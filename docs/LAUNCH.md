@@ -27,15 +27,17 @@ Quantized defaults stay in the **~5–7 GB** range. Full BF16 is not the happy p
 3. Download one quantized artifact: `personality-protect download` (GGUF) and/or `--format mlx` on Apple Silicon.
 4. Ingest local writing: `personality-protect ingest --linkedin <export> --path <docs>`
 5. Select: `personality-protect select` (warns below 50 pieces; blocks below 20 unless `--force`)
-6. Full train: `personality-protect train` (auto steps from SFT count). CI uses `--smoke` / `--backend mock`.
+6. Full train: `personality-protect train` (auto steps from SFT count). Useful flags: `--proof`, `--resume`, `--chunk-steps`, `--memory-gb`. CI uses `--smoke` / `--backend mock`.
 7. Filter: `personality-protect filter --text "…"`
 8. Compare: `personality-protect compare --synthetic slop_branding`
 9. Eval: `personality-protect eval --synthetic slop_branding`
 
+MLX train is chunked and checkpointed — a crash does not wipe a full run; use `--resume` (incomplete runs also auto-resume).
+
 ## One-shot script
 
 ```bash
-./scripts/beast_demo.sh --linkedin ~/Downloads/LinkedInExport
+./scripts/beast_demo.sh --linkedin ~/path/to/linkedin-export
 # or synthetic smoke (no personal data):
 ./scripts/beast_demo.sh --smoke --allow-mock --backend mock --skip-download
 ```

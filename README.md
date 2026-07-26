@@ -1,27 +1,75 @@
 # PersonalityProtect
 
-Local-only CLI that turns **your** writing into a small voice adapter on **Qwen3.5-9B**, then rewrites frontier drafts through it before you publish.
+**Local-only personal writing-voice filter.** Train a small LoRA adapter on your own writing, then rewrite AI drafts so they sound like you — not like LinkedIn slop.
 
-**Download target: one quantized model, ~5–7 GB on disk** — not an 18–20 GB full-precision dump.
+Runs on **quantized Qwen3.5-9B** (~5–7 GB on disk). Your corpus, indexes, SFT JSONL, and adapters **never leave this machine**. No cloud fine-tune. No Colab. No uploading personal weights.
 
-| Artifact | Role | Approx. size |
-| --- | --- | --- |
-| Qwen3.5-9B **Q4_K_M GGUF** | Default local runtime (`filter` via llama.cpp) | **~5.6 GB** |
-| Qwen3.5-9B **MLX 4-bit** | Apple Silicon train + filter | **~6 GB** |
-| Your LoRA / adapter | After `train` | small (MBs) |
-
-`demo` / `mock` need **no** model download (pipeline smoke only).
-
-**Your corpus, indexes, SFT JSONL, and adapters never leave this machine.**  
-No Kaggle. No Colab. No cloud train. No uploading personal weights.
-
-Built by [Telivity](https://telivity.com). Apache-2.0.
+Built by [Telivity](https://telivity.com). Apache-2.0. **Alpha** — the pipeline works; voice-match quality is still improving.
 
 ```text
-sources ──► ingest ──► select ──► train (local LoRA) ──► filter ──► your voice
-                 ▲                      │
-                 └── demo (synthetic) ──┘
+your writing ──► ingest ──► select ──► train (local LoRA) ──► filter ──► your voice
+                      ▲                        │
+                      └── demo (synthetic) ─────┘
 ```
+
+---
+
+## Why
+
+Frontier models default to generic corporate voice: *“In today’s fast-paced world, we must leverage synergies…”* Prompting helps a little. A local adapter trained on **your** posts, notes, and emails helps more — without shipping your writing to a cloud trainer.
+
+PersonalityProtect is that filter: ingest locally → select → train a small adapter on a quantized base → rewrite drafts before you publish.
+
+---
+
+## Status (honest)
+
+| Ready | Still improving |
+| --- | --- |
+| End-to-end CLI pipeline | How closely output matches *your* voice |
+| Quantized download (~5–7 GB) | Eval metrics / automatic quality gates |
+| Chunked, resumable MLX train | CUDA path polish |
+| Privacy defaults + sanitize CI | Browser extension (API stub only) |
+
+Don’t expect magic after one short train. More (and better) personal writing → better results. Treat early outputs as drafts you still edit.
+
+---
+
+## Hardware
+
+**Happy path: Apple Silicon Mac** (MLX train + filter).
+
+| What | Size / note |
+| --- | --- |
+| GGUF Q4_K_M (default filter) | ~5.6 GB download |
+| MLX 4-bit (Apple Silicon train/filter) | ~6 GB download |
+| Your LoRA adapter | Small (MBs) after `train` |
+| Train peak RAM (48 GB Mac, memory-capped) | Roughly ~14 GB peak with chunked MLX |
+
+MLX train is **memory-capped and chunked** so a crash doesn’t wipe a full run — see [Checkpoints](#checkpoints--resume). Day-to-day `filter` can use the lighter GGUF via llama.cpp.
+
+**NVIDIA CUDA:** QLoRA train is available (`pip install -e ".[cuda]"`). Prefer GGUF for everyday filter. Mock/smoke needs no model download (CI / pipeline only).
+
+---
+
+## Privacy
+
+**Hard rule: personal writing stays on your machine.**
+
+| Stays in `~/.personality-protect/` | Never commit / never upload |
+| --- | --- |
+| Profiles, corpus index, SFT JSONL | Real LinkedIn / email / note exports |
+| LoRA adapters & train checkpoints | Profile URLs, personal paths |
+| Downloaded GGUF under `models/` | API keys, `.env`, tokens |
+| Local eval receipts | Cloud train / Colab / Kaggle uploads |
+
+Override the home directory with `--home` or `PERSONALITY_PROTECT_HOME`.
+
+`.gitignore` blocks profiles, adapters, SFT, exports, weights, and secrets. Public git ships **code + synthetic demo/eval fixtures only**. Hugging Face is used only to **download public quantized base weights**.
+
+This README uses synthetic examples only (e.g. Contoso, “leverage synergies”). Do not paste real posts, profile URLs, or personal before/after samples into docs or PRs.
+
+---
 
 ## Install
 
@@ -38,87 +86,88 @@ pip install -e ".[dev]"
 Optional extras (pick what matches your machine):
 
 ```bash
-# Hugging Face download helper (GGUF / MLX prefetch)
-pip install -e ".[models]"
-
-# llama.cpp GGUF runtime (recommended for filter)
-pip install -e ".[gguf]"
-
-# Apple Silicon MLX LoRA train + filter
-pip install -e ".[mlx]"
-
-# NVIDIA CUDA QLoRA
-pip install -e ".[cuda]"
+pip install -e ".[models]"   # Hugging Face download helper
+pip install -e ".[gguf]"     # llama.cpp GGUF filter (recommended)
+pip install -e ".[mlx]"      # Apple Silicon MLX train + filter
+pip install -e ".[cuda]"     # NVIDIA QLoRA train
 ```
 
-## Quick start (synthetic demo — no download)
+---
+
+## Quick start
+
+### 1. Synthetic demo (no download)
 
 ```bash
 personality-protect demo
 personality-protect demo --json    # machine-readable; no logo
 ```
 
-This runs: init → ingest synthetic docs → select → mock train → filter.
+Runs: init → ingest synthetic docs → select → mock train → filter.
 
-## Average Joe path (real local model)
-
-1. Install + optional extras above.
-2. Init a profile and **download one quantized artifact** (~5–7 GB once):
+### 2. Real local path (Average Joe)
 
 ```bash
 personality-protect init
-personality-protect download                 # GGUF Q4_K_M ~5.6 GB (default)
-# Apple Silicon trainers may also want:
+personality-protect download                 # GGUF Q4_K_M ~5.6 GB
+# Apple Silicon trainers also want:
 personality-protect download --format mlx    # MLX 4-bit ~6 GB
-```
 
-3. Ingest → select → train → filter:
+# Point at your own local export / notes (paths stay on your machine)
+personality-protect ingest --linkedin ~/path/to/linkedin-export
+personality-protect ingest --path ~/path/to/notes --source note
 
-```bash
-personality-protect ingest --linkedin ~/Downloads/LinkedInExport
 personality-protect select
-personality-protect train --backend mlx      # Mac: train on 4-bit MLX base
-# or: personality-protect train --backend cuda
+personality-protect train --backend mlx
+# Useful flags:
+#   --proof              bounded real train for receipts
+#   --resume             continue after a crash / interrupt
+#   --chunk-steps 50     smaller Metal chunks
+#   --memory-gb 16       tighter wired-memory cap
+
 personality-protect filter --text "In today's fast-paced world we must leverage synergies."
+personality-protect compare --synthetic slop_branding
 ```
 
-Filter auto-prefers a local GGUF when present (`--backend llama`), then MLX 4-bit, then mock.
+Filter auto-prefers local GGUF when present (`llama`), then MLX, then requires an explicit mock.
 
-## Real workflow details
+---
 
-State lives in `~/.personality-protect/` (override with `--home` or `PERSONALITY_PROTECT_HOME`).
+## Workflow
 
-### 1. Init
+State lives in `~/.personality-protect/profiles/<name>/`.
+
+### Init
 
 ```bash
 personality-protect init
 personality-protect init --profile work
 ```
 
-### 2. Download (quantized only)
+### Download
 
 ```bash
 personality-protect download --format gguf   # → ~/.personality-protect/models/*.gguf
 personality-protect download --format mlx    # → Hugging Face cache, ~6 GB
 ```
 
-### 3. Ingest
+### Ingest
 
-LinkedIn export (folder or `.zip`) — reads Shares*/Comments*/Articles* in place; zips unpack only into the profile cache:
-
-```bash
-personality-protect ingest --linkedin ~/Downloads/LinkedInExport
-personality-protect ingest --linkedin ~/Downloads/LinkedInExport.zip
-```
-
-Local emails / docs / notes (read in place — **no mandatory copy**):
+LinkedIn export (folder or `.zip`) — CSV/HTML read in place; zips unpack only into the profile cache:
 
 ```bash
-personality-protect ingest --path ~/Documents/notes --source note
-personality-protect ingest --path ~/Mail/archive --source email
+personality-protect ingest --linkedin ~/path/to/linkedin-export
+personality-protect ingest --linkedin ~/path/to/linkedin-export.zip
 ```
 
-### 4. Select
+Local docs / notes / mail archives (read in place — **no mandatory copy**):
+
+```bash
+personality-protect ingest --path ~/path/to/notes --source note
+personality-protect ingest --path ~/path/to/mail-archive --source email
+```
+
+### Select
 
 Defaults: **>50 words**, dates **through 2024** (overridable):
 
@@ -128,42 +177,47 @@ personality-protect select --min-words 75 --through-year 2023
 personality-protect select --include-undated
 ```
 
-### 5. Train
+Corpus gates at train time: **warn** below 50 selected pieces; **block** below 20 unless `--force`.
 
-Builds local SFT JSONL, then fine-tunes a **small adapter** on top of the quantized base.
+### Train
+
+Builds local SFT JSONL, then fine-tunes a **small adapter** on the quantized base.
 
 Full-train defaults scale steps from your SFT example count (≈3 epochs, clamped). Use `--smoke` for CI/low-step. Mock is never a silent fallback — pass `--backend mock` or `--allow-mock` explicitly.
-
-Corpus gates: **warn** below 50 selected pieces; **block** below 20 unless `--force`.
 
 ```bash
 personality-protect train --sft-only
 personality-protect train --backend mock --smoke --force   # CI / pipeline only
-personality-protect train --backend mlx                    # auto steps from corpus size (fresh)
-personality-protect train --backend mlx --proof            # bounded real train (receipts)
+personality-protect train --backend mlx                    # auto steps from corpus
+personality-protect train --backend mlx --proof            # bounded real train
 personality-protect train --backend mlx --chunk-steps 50 --memory-gb 16
 personality-protect train --backend mlx --resume --max-steps 750 --chunk-steps 50 --memory-gb 16
-personality-protect train --backend mlx --force-retrain --max-steps 750  # wipe adapters, start clean
+personality-protect train --backend mlx --force-retrain --max-steps 750
 personality-protect train --backend cuda --max-steps 200
 ```
 
-Each successful MLX chunk writes `adapters.safetensors` (plus a numbered `NNNNNNN_adapters.safetensors`) and updates `train_chunks.json` (`completed_steps`, `total_steps`, `last_chunk`). If a run dies, `--resume` continues from the last good chunk instead of restarting from zero.
 Adapters land under `~/.personality-protect/profiles/<name>/adapters/` only.
 
-**Honest hardware note:** MLX train **and** filter/compare apply a **Metal wired-memory cap** (default ~40% of RAM, max 20 GB). Stock `mlx-lm` `generate`/`train` call `set_wired_limit(~40 GB)` on a 48 GB Mac and jetsam-kill Python ("quit unexpectedly"). Train additionally runs in subprocess chunks. Peak RAM is still higher than the ~5–7 GB on-disk footprint. CUDA’s first HF fetch can cache extra shards; day-to-day `filter` should use the GGUF under `models/` when available.
+**Metal note:** MLX train and filter apply a wired-memory cap (default ~40% of RAM, max 20 GB). Without it, stock `mlx-lm` can request a huge limit and jetsam-kill Python on mid-size Macs. Train additionally runs in subprocess chunks.
 
-### 6. Filter
+### Checkpoints / resume
+
+Each successful MLX chunk writes `adapters.safetensors` (plus a numbered `NNNNNNN_adapters.safetensors`) and updates `train_chunks.json` (`completed_steps`, `total_steps`, `last_chunk`).
+
+If a run dies mid-train, **`--resume` continues from the last good chunk** instead of restarting from zero. Incomplete checkpoints also auto-resume when you start train again. Use `--force-retrain` only when you intentionally want a clean wipe.
+
+### Filter
 
 ```bash
 personality-protect filter --text "In today's fast-paced world we must leverage synergies."
-personality-protect filter --backend llama --text "…"
+personality-protect filter --backend llama --text "Contoso must ship the Q3 plan by Friday."
 personality-protect filter --file draft.txt --out voice.txt
 personality-protect filter --backend mock --text "…"   # after mock train / demo
 ```
 
 On Apple Silicon with an MLX adapter, `filter --backend auto` prefers MLX.
 
-### 7. Eval / compare
+### Eval / compare
 
 Synthetic slop drafts ship under package `data/evals/`. Receipts write to the local profile `evals/` directory (gitignored — never commit).
 
@@ -175,9 +229,9 @@ personality-protect compare --text "It is important to note that we must leverag
 
 Three-way compare: **raw** vs **prompt few-shot baseline** vs **LoRA/adapter filter**.
 
-### 8. Local API stub (future browser extension)
+### Local API stub
 
-Loopback only (`127.0.0.1`). Refuses non-local binds.
+Loopback only (`127.0.0.1`). Refuses non-local binds. Future browser-extension hook.
 
 ```bash
 personality-protect api
@@ -185,52 +239,92 @@ personality-protect api
 # POST http://127.0.0.1:8765/v1/filter  {"text":"…"}
 ```
 
-## Launch / impress workflow
+---
 
-See [docs/LAUNCH.md](docs/LAUNCH.md) for the operator checklist (hardware, privacy, steps).
+## CLI reference
+
+Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--color`, `--logo`, `--logo-mode`.
+
+| Command | Purpose |
+| --- | --- |
+| `init` | Create profile under `~/.personality-protect/` |
+| `download` | Prefetch quantized GGUF or MLX base |
+| `ingest` | Index LinkedIn export and/or local paths |
+| `select` | Gate corpus by length / year / source |
+| `train` | Build SFT JSONL + local LoRA |
+| `filter` | Rewrite a draft through the adapter |
+| `compare` | Raw vs few-shot vs adapter |
+| `eval` | Score a draft (synthetic or yours) |
+| `demo` | Full synthetic pipeline smoke |
+| `status` | Show profile / artifact state |
+| `api` | Loopback HTTP filter stub |
+| `logo` | Print Telivity CLI mark |
+
+### Important flags
+
+**`download`**
+
+| Flag | Meaning |
+| --- | --- |
+| `--format gguf\|mlx` | Which quantized artifact to fetch |
+
+**`ingest`**
+
+| Flag | Meaning |
+| --- | --- |
+| `--linkedin PATH` | LinkedIn export folder or `.zip` |
+| `--path PATH` | Local docs/notes/mail (repeatable) |
+| `--source NAME` | Label for `--path` sources |
+
+**`select`**
+
+| Flag | Meaning |
+| --- | --- |
+| `--min-words N` | Minimum words (default 50) |
+| `--through-year YYYY` | Keep pieces through this year |
+| `--include-undated` | Keep items without dates |
+| `--force` | Allow thin corpus through gates |
+
+**`train`**
+
+| Flag | Meaning |
+| --- | --- |
+| `--backend auto\|mlx\|cuda\|cpu\|mock` | Train backend |
+| `--max-steps N` | Cap / set steps (else auto from SFT count) |
+| `--chunk-steps N` | MLX: iters per subprocess chunk |
+| `--memory-gb N` | MLX: Metal wired-memory cap (GB) |
+| `--proof` | Bounded real train for receipts |
+| `--resume` | Continue from last good chunk / adapters |
+| `--force-retrain` | Wipe adapters; start clean |
+| `--smoke` | Low-step CI train (not a silent mock) |
+| `--allow-mock` / `--mock` | Explicit mock path |
+| `--sft-only` | Build JSONL only; skip weight train |
+| `--force` | Allow train below corpus block threshold |
+
+**`filter` / `compare` / `eval`**
+
+| Flag | Meaning |
+| --- | --- |
+| `--text` / `--file` | Draft input |
+| `--out` | Write rewrite to file (`filter`) |
+| `--backend` | `auto`, `llama`, `mlx`, `mock`, … |
+| `--synthetic NAME` | Packaged eval draft (`compare` / `eval`) |
+| `--gguf PATH` | Override GGUF path (`filter`) |
+
+---
+
+## Launch script
+
+Operator checklist: [docs/LAUNCH.md](docs/LAUNCH.md).
 
 ```bash
 chmod +x scripts/beast_demo.sh
-./scripts/beast_demo.sh --linkedin ~/Downloads/LinkedInExport
+./scripts/beast_demo.sh --linkedin ~/path/to/linkedin-export
 # synthetic smoke (no personal data, no multi-GB download):
 ./scripts/beast_demo.sh --skip-download
 ```
 
-## CLI branding
-
-Telivity terminal logo on interactive welcome / help surfaces. Never on `--json`.
-
-```bash
-personality-protect                 # banner + welcome
-personality-protect logo
-personality-protect --color never --logo mark status
-```
-
-Flags: `--color auto|always|never`, `--logo full|mark|off`, `--logo-mode auto|truecolor|color|plain|ascii`.  
-Honors `NO_COLOR` and non-TTY (no ANSI).
-
-## Privacy hard rules
-
-| Stays on your machine | Never commit / never upload |
-| --- | --- |
-| Writing corpus & index | Real LinkedIn exports |
-| SFT JSONL | Emails, notes, personal paths |
-| LoRA / GGUF adapters | API keys, `.env`, tokens |
-| Profile `evals/` receipts | Personal adapters / weights |
-| Profile cache + `models/*.gguf` | Cloud train uploads |
-
-Public git contains **code + synthetic demo/eval fixtures only**.  
-Hugging Face is used only to **download public quantized base weights** (GGUF / MLX 4-bit).
-
-## Hardware notes
-
-| Backend | When | Disk download |
-| --- | --- | --- |
-| `mock` | Demo, CI, pipeline smoke | None |
-| `llama` / GGUF | Default local filter | Q4_K_M **~5.6 GB** |
-| `mlx` | Apple Silicon train/filter | MLX 4-bit **~6 GB** |
-| `cuda` | NVIDIA QLoRA train | Prefer GGUF for filter; train uses 4-bit in VRAM |
-| `cpu` | Impractical for 9B SFT | Prefer mock / GGUF filter on another machine |
+---
 
 ## Develop
 
@@ -240,17 +334,9 @@ pytest
 ruff check src tests
 ```
 
-### CI / branch protection
+CI (`.github/workflows/ci.yml`) required checks: `lint`, `test (3.11)`, `test (3.12)`, `sanitize`, `cli-smoke`.
 
-Workflow: `.github/workflows/ci.yml`. Required check names:
-
-| Check name | What it runs |
-| --- | --- |
-| `lint` | `ruff check src tests` |
-| `test (3.11)` | `pytest` on Python 3.11 |
-| `test (3.12)` | `pytest` on Python 3.12 |
-| `sanitize` | Block private-path / discussion leaks in tracked files |
-| `cli-smoke` | `demo` + `compare` + mock `--smoke` train (no model download) |
+---
 
 ## License
 
