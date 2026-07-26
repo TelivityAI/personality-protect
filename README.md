@@ -139,13 +139,15 @@ Corpus gates: **warn** below 50 selected pieces; **block** below 20 unless `--fo
 ```bash
 personality-protect train --sft-only
 personality-protect train --backend mock --smoke --force   # CI / pipeline only
-personality-protect train --backend mlx                    # auto steps from corpus size
+personality-protect train --backend mlx                    # auto steps from corpus size (fresh)
 personality-protect train --backend mlx --proof            # bounded real train (receipts)
 personality-protect train --backend mlx --chunk-steps 50 --memory-gb 16
-personality-protect train --backend mlx --resume --max-steps 500 --chunk-steps 50 --memory-gb 16
+personality-protect train --backend mlx --resume --max-steps 750 --chunk-steps 50 --memory-gb 16
+personality-protect train --backend mlx --force-retrain --max-steps 750  # wipe adapters, start clean
 personality-protect train --backend cuda --max-steps 200
 ```
 
+Each successful MLX chunk writes `adapters.safetensors` (plus a numbered `NNNNNNN_adapters.safetensors`) and updates `train_chunks.json` (`completed_steps`, `total_steps`, `last_chunk`). If a run dies, `--resume` continues from the last good chunk instead of restarting from zero.
 Adapters land under `~/.personality-protect/profiles/<name>/adapters/` only.
 
 **Honest hardware note:** MLX train **and** filter/compare apply a **Metal wired-memory cap** (default ~40% of RAM, max 20 GB). Stock `mlx-lm` `generate`/`train` call `set_wired_limit(~40 GB)` on a 48 GB Mac and jetsam-kill Python ("quit unexpectedly"). Train additionally runs in subprocess chunks. Peak RAM is still higher than the ~5–7 GB on-disk footprint. CUDA’s first HF fetch can cache extra shards; day-to-day `filter` should use the GGUF under `models/` when available.

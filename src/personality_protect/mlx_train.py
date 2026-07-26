@@ -34,6 +34,8 @@ PROOF_MAX_STEPS = 150  # enough for real receipts without a marathon
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
+CHECKPOINT_META_NAME = "train_chunks.json"
+
 _ITER_RE = re.compile(r"^Iter\s+(\d+)\s*:", re.MULTILINE)
 _PEAK_RE = re.compile(r"Peak mem\s+([0-9.]+)\s*GB", re.IGNORECASE)
 
@@ -54,6 +56,97 @@ def plan_train_chunks(total_steps: int, chunk_size: int) -> list[int]:
         remaining -= n
     return chunks
 
+
+def write_train_checkpoint_meta(adapter_dir: Path, meta: dict[str, Any]) -> Path:
+    """Persist resumable train progress next to adapters (after every chunk)."""
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    path = adapter_dir / CHECKPOINT_META_NAME
+    path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def load_train_checkpoint_meta(adapter_dir: Path) -> dict[str, Any] | None:
+    """Load ``train_chunks.json`` if present and valid."""
+    path = adapter_dir / CHECKPOINT_META_NAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+@dataclass
+class TrainPlan:
+    """Resolved chunk plan for a fresh or resumed MLX train."""
+
+    chunks_to_run: list[int]
+    already_completed: int
+    total_steps: int
+    chunk_steps: int
+    resume: bool
+    full_chunk_plan: list[int]
+
+
+def _clear_adapter_weights(adapter_dir: Path) -> None:
+    adapter_file = adapter_dir / "adapters.safetensors"
+    if adapter_file.is_file():
+        adapter_file.unlink()
+    for stale in adapter_dir.glob("*_adapters.safetensors"):
+        stale.unlink()
+    meta_path = adapter_dir / CHECKPOINT_META_NAME
+    if meta_path.is_file():
+        meta_path.unlink()
+
+
+def resolve_train_plan(
+    *,
+    adapter_dir: Path,
+    total_steps: int,
+    chunk_steps: int = DEFAULT_CHUNK_STEPS,
+    resume: bool = False,
+    force_retrain: bool = False,
+) -> TrainPlan:
+    """Decide chunks to run; resume keeps weights and skips completed steps."""
+    total = max(1, int(total_steps))
+    size = int(chunk_steps)
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    adapter_file = adapter_dir / "adapters.safetensors"
+
+    if force_retrain or not resume:
+        _clear_adapter_weights(adapter_dir)
+        full = plan_train_chunks(total, size)
+        return TrainPlan(
+            chunks_to_run=full,
+            already_completed=0,
+            total_steps=total,
+            chunk_steps=size,
+            resume=False,
+            full_chunk_plan=full,
+        )
+
+    if not adapter_file.is_file():
+        raise FileNotFoundError(
+            f"--resume requested but no adapter at {adapter_file}. "
+            "Run a fresh train first, or pass --force-retrain."
+        )
+
+    prior = load_train_checkpoint_meta(adapter_dir) or {}
+    already = max(0, int(prior.get("completed_steps") or 0))
+    # ``total_steps`` is the desired final completed count for this invocation.
+    target = max(1, int(total_steps))
+    remaining = max(0, target - already)
+    chunks = plan_train_chunks(remaining, size)
+    full = plan_train_chunks(target, size)
+    return TrainPlan(
+        chunks_to_run=chunks,
+        already_completed=already,
+        total_steps=target,
+        chunk_steps=size,
+        resume=True,
+        full_chunk_plan=full,
+    )
 
 def resolve_wired_limit_bytes(
     *,
@@ -254,17 +347,52 @@ def run_chunked_mlx_train(
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     num_layers: int = DEFAULT_NUM_LAYERS,
     resume: bool = False,
+    force_retrain: bool = False,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Train LoRA in subprocess chunks with progress events.
 
-    By default starts fresh (deletes existing adapters). Pass ``resume=True`` to
-    continue from ``adapter_dir/adapters.safetensors`` across a new CLI invocation
-    (chunks within one run always resume between subprocesses).
+    Each successful chunk persists ``adapters.safetensors`` (mlx-lm) and updates
+    ``train_chunks.json`` so a crash can ``--resume`` from completed_steps.
+    Pass ``resume=True`` to keep weights and run only remaining steps toward
+    ``total_steps``. Pass ``force_retrain=True`` (or omit resume) to start clean.
     """
-    chunks = plan_train_chunks(total_steps, chunk_steps)
+    if force_retrain and resume:
+        raise ValueError("Pass only one of --resume or --force-retrain")
+
+    plan = resolve_train_plan(
+        adapter_dir=adapter_dir,
+        total_steps=total_steps,
+        chunk_steps=chunk_steps,
+        resume=resume,
+        force_retrain=force_retrain,
+    )
+    chunks = plan.chunks_to_run
     if not chunks:
-        raise ValueError("total_steps must be >= 1")
+        # Already at or past target — treat as complete receipt.
+        meta = {
+            "status": "complete",
+            "chunks": 0,
+            "chunk_plan": plan.full_chunk_plan,
+            "completed_steps": plan.already_completed,
+            "total_steps": plan.total_steps,
+            "last_chunk": int(
+                (load_train_checkpoint_meta(adapter_dir) or {}).get("last_chunk") or 0
+            ),
+            "chunk_steps": plan.chunk_steps,
+            "wired_limit_gb": None,
+            "peak_mem_gb": None,
+            "max_seq_length": max_seq_length,
+            "num_layers": num_layers,
+            "adapter_file": str(adapter_dir / "adapters.safetensors"),
+            "resume": plan.resume,
+            "already_completed": plan.already_completed,
+            "steps_this_run": 0,
+        }
+        write_train_checkpoint_meta(adapter_dir, meta)
+        if progress_callback:
+            progress_callback({"kind": "done", **meta})
+        return meta
 
     mem_size, max_rec = detect_device_memory()
     wired = resolve_wired_limit_bytes(
@@ -273,48 +401,42 @@ def run_chunked_mlx_train(
         memory_gb=memory_gb,
     )
 
-    adapter_dir.mkdir(parents=True, exist_ok=True)
     adapter_file = adapter_dir / "adapters.safetensors"
-    if resume:
-        if not adapter_file.is_file():
-            raise FileNotFoundError(
-                f"--resume requested but no adapter at {adapter_file}. "
-                "Run a fresh train first, or omit --resume."
-            )
-    else:
-        # Fresh run: drop stale adapter so we don't silently resume old weights
-        # unless a prior chunk in THIS run wrote them.
-        if adapter_file.is_file():
-            adapter_file.unlink()
-        for stale in adapter_dir.glob("*_adapters.safetensors"):
-            stale.unlink()
-
-    completed = 0
+    completed = plan.already_completed
     peaks: list[float] = []
+    prior_chunks_done = 0
+    if plan.resume:
+        prior_chunks_done = int(
+            (load_train_checkpoint_meta(adapter_dir) or {}).get("last_chunk") or 0
+        )
+
     if progress_callback:
         progress_callback(
             {
                 "kind": "start",
-                "total_steps": total_steps,
+                "total_steps": plan.total_steps,
+                "completed_steps": completed,
                 "chunks": len(chunks),
                 "chunk_steps": chunk_steps,
                 "wired_limit_gb": round(wired / 1e9, 2),
                 "max_seq_length": max_seq_length,
-                "resume": resume and adapter_file.is_file(),
+                "resume": plan.resume,
             }
         )
 
     for i, n_iters in enumerate(chunks, start=1):
-        resume = adapter_file if adapter_file.is_file() else None
+        resume_adapter = adapter_file if adapter_file.is_file() else None
+        chunk_index = prior_chunks_done + i
+        total_chunk_count = prior_chunks_done + len(chunks)
         if progress_callback:
             progress_callback(
                 {
                     "kind": "chunk_start",
-                    "chunk": i,
-                    "chunks": len(chunks),
+                    "chunk": chunk_index,
+                    "chunks": total_chunk_count,
                     "chunk_iters": n_iters,
                     "completed_steps": completed,
-                    "total_steps": total_steps,
+                    "total_steps": plan.total_steps,
                 }
             )
 
@@ -326,7 +448,7 @@ def run_chunked_mlx_train(
                 {
                     "kind": "step",
                     "global_step": _completed + it,
-                    "total_steps": total_steps,
+                    "total_steps": plan.total_steps,
                     "chunk_iter": it,
                     "chunk_iters": _n,
                     "line": line.strip(),
@@ -339,7 +461,7 @@ def run_chunked_mlx_train(
             adapter_dir=adapter_dir,
             iters=n_iters,
             wired_limit_bytes=wired,
-            resume_adapter=resume,
+            resume_adapter=resume_adapter,
             max_seq_length=max_seq_length,
             num_layers=num_layers,
             on_line=_on_line,
@@ -349,11 +471,32 @@ def run_chunked_mlx_train(
 
         if result.returncode != 0 or not result.adapters_ok:
             err_tail = result.stdout[-2000:] if result.stdout else ""
+            # Persist partial progress so --resume can continue.
+            write_train_checkpoint_meta(
+                adapter_dir,
+                {
+                    "status": "error",
+                    "completed_steps": completed,
+                    "total_steps": plan.total_steps,
+                    "chunk_plan": plan.full_chunk_plan,
+                    "last_chunk": prior_chunks_done + i - 1,
+                    "chunk_steps": plan.chunk_steps,
+                    "wired_limit_gb": round(wired / 1e9, 2),
+                    "peak_mem_gb": max(peaks) if peaks else None,
+                    "max_seq_length": max_seq_length,
+                    "num_layers": num_layers,
+                    "adapter_file": str(adapter_file),
+                    "resume": plan.resume,
+                    "already_completed": plan.already_completed,
+                    "error_chunk": chunk_index,
+                    "returncode": result.returncode,
+                },
+            )
             if progress_callback:
                 progress_callback(
                     {
                         "kind": "error",
-                        "chunk": i,
+                        "chunk": chunk_index,
                         "returncode": result.returncode,
                         "detail": err_tail,
                     }
@@ -369,45 +512,72 @@ def run_chunked_mlx_train(
                 sig_hint = (
                     f" Process killed by {signame} (exit={result.returncode}). "
                     "If SIGTERM: another agent/script likely pkill'd the worker — "
-                    "do not restart-kill mid-train. If SIGKILL: check jetsam/OOM."
+                    "do not restart-kill mid-train. If SIGKILL: check jetsam/OOM. "
+                    "Re-run with --resume to continue from the last good chunk."
                 )
             raise RuntimeError(
-                f"MLX train chunk {i}/{len(chunks)} failed "
+                f"MLX train chunk {chunk_index}/{total_chunk_count} failed "
                 f"(exit={result.returncode}, adapters_ok={result.adapters_ok})."
                 f"{sig_hint}\n"
                 f"Wired limit was {wired / 1e9:.1f} GB (capped; mlx-lm alone would "
                 f"try ~{max_rec / 1e9:.0f} GB and can kill the Mac).\n"
+                f"Completed steps so far: {completed}/{plan.total_steps}. "
+                f"Re-run with --resume.\n"
                 f"Last output:\n{err_tail}"
             )
 
         completed += n_iters
+        status = "complete" if completed >= plan.total_steps else "in_progress"
+        chunk_meta = {
+            "status": status,
+            "completed_steps": completed,
+            "total_steps": plan.total_steps,
+            "chunk_plan": plan.full_chunk_plan,
+            "last_chunk": chunk_index,
+            "chunk_steps": plan.chunk_steps,
+            "wired_limit_gb": round(wired / 1e9, 2),
+            "peak_mem_gb": max(peaks) if peaks else None,
+            "max_seq_length": max_seq_length,
+            "num_layers": num_layers,
+            "adapter_file": str(adapter_file),
+            "resume": plan.resume,
+            "already_completed": plan.already_completed,
+            "steps_this_run": completed - plan.already_completed,
+            "chunks": total_chunk_count,
+        }
+        write_train_checkpoint_meta(adapter_dir, chunk_meta)
+
         if progress_callback:
             progress_callback(
                 {
                     "kind": "chunk_done",
-                    "chunk": i,
-                    "chunks": len(chunks),
+                    "chunk": chunk_index,
+                    "chunks": total_chunk_count,
                     "completed_steps": completed,
-                    "total_steps": total_steps,
+                    "total_steps": plan.total_steps,
                     "peak_mem_gb": result.peak_mem_gb,
                 }
             )
 
-    meta = {
-        "chunks": len(chunks),
-        "chunk_plan": chunks,
-        "wired_limit_gb": round(wired / 1e9, 2),
-        "peak_mem_gb": max(peaks) if peaks else None,
-        "max_seq_length": max_seq_length,
-        "num_layers": num_layers,
-        "adapter_file": str(adapter_file),
-        "resume": bool(resume),
-        "steps_this_run": total_steps,
-    }
-    if progress_callback:
-        progress_callback({"kind": "done", **meta, "total_steps": total_steps})
-    # Persist chunk meta next to adapters for receipts
-    (adapter_dir / "train_chunks.json").write_text(
-        json.dumps(meta, indent=2) + "\n", encoding="utf-8"
+    meta = load_train_checkpoint_meta(adapter_dir) or {}
+    meta.update(
+        {
+            "status": "complete",
+            "completed_steps": completed,
+            "total_steps": plan.total_steps,
+            "chunk_plan": plan.full_chunk_plan,
+            "wired_limit_gb": round(wired / 1e9, 2),
+            "peak_mem_gb": max(peaks) if peaks else None,
+            "max_seq_length": max_seq_length,
+            "num_layers": num_layers,
+            "adapter_file": str(adapter_file),
+            "resume": plan.resume,
+            "already_completed": plan.already_completed,
+            "steps_this_run": completed - plan.already_completed,
+            "chunks": prior_chunks_done + len(chunks),
+        }
     )
+    write_train_checkpoint_meta(adapter_dir, meta)
+    if progress_callback:
+        progress_callback({"kind": "done", **meta, "total_steps": plan.total_steps})
     return meta

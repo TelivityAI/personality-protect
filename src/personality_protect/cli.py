@@ -448,7 +448,15 @@ def train_cmd(
     resume: bool = typer.Option(
         False,
         "--resume",
-        help="MLX: continue from existing adapters.safetensors instead of deleting it.",
+        help=(
+            "MLX: continue from adapters.safetensors + train_chunks.json "
+            "(skips completed_steps; does not delete weights)."
+        ),
+    ),
+    force_retrain: bool = typer.Option(
+        False,
+        "--force-retrain",
+        help="MLX: delete existing adapters/checkpoints and start a clean train.",
     ),
     smoke: bool = typer.Option(
         False,
@@ -513,8 +521,21 @@ def train_cmd(
             )
         if memory_gb is not None:
             console.print(f"Metal wired memory cap: {memory_gb} GB")
+        if resume and force_retrain:
+            console.print("[red]Pass only one of --resume or --force-retrain[/red]")
+            raise typer.Exit(2)
         if resume:
-            console.print("Resume: continuing from existing adapters.safetensors")
+            from personality_protect.mlx_train import load_train_checkpoint_meta
+
+            prior = load_train_checkpoint_meta(paths.adapters_dir / "latest") or {}
+            done = int(prior.get("completed_steps") or 0)
+            target = max_steps or int(prior.get("total_steps") or 0) or "…"
+            console.print(
+                f"Resume: continuing from step {done}/{target} "
+                "(adapters.safetensors + train_chunks.json)"
+            )
+        if force_retrain:
+            console.print("Force retrain: wiping adapters and starting clean")
 
     progress_holder: dict = {}
 
@@ -524,12 +545,15 @@ def train_cmd(
         def on_progress(info: dict) -> None:
             kind = info.get("kind")
             if kind == "start":
+                done = info.get("completed_steps") or 0
+                total = info.get("total_steps") or 0
                 print(
-                    f"MLX LoRA start: {info.get('total_steps')} steps · "
+                    f"MLX LoRA start: {total} steps · "
                     f"{info.get('chunks')} chunks · "
                     f"cap {info.get('wired_limit_gb')} GB · "
                     f"seq {info.get('max_seq_length')} · "
-                    f"resume={info.get('resume')}",
+                    f"resume={info.get('resume')} · "
+                    f"from step {done}/{total}",
                     flush=True,
                 )
             elif kind == "chunk_start":
@@ -676,6 +700,7 @@ def train_cmd(
             memory_gb=memory_gb,
             proof=proof,
             resume=resume,
+            force_retrain=force_retrain,
             progress_callback=callback,
         )
     except (FileNotFoundError, RuntimeError, MockFallbackError) as exc:

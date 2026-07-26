@@ -230,6 +230,7 @@ def run_train(
     memory_gb: float | None = None,
     proof: bool = False,
     resume: bool = False,
+    force_retrain: bool = False,
     progress_callback: ProgressCallback | None = None,
 ) -> TrainResult:
     config = load_config(paths)
@@ -301,6 +302,7 @@ def run_train(
             progress_callback=progress_callback,
             proof=proof,
             resume=resume,
+            force_retrain=force_retrain,
         )
     elif chosen == "cuda":
         result = _train_cuda(paths, sft_path, adapter_dir, model_id, n, steps)
@@ -431,6 +433,7 @@ def _train_mlx(
     progress_callback: ProgressCallback | None = None,
     proof: bool = False,
     resume: bool = False,
+    force_retrain: bool = False,
 ) -> TrainResult:
     """LoRA fine-tune via chunked, memory-capped MLX subprocesses (not full BF16)."""
     import importlib.util
@@ -473,6 +476,7 @@ def _train_mlx(
             chunk_steps=chunk_steps,
             memory_gb=memory_gb,
             resume=resume,
+            force_retrain=force_retrain,
             progress_callback=progress_callback,
         )
     except Exception as exc:  # noqa: BLE001 — surface train errors honestly
@@ -488,6 +492,7 @@ def _train_mlx(
                 "Prefetch with: personality-protect download --format mlx\n"
                 "Train uses memory-capped subprocess chunks so a 48 GB Mac stays usable. "
                 "Try: --proof (bounded steps) or --memory-gb 16 --chunk-steps 25\n"
+                "Crash mid-train? Re-run with --resume (keeps adapters + completed_steps).\n"
                 "For a no-download smoke test: --backend mock"
             ),
             steps=0,
@@ -496,6 +501,7 @@ def _train_mlx(
 
     proof_note = " [proof mode]" if proof else ""
     resume_note = " [resumed]" if resume else ""
+    retrain_note = " [force-retrain]" if force_retrain else ""
     return TrainResult(
         backend="mlx",
         status="ok",
@@ -504,13 +510,13 @@ def _train_mlx(
         examples=n,
         notes=(
             f"MLX LoRA adapter saved under {adapter_dir} "
-            f"(base={base_model}, steps={max_steps}, "
+            f"(base={base_model}, steps={meta.get('completed_steps', max_steps)}, "
             f"chunks={meta.get('chunks')}, "
             f"wired_cap={meta.get('wired_limit_gb')} GB)"
-            f"{proof_note}{resume_note}"
+            f"{proof_note}{resume_note}{retrain_note}"
         ),
         meta={"loss": None, **meta},
-        steps=max_steps,
+        steps=int(meta.get("completed_steps") or max_steps),
     )
 
 

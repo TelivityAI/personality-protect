@@ -259,3 +259,204 @@ def test_run_chunked_mlx_train_fresh_deletes_adapter(tmp_path: Path):
 
     # First chunk of a fresh run must not resume prior weights
     assert seen_resume[0] is None
+
+
+def test_checkpoint_meta_roundtrip(tmp_path: Path):
+    from personality_protect.mlx_train import (
+        load_train_checkpoint_meta,
+        write_train_checkpoint_meta,
+    )
+
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    meta = {
+        "status": "in_progress",
+        "completed_steps": 100,
+        "total_steps": 750,
+        "chunk_plan": [50, 50, 50],
+        "last_chunk": 2,
+        "chunk_steps": 50,
+    }
+    write_train_checkpoint_meta(adapter_dir, meta)
+    loaded = load_train_checkpoint_meta(adapter_dir)
+    assert loaded is not None
+    assert loaded["completed_steps"] == 100
+    assert loaded["total_steps"] == 750
+    assert loaded["last_chunk"] == 2
+    assert loaded["status"] == "in_progress"
+
+
+def test_resolve_resume_plan_remaining_only(tmp_path: Path):
+    from personality_protect.mlx_train import (
+        resolve_train_plan,
+        write_train_checkpoint_meta,
+    )
+
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapters.safetensors").write_bytes(b"ckpt")
+    write_train_checkpoint_meta(
+        adapter_dir,
+        {
+            "status": "in_progress",
+            "completed_steps": 100,
+            "total_steps": 250,
+            "chunk_plan": [50, 50, 50, 50, 50],
+            "last_chunk": 2,
+            "chunk_steps": 50,
+        },
+    )
+    plan = resolve_train_plan(
+        adapter_dir=adapter_dir,
+        total_steps=250,
+        chunk_steps=50,
+        resume=True,
+        force_retrain=False,
+    )
+    assert plan.already_completed == 100
+    assert plan.chunks_to_run == [50, 50, 50]
+    assert plan.total_steps == 250
+    assert (adapter_dir / "adapters.safetensors").is_file()
+
+
+def test_resolve_resume_plan_force_retrain_wipes(tmp_path: Path):
+    from personality_protect.mlx_train import resolve_train_plan
+
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapters.safetensors").write_bytes(b"old")
+    (adapter_dir / "0000050_adapters.safetensors").write_bytes(b"old50")
+    (adapter_dir / "train_chunks.json").write_text("{}", encoding="utf-8")
+    plan = resolve_train_plan(
+        adapter_dir=adapter_dir,
+        total_steps=100,
+        chunk_steps=50,
+        resume=False,
+        force_retrain=True,
+    )
+    assert plan.already_completed == 0
+    assert plan.chunks_to_run == [50, 50]
+    assert not (adapter_dir / "adapters.safetensors").exists()
+    assert not (adapter_dir / "0000050_adapters.safetensors").exists()
+
+
+def test_chunked_train_writes_meta_after_each_chunk(tmp_path: Path):
+    from personality_protect.mlx_train import (
+        load_train_checkpoint_meta,
+        run_chunked_mlx_train,
+    )
+
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "train.jsonl").write_text("{}\n", encoding="utf-8")
+    metas_during: list[dict] = []
+
+    with patch("personality_protect.mlx_train.run_mlx_chunk_subprocess") as mock_chunk:
+
+        def _side_effect(**kwargs):
+            (kwargs["adapter_dir"] / "adapters.safetensors").write_bytes(b"w")
+            # Numbered checkpoint (mlx-lm style)
+            n = kwargs["iters"]
+            (
+                kwargs["adapter_dir"] / f"{kwargs.get('_done', 0) + n:07d}_adapters.safetensors"
+            )
+            meta = load_train_checkpoint_meta(adapter_dir)
+            # Before this chunk finishes, prior meta should exist from previous chunk
+            metas_during.append(meta)
+            return MagicMock(
+                returncode=0,
+                adapters_ok=True,
+                last_iter=kwargs["iters"],
+                peak_mem_gb=6.0,
+                stdout=f"Iter {kwargs['iters']}: Train loss 1.0\n",
+                stderr="",
+            )
+
+        mock_chunk.side_effect = _side_effect
+        final = run_chunked_mlx_train(
+            model="m",
+            data_dir=data_dir,
+            adapter_dir=adapter_dir,
+            total_steps=120,
+            chunk_steps=50,
+            memory_gb=16.0,
+            resume=False,
+        )
+
+    assert mock_chunk.call_count == 3
+    mid = load_train_checkpoint_meta(adapter_dir)
+    assert mid is not None
+    assert mid["completed_steps"] == 120
+    assert mid["total_steps"] == 120
+    assert mid["status"] == "complete"
+    assert mid["last_chunk"] == 3
+    assert mid["chunk_plan"] == [50, 50, 20]
+    assert final["completed_steps"] == 120
+    # After chunk 1 completed, meta must already show 50 before chunk 2 runs
+    assert metas_during[1] is not None
+    assert metas_during[1]["completed_steps"] == 50
+    assert metas_during[1]["status"] == "in_progress"
+
+
+def test_chunked_train_resume_skips_completed_steps(tmp_path: Path):
+    from personality_protect.mlx_train import (
+        run_chunked_mlx_train,
+        write_train_checkpoint_meta,
+    )
+
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapters.safetensors").write_bytes(b"prior")
+    write_train_checkpoint_meta(
+        adapter_dir,
+        {
+            "status": "in_progress",
+            "completed_steps": 100,
+            "total_steps": 150,
+            "chunk_plan": [50, 50, 50],
+            "last_chunk": 2,
+            "chunk_steps": 50,
+        },
+    )
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "train.jsonl").write_text("{}\n", encoding="utf-8")
+    seen_iters: list[int] = []
+
+    with patch("personality_protect.mlx_train.run_mlx_chunk_subprocess") as mock_chunk:
+
+        def _side_effect(**kwargs):
+            seen_iters.append(kwargs["iters"])
+            assert kwargs["resume_adapter"] is not None
+            (kwargs["adapter_dir"] / "adapters.safetensors").write_bytes(b"more")
+            return MagicMock(
+                returncode=0,
+                adapters_ok=True,
+                last_iter=kwargs["iters"],
+                peak_mem_gb=6.0,
+                stdout="Iter 50: Train loss 0.5\n",
+                stderr="",
+            )
+
+        mock_chunk.side_effect = _side_effect
+        events: list[dict] = []
+        meta = run_chunked_mlx_train(
+            model="m",
+            data_dir=data_dir,
+            adapter_dir=adapter_dir,
+            total_steps=150,
+            chunk_steps=50,
+            memory_gb=16.0,
+            resume=True,
+            progress_callback=events.append,
+        )
+
+    assert seen_iters == [50]  # only remaining chunk
+    assert meta["completed_steps"] == 150
+    assert meta["already_completed"] == 100
+    start = next(e for e in events if e.get("kind") == "start")
+    assert start["completed_steps"] == 100
+    assert start["total_steps"] == 150
+    assert start["resume"] is True
