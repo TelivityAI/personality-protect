@@ -140,3 +140,122 @@ def test_run_train_mlx_uses_chunks_and_progress(tmp_path: Path):
     assert mock_chunk.call_count == 3  # 50+50+20
     assert any(e.get("kind") == "chunk_start" for e in progress_events)
     assert any(e.get("kind") == "done" for e in progress_events)
+
+
+def test_run_chunked_mlx_train_resume_keeps_adapter(tmp_path: Path):
+    from personality_protect.mlx_train import run_chunked_mlx_train
+
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    existing = adapter_dir / "adapters.safetensors"
+    existing.write_bytes(b"prior-weights")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "train.jsonl").write_text("{}\n", encoding="utf-8")
+
+    with patch("personality_protect.mlx_train.run_mlx_chunk_subprocess") as mock_chunk:
+
+        def _side_effect(**kwargs):
+            assert kwargs["resume_adapter"] is not None
+            assert kwargs["resume_adapter"].is_file()
+            (kwargs["adapter_dir"] / "adapters.safetensors").write_bytes(b"continued")
+            return MagicMock(
+                returncode=0,
+                adapters_ok=True,
+                last_iter=kwargs["iters"],
+                peak_mem_gb=7.0,
+                stdout="Iter 10: Train loss 1.0\n",
+                stderr="",
+            )
+
+        mock_chunk.side_effect = _side_effect
+        meta = run_chunked_mlx_train(
+            model="mlx-community/Qwen3.5-9B-4bit",
+            data_dir=data_dir,
+            adapter_dir=adapter_dir,
+            total_steps=50,
+            chunk_steps=50,
+            memory_gb=16.0,
+            resume=True,
+        )
+
+    assert meta["resume"] is True
+    assert existing.read_bytes() == b"continued"
+    assert mock_chunk.call_count == 1
+
+
+def test_run_mlx_chunk_subprocess_forces_unbuffered(tmp_path: Path):
+    """Detached/nohup trains must not hang on block-buffered child stdout."""
+    from personality_protect.mlx_train import run_mlx_chunk_subprocess
+
+    adapter_dir = tmp_path / "adapters"
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "train.jsonl").write_text("{}\n", encoding="utf-8")
+
+    with patch("personality_protect.mlx_train.subprocess.Popen") as mock_popen:
+        proc = MagicMock()
+        proc.stdout = iter(["PP MLX chunk: iters=1\n", "Iter 1: Train loss 1.0\n"])
+        proc.wait.return_value = 0
+        mock_popen.return_value = proc
+        (adapter_dir).mkdir(parents=True, exist_ok=True)
+        # Pretend adapters appear after run
+        def _wait(*_a, **_k):
+            (adapter_dir / "adapters.safetensors").write_bytes(b"x")
+            return 0
+
+        proc.wait.side_effect = _wait
+        run_mlx_chunk_subprocess(
+            model="m",
+            data_dir=data_dir,
+            adapter_dir=adapter_dir,
+            iters=1,
+            wired_limit_bytes=16 * 10**9,
+        )
+        args, kwargs = mock_popen.call_args
+        cmd = args[0]
+        assert "-u" in cmd
+        assert kwargs["env"].get("PYTHONUNBUFFERED") == "1"
+
+
+def test_run_chunked_mlx_train_fresh_deletes_adapter(tmp_path: Path):
+
+    from personality_protect.mlx_train import run_chunked_mlx_train
+
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    existing = adapter_dir / "adapters.safetensors"
+    existing.write_bytes(b"prior-weights")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "train.jsonl").write_text("{}\n", encoding="utf-8")
+
+    seen_resume: list = []
+
+    with patch("personality_protect.mlx_train.run_mlx_chunk_subprocess") as mock_chunk:
+
+        def _side_effect(**kwargs):
+            seen_resume.append(kwargs.get("resume_adapter"))
+            (kwargs["adapter_dir"] / "adapters.safetensors").write_bytes(b"fresh")
+            return MagicMock(
+                returncode=0,
+                adapters_ok=True,
+                last_iter=kwargs["iters"],
+                peak_mem_gb=7.0,
+                stdout="Iter 10: Train loss 1.0\n",
+                stderr="",
+            )
+
+        mock_chunk.side_effect = _side_effect
+        run_chunked_mlx_train(
+            model="mlx-community/Qwen3.5-9B-4bit",
+            data_dir=data_dir,
+            adapter_dir=adapter_dir,
+            total_steps=50,
+            chunk_steps=50,
+            memory_gb=16.0,
+            resume=False,
+        )
+
+    # First chunk of a fresh run must not resume prior weights
+    assert seen_resume[0] is None

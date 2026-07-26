@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -444,6 +445,11 @@ def train_cmd(
         "--proof",
         help=f"Bounded real train ({PROOF_MAX_STEPS} steps) for receipts — not mock.",
     ),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help="MLX: continue from existing adapters.safetensors instead of deleting it.",
+    ),
     smoke: bool = typer.Option(
         False,
         "--smoke",
@@ -507,8 +513,66 @@ def train_cmd(
             )
         if memory_gb is not None:
             console.print(f"Metal wired memory cap: {memory_gb} GB")
+        if resume:
+            console.print("Resume: continuing from existing adapters.safetensors")
 
     progress_holder: dict = {}
+
+    def _make_plain_progress_callback():
+        """Line-oriented progress for nohup / redirected logs (no Rich Live)."""
+
+        def on_progress(info: dict) -> None:
+            kind = info.get("kind")
+            if kind == "start":
+                print(
+                    f"MLX LoRA start: {info.get('total_steps')} steps · "
+                    f"{info.get('chunks')} chunks · "
+                    f"cap {info.get('wired_limit_gb')} GB · "
+                    f"seq {info.get('max_seq_length')} · "
+                    f"resume={info.get('resume')}",
+                    flush=True,
+                )
+            elif kind == "chunk_start":
+                print(
+                    f"chunk {info.get('chunk')}/{info.get('chunks')} "
+                    f"start ({info.get('chunk_iters')} iters, "
+                    f"completed {info.get('completed_steps')}/"
+                    f"{info.get('total_steps')})",
+                    flush=True,
+                )
+            elif kind == "step":
+                line = str(info.get("line") or "").strip()
+                if line:
+                    print(
+                        f"step {info.get('global_step')}/"
+                        f"{info.get('total_steps')}: {line}",
+                        flush=True,
+                    )
+            elif kind == "chunk_done":
+                peak = info.get("peak_mem_gb")
+                peak_s = f" peak_mem={peak:.1f}GB" if peak else ""
+                print(
+                    f"chunk {info.get('chunk')}/{info.get('chunks')} done "
+                    f"({info.get('completed_steps')}/"
+                    f"{info.get('total_steps')}){peak_s}",
+                    flush=True,
+                )
+            elif kind == "done":
+                print(
+                    f"MLX LoRA done: adapter saved "
+                    f"(wired_cap={info.get('wired_limit_gb')} GB, "
+                    f"peak={info.get('peak_mem_gb')})",
+                    flush=True,
+                )
+            elif kind == "error":
+                detail = str(info.get("detail") or "")[-500:]
+                print(
+                    f"MLX LoRA FAILED chunk={info.get('chunk')} "
+                    f"exit={info.get('returncode')}\n{detail}",
+                    flush=True,
+                )
+
+        return on_progress
 
     def _make_progress_callback():
         if as_json or sft_only or detected not in {"mlx", "auto"} and backend != "mlx":
@@ -518,6 +582,12 @@ def train_cmd(
         # Only show bar for real MLX path
         if detected != "mlx":
             return None
+
+        # Rich Live + subprocess PIPE is hostile to nohup/redirected logs:
+        # the monitor shows an empty file after the banner even while (or after)
+        # the worker dies. Prefer plain flushed lines when stdout is not a TTY.
+        if not sys.stdout.isatty():
+            return _make_plain_progress_callback()
 
         progress = Progress(
             SpinnerColumn(),
@@ -605,6 +675,7 @@ def train_cmd(
             chunk_steps=chunk_steps,
             memory_gb=memory_gb,
             proof=proof,
+            resume=resume,
             progress_callback=callback,
         )
     except (FileNotFoundError, RuntimeError, MockFallbackError) as exc:

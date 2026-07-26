@@ -229,6 +229,7 @@ def run_train(
     chunk_steps: int = DEFAULT_CHUNK_STEPS,
     memory_gb: float | None = None,
     proof: bool = False,
+    resume: bool = False,
     progress_callback: ProgressCallback | None = None,
 ) -> TrainResult:
     config = load_config(paths)
@@ -299,6 +300,7 @@ def run_train(
             memory_gb=memory_gb,
             progress_callback=progress_callback,
             proof=proof,
+            resume=resume,
         )
     elif chosen == "cuda":
         result = _train_cuda(paths, sft_path, adapter_dir, model_id, n, steps)
@@ -428,6 +430,7 @@ def _train_mlx(
     memory_gb: float | None = None,
     progress_callback: ProgressCallback | None = None,
     proof: bool = False,
+    resume: bool = False,
 ) -> TrainResult:
     """LoRA fine-tune via chunked, memory-capped MLX subprocesses (not full BF16)."""
     import importlib.util
@@ -469,6 +472,7 @@ def _train_mlx(
             total_steps=max(1, max_steps),
             chunk_steps=chunk_steps,
             memory_gb=memory_gb,
+            resume=resume,
             progress_callback=progress_callback,
         )
     except Exception as exc:  # noqa: BLE001 — surface train errors honestly
@@ -491,6 +495,7 @@ def _train_mlx(
         )
 
     proof_note = " [proof mode]" if proof else ""
+    resume_note = " [resumed]" if resume else ""
     return TrainResult(
         backend="mlx",
         status="ok",
@@ -501,7 +506,8 @@ def _train_mlx(
             f"MLX LoRA adapter saved under {adapter_dir} "
             f"(base={base_model}, steps={max_steps}, "
             f"chunks={meta.get('chunks')}, "
-            f"wired_cap={meta.get('wired_limit_gb')} GB){proof_note}"
+            f"wired_cap={meta.get('wired_limit_gb')} GB)"
+            f"{proof_note}{resume_note}"
         ),
         meta={"loss": None, **meta},
         steps=max_steps,

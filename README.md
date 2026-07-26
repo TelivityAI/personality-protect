@@ -142,6 +142,7 @@ personality-protect train --backend mock --smoke --force   # CI / pipeline only
 personality-protect train --backend mlx                    # auto steps from corpus size
 personality-protect train --backend mlx --proof            # bounded real train (receipts)
 personality-protect train --backend mlx --chunk-steps 50 --memory-gb 16
+personality-protect train --backend mlx --resume --max-steps 500 --chunk-steps 50 --memory-gb 16
 personality-protect train --backend cuda --max-steps 200
 ```
 

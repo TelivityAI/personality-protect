@@ -165,11 +165,16 @@ def run_mlx_chunk_subprocess(
     env = os.environ.copy()
     env["PP_MLX_WIRED_BYTES"] = str(int(wired_limit_bytes))
     env["TOKENIZERS_PARALLELISM"] = "true"
+    # Critical: child stdout is a PIPE (not a TTY). Without this, mlx-lm's
+    # prints stay block-buffered and the parent appears frozen / gets killed
+    # while waiting for the first "Iter" line in redirected nohup logs.
+    env["PYTHONUNBUFFERED"] = "1"
     # Keep HF from spawning thread storms.
     env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
     cmd = [
         sys.executable,
+        "-u",  # unbuffered stdio even if env is stripped
         "-m",
         "personality_protect.mlx_chunk_worker",
         "--model",
@@ -248,9 +253,15 @@ def run_chunked_mlx_train(
     memory_gb: float | None = None,
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     num_layers: int = DEFAULT_NUM_LAYERS,
+    resume: bool = False,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """Train LoRA in subprocess chunks with progress events."""
+    """Train LoRA in subprocess chunks with progress events.
+
+    By default starts fresh (deletes existing adapters). Pass ``resume=True`` to
+    continue from ``adapter_dir/adapters.safetensors`` across a new CLI invocation
+    (chunks within one run always resume between subprocesses).
+    """
     chunks = plan_train_chunks(total_steps, chunk_steps)
     if not chunks:
         raise ValueError("total_steps must be >= 1")
@@ -264,12 +275,19 @@ def run_chunked_mlx_train(
 
     adapter_dir.mkdir(parents=True, exist_ok=True)
     adapter_file = adapter_dir / "adapters.safetensors"
-    # Fresh run: drop stale adapter so we don't silently resume old weights
-    # unless a prior chunk in THIS run wrote them.
-    if adapter_file.is_file():
-        adapter_file.unlink()
-    for stale in adapter_dir.glob("*_adapters.safetensors"):
-        stale.unlink()
+    if resume:
+        if not adapter_file.is_file():
+            raise FileNotFoundError(
+                f"--resume requested but no adapter at {adapter_file}. "
+                "Run a fresh train first, or omit --resume."
+            )
+    else:
+        # Fresh run: drop stale adapter so we don't silently resume old weights
+        # unless a prior chunk in THIS run wrote them.
+        if adapter_file.is_file():
+            adapter_file.unlink()
+        for stale in adapter_dir.glob("*_adapters.safetensors"):
+            stale.unlink()
 
     completed = 0
     peaks: list[float] = []
@@ -282,6 +300,7 @@ def run_chunked_mlx_train(
                 "chunk_steps": chunk_steps,
                 "wired_limit_gb": round(wired / 1e9, 2),
                 "max_seq_length": max_seq_length,
+                "resume": resume and adapter_file.is_file(),
             }
         )
 
@@ -339,9 +358,23 @@ def run_chunked_mlx_train(
                         "detail": err_tail,
                     }
                 )
+            sig_hint = ""
+            if result.returncode < 0:
+                import signal
+
+                try:
+                    signame = signal.Signals(-result.returncode).name
+                except ValueError:
+                    signame = f"signal_{-result.returncode}"
+                sig_hint = (
+                    f" Process killed by {signame} (exit={result.returncode}). "
+                    "If SIGTERM: another agent/script likely pkill'd the worker — "
+                    "do not restart-kill mid-train. If SIGKILL: check jetsam/OOM."
+                )
             raise RuntimeError(
                 f"MLX train chunk {i}/{len(chunks)} failed "
-                f"(exit={result.returncode}, adapters_ok={result.adapters_ok}).\n"
+                f"(exit={result.returncode}, adapters_ok={result.adapters_ok})."
+                f"{sig_hint}\n"
                 f"Wired limit was {wired / 1e9:.1f} GB (capped; mlx-lm alone would "
                 f"try ~{max_rec / 1e9:.0f} GB and can kill the Mac).\n"
                 f"Last output:\n{err_tail}"
@@ -368,6 +401,8 @@ def run_chunked_mlx_train(
         "max_seq_length": max_seq_length,
         "num_layers": num_layers,
         "adapter_file": str(adapter_file),
+        "resume": bool(resume),
+        "steps_this_run": total_steps,
     }
     if progress_callback:
         progress_callback({"kind": "done", **meta, "total_steps": total_steps})
