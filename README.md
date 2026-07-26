@@ -1,10 +1,14 @@
 # PersonalityProtect
 
-**Local-only personal writing-voice filter.** Train a small LoRA adapter on your own writing, then rewrite AI drafts so they sound like you — not like LinkedIn slop.
+**Stop sounding like everyone else's AI.**
 
-Runs on **quantized Qwen3.5-9B** (~5–7 GB on disk). Your corpus, indexes, SFT JSONL, and adapters **never leave this machine**. No cloud fine-tune. No Colab. No uploading personal weights.
+Train a small LoRA on *your* writing. Filter AI drafts so they carry your cadence — not LinkedIn-style mush. Runs locally on quantized Qwen3.5-9B (~5–7 GB). Your corpus, SFT JSONL, and adapters **never leave this machine**.
 
-Built by [Telivity](https://telivity.com). Apache-2.0. **Alpha** — the pipeline works; voice-match quality is still improving.
+Built by [Telivity](https://telivity.com). Apache-2.0. **Alpha** — the pipeline is real; voice-match quality is still climbing. Don't expect magic after one short train.
+
+<p align="center">
+  <img src="docs/images/cli-demo.png" alt="personality-protect demo: synthetic AI slop draft rewritten locally" width="760" />
+</p>
 
 ```text
 your writing ──► ingest ──► select ──► train (local LoRA) ──► filter ──► your voice
@@ -14,11 +18,37 @@ your writing ──► ingest ──► select ──► train (local LoRA) ─�
 
 ---
 
-## Why
+## How it came about
 
-Frontier models default to generic corporate voice: *“In today’s fast-paced world, we must leverage synergies…”* Prompting helps a little. A local adapter trained on **your** posts, notes, and emails helps more — without shipping your writing to a cloud trainer.
+The feed is drowning in AI writing that all sounds the same — *“In today’s fast-paced world, we must leverage synergies…”* Prompting helps a little. Pasting a style guide into the system prompt helps a little more. Neither puts **your** voice into the model.
 
-PersonalityProtect is that filter: ingest locally → select → train a small adapter on a quantized base → rewrite drafts before you publish.
+Cloud fine-tunes are a non-option for personal writing. Notes, emails, and posts are biometric-adjacent. Shipping them to a rented GPU farm so someone else's stack can imitate you is a strange bargain.
+
+PersonalityProtect is the other path: keep the corpus on disk, train a small adapter on a quantized base (MLX on Apple Silicon, or CUDA), then rewrite drafts *before* they go public. The weights that carry your voice stay under your profile directory. Nothing leaves the machine.
+
+Alpha honesty: this will not make every draft sound exactly like you on day one. More (and better) personal writing → better results. Treat early outputs as drafts you still edit.
+
+---
+
+## Screenshots
+
+Synthetic demo only — safe for public docs. No personal corpus.
+
+| Demo (before → after) | Filter a draft | Telivity mark |
+| --- | --- | --- |
+| <img src="docs/images/cli-demo.png" alt="demo before/after" width="360" /> | <img src="docs/images/cli-filter.png" alt="filter command" width="360" /> | <img src="docs/images/cli-logo.png" alt="Telivity CLI logo" width="280" /> |
+
+```bash
+personality-protect demo          # synthetic ingest → mock train → filter
+personality-protect logo          # Telivity terminal mark
+personality-protect filter --text "In today's fast-paced world…"
+```
+
+Local profile state after a real run:
+
+<p align="center">
+  <img src="docs/images/cli-status.png" alt="personality-protect status on a local demo profile" width="480" />
+</p>
 
 ---
 
@@ -30,8 +60,6 @@ PersonalityProtect is that filter: ingest locally → select → train a small a
 | Quantized download (~5–7 GB) | Eval metrics / automatic quality gates |
 | Chunked, resumable MLX train | CUDA path polish |
 | Privacy defaults + sanitize CI | Browser extension (API stub only) |
-
-Don’t expect magic after one short train. More (and better) personal writing → better results. Treat early outputs as drafts you still edit.
 
 ---
 
@@ -105,7 +133,7 @@ personality-protect demo --json    # machine-readable; no logo
 
 Runs: init → ingest synthetic docs → select → mock train → filter.
 
-### 2. Real local path (Average Joe)
+### 2. Real local path
 
 ```bash
 personality-protect init
