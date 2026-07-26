@@ -419,6 +419,84 @@ def test_resolve_resume_plan_force_retrain_wipes(tmp_path: Path):
     assert not (adapter_dir / "0000050_adapters.safetensors").exists()
 
 
+def test_incomplete_checkpoint_auto_resumes_without_flag(tmp_path: Path):
+    """Crash restart must NOT wipe — incomplete train_chunks.json auto-resumes."""
+    from personality_protect.mlx_train import (
+        is_incomplete_checkpoint,
+        resolve_train_plan,
+        write_train_checkpoint_meta,
+    )
+
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapters.safetensors").write_bytes(b"GOOD")
+    write_train_checkpoint_meta(
+        adapter_dir,
+        {
+            "status": "in_progress",
+            "completed_steps": 50,
+            "total_steps": 200,
+            "chunk_plan": [50, 50, 50, 50],
+            "last_chunk": 1,
+            "chunk_steps": 50,
+        },
+    )
+    assert is_incomplete_checkpoint(adapter_dir) is True
+    plan = resolve_train_plan(
+        adapter_dir=adapter_dir,
+        total_steps=200,
+        chunk_steps=50,
+        resume=False,  # user forgot --resume
+        force_retrain=False,
+    )
+    assert plan.resume is True
+    assert plan.auto_resumed is True
+    assert plan.already_completed == 50
+    assert plan.chunks_to_run == [50, 50, 50]
+    assert (adapter_dir / "adapters.safetensors").read_bytes() == b"GOOD"
+
+
+def test_completed_checkpoint_still_wipes_without_resume(tmp_path: Path):
+    """Finished runs without --resume still start clean (use --force-retrain to be explicit)."""
+    from personality_protect.mlx_train import (
+        is_incomplete_checkpoint,
+        resolve_train_plan,
+        write_train_checkpoint_meta,
+    )
+
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapters.safetensors").write_bytes(b"DONE")
+    write_train_checkpoint_meta(
+        adapter_dir,
+        {
+            "status": "complete",
+            "completed_steps": 750,
+            "total_steps": 750,
+            "steps_this_run": 750,
+        },
+    )
+    assert is_incomplete_checkpoint(adapter_dir) is False
+    plan = resolve_train_plan(
+        adapter_dir=adapter_dir,
+        total_steps=200,
+        chunk_steps=50,
+        resume=False,
+        force_retrain=False,
+    )
+    assert plan.resume is False
+    assert plan.already_completed == 0
+    assert not (adapter_dir / "adapters.safetensors").exists()
+
+
+def test_legacy_steps_this_run_counts_as_completed(tmp_path: Path):
+    from personality_protect.mlx_train import completed_steps_from_meta
+
+    assert completed_steps_from_meta({"steps_this_run": 750}) == 750
+    assert completed_steps_from_meta({"completed_steps": 100, "steps_this_run": 50}) == 100
+    assert completed_steps_from_meta(None) == 0
+
+
 def test_chunked_train_writes_meta_after_each_chunk(tmp_path: Path):
     from personality_protect.mlx_train import (
         load_train_checkpoint_meta,

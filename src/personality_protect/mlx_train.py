@@ -101,6 +101,35 @@ def load_train_checkpoint_meta(adapter_dir: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def completed_steps_from_meta(meta: dict[str, Any] | None) -> int:
+    """Resolve how many steps are already trained (legacy-safe)."""
+    if not meta:
+        return 0
+    if "completed_steps" in meta and meta.get("completed_steps") is not None:
+        return max(0, int(meta["completed_steps"]))
+    # Older finished runs only recorded steps_this_run.
+    return max(0, int(meta.get("steps_this_run") or 0))
+
+
+def is_incomplete_checkpoint(adapter_dir: Path) -> bool:
+    """True when adapters + train_chunks.json show an unfinished chunked train.
+
+    Safe default for crash recovery: do not wipe these weights unless
+    ``--force-retrain`` is explicit.
+    """
+    if not (adapter_dir / "adapters.safetensors").is_file():
+        return False
+    meta = load_train_checkpoint_meta(adapter_dir)
+    if not meta:
+        return False
+    status = str(meta.get("status") or "").lower()
+    if status == "in_progress":
+        return True
+    done = completed_steps_from_meta(meta)
+    total = int(meta.get("total_steps") or 0)
+    return total > 0 and done < total
+
+
 @dataclass
 class TrainPlan:
     """Resolved chunk plan for a fresh or resumed MLX train."""
@@ -111,6 +140,7 @@ class TrainPlan:
     chunk_steps: int
     resume: bool
     full_chunk_plan: list[int]
+    auto_resumed: bool = False
 
 
 def _clear_adapter_weights(adapter_dir: Path) -> None:
@@ -132,13 +162,22 @@ def resolve_train_plan(
     resume: bool = False,
     force_retrain: bool = False,
 ) -> TrainPlan:
-    """Decide chunks to run; resume keeps weights and skips completed steps."""
+    """Decide chunks to run; resume keeps weights and skips completed steps.
+
+    Incomplete ``train_chunks.json`` (status=in_progress or completed < total)
+    auto-resumes so a crash restart does not wipe adapters. Pass
+    ``force_retrain=True`` for an explicit clean slate.
+    """
+    if force_retrain and resume:
+        raise ValueError("Pass only one of --resume or --force-retrain")
+
     total = max(1, int(total_steps))
     size = int(chunk_steps)
     adapter_dir.mkdir(parents=True, exist_ok=True)
     adapter_file = adapter_dir / "adapters.safetensors"
+    auto_resumed = False
 
-    if force_retrain or not resume:
+    if force_retrain:
         _clear_adapter_weights(adapter_dir)
         full = plan_train_chunks(total, size)
         return TrainPlan(
@@ -148,6 +187,24 @@ def resolve_train_plan(
             chunk_steps=size,
             resume=False,
             full_chunk_plan=full,
+            auto_resumed=False,
+        )
+
+    if not resume and is_incomplete_checkpoint(adapter_dir):
+        resume = True
+        auto_resumed = True
+
+    if not resume:
+        _clear_adapter_weights(adapter_dir)
+        full = plan_train_chunks(total, size)
+        return TrainPlan(
+            chunks_to_run=full,
+            already_completed=0,
+            total_steps=total,
+            chunk_steps=size,
+            resume=False,
+            full_chunk_plan=full,
+            auto_resumed=False,
         )
 
     if not adapter_file.is_file():
@@ -157,7 +214,7 @@ def resolve_train_plan(
         )
 
     prior = load_train_checkpoint_meta(adapter_dir) or {}
-    already = max(0, int(prior.get("completed_steps") or 0))
+    already = completed_steps_from_meta(prior)
     # ``total_steps`` is the desired final completed count for this invocation.
     target = max(1, int(total_steps))
     remaining = max(0, target - already)
@@ -170,6 +227,7 @@ def resolve_train_plan(
         chunk_steps=size,
         resume=True,
         full_chunk_plan=full,
+        auto_resumed=auto_resumed,
     )
 
 def resolve_wired_limit_bytes(
@@ -395,8 +453,10 @@ def run_chunked_mlx_train(
 
     Each successful chunk persists ``adapters.safetensors`` (mlx-lm) and updates
     ``train_chunks.json`` so a crash can ``--resume`` from completed_steps.
-    Pass ``resume=True`` to keep weights and run only remaining steps toward
-    ``total_steps``. Pass ``force_retrain=True`` (or omit resume) to start clean.
+    Incomplete checkpoints (status=in_progress or completed < total) auto-resume
+    even without ``resume=True`` so a plain restart does not wipe weights.
+    Pass ``resume=True`` to continue a finished adapter toward a higher
+    ``total_steps``. Pass ``force_retrain=True`` for an explicit clean slate.
     """
     if force_retrain and resume:
         raise ValueError("Pass only one of --resume or --force-retrain")
@@ -466,6 +526,7 @@ def run_chunked_mlx_train(
                 "wired_limit_gb": round(wired / 1e9, 2),
                 "max_seq_length": max_seq_length,
                 "resume": plan.resume,
+                "auto_resumed": plan.auto_resumed,
             }
         )
 

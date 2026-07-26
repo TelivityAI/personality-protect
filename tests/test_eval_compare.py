@@ -27,6 +27,7 @@ def test_synthetic_evals_packaged():
     assert len(drafts) >= 3
     stems = {p.stem for p in drafts}
     assert "slop_branding" in stems
+    assert "clean_neutral" in stems
 
 
 def test_slop_score_detects_tells():

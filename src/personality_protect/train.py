@@ -244,6 +244,22 @@ def run_train(
     # --proof: real weights, bounded steps for receipts (not a silent mock).
     if proof and max_steps is None and not smoke and not mock:
         max_steps = PROOF_MAX_STEPS
+    # Crash recovery: keep the original target when an incomplete checkpoint exists
+    # and the user did not pass a new --max-steps.
+    if max_steps is None and not force_retrain and not smoke and not mock:
+        from personality_protect.mlx_train import (
+            completed_steps_from_meta,
+            is_incomplete_checkpoint,
+            load_train_checkpoint_meta,
+        )
+
+        latest = paths.adapters_dir / "latest"
+        if is_incomplete_checkpoint(latest) or resume:
+            prior = load_train_checkpoint_meta(latest) or {}
+            prior_total = int(prior.get("total_steps") or 0)
+            done = completed_steps_from_meta(prior)
+            if prior_total > done:
+                max_steps = prior_total
     steps = auto_max_steps(n, smoke=smoke or mock, max_steps=max_steps)
 
     if sft_only:

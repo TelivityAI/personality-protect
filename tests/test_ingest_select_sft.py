@@ -254,6 +254,36 @@ def test_piece_to_examples_includes_clean_draft_voice_pair():
     assert "northwind" in draft.lower()
 
 
+def test_clean_generic_draft_forces_rewrite_even_on_flat_prose():
+    """Already-clean drafts must NOT be near-identity — that teaches LoRA pass-through."""
+    from personality_protect.sft import _clean_generic_draft, normalize_corpus_text
+
+    text = (
+        "Personal branding matters more than ever as AI tools flood every channel. "
+        "Companies need a clear point of view, not another template post about authenticity."
+    )
+    target = normalize_corpus_text(text)
+    draft = _clean_generic_draft(text)
+    assert draft.strip() != target.strip()
+    # Still clean — no AI-tell scaffolding
+    assert "leverage" not in draft.lower()
+    assert "fast-paced" not in draft.lower()
+    assert "synerg" not in draft.lower()
+    assert "testament" not in draft.lower()
+    # Lexical overlap must drop so the assistant target teaches voice injection
+    tw = set(re.findall(r"[a-z0-9']+", target.lower()))
+    dw = set(re.findall(r"[a-z0-9']+", draft.lower()))
+    overlap = len(tw & dw) / max(1, len(tw))
+    assert overlap < 0.75, f"clean draft still near-identity (overlap={overlap:.2f})"
+    # Meaning retained
+    assert "branding" in draft.lower() or "brand" in draft.lower()
+    assert (
+        "authenticity" in draft.lower()
+        or "authentic" in draft.lower()
+        or "genuine" in draft.lower()
+    )
+
+
 def test_neutral_draft_is_not_near_identity_copy():
     """Draft must teach rewrite→voice, not strip-opener-and-copy."""
     from personality_protect.models import Piece

@@ -450,7 +450,8 @@ def train_cmd(
         "--resume",
         help=(
             "MLX: continue from adapters.safetensors + train_chunks.json "
-            "(skips completed_steps; does not delete weights)."
+            "(skips completed_steps; does not delete weights). "
+            "Incomplete checkpoints auto-resume even without this flag."
         ),
     ),
     force_retrain: bool = typer.Option(
@@ -524,19 +525,33 @@ def train_cmd(
         if resume and force_retrain:
             console.print("[red]Pass only one of --resume or --force-retrain[/red]")
             raise typer.Exit(2)
-        if resume:
-            from personality_protect.mlx_train import load_train_checkpoint_meta
-
-            prior = load_train_checkpoint_meta(paths.adapters_dir / "latest") or {}
-            done = int(prior.get("completed_steps") or 0)
-            target = max_steps or int(prior.get("total_steps") or 0) or "…"
-            console.print(
-                f"Resume: continuing from step {done}/{target} "
-                "(adapters.safetensors + train_chunks.json)"
-            )
         if force_retrain:
             console.print("Force retrain: wiping adapters and starting clean")
+        else:
+            from personality_protect.mlx_train import (
+                completed_steps_from_meta,
+                is_incomplete_checkpoint,
+                load_train_checkpoint_meta,
+            )
 
+            latest = paths.adapters_dir / "latest"
+            prior = load_train_checkpoint_meta(latest) or {}
+            done = completed_steps_from_meta(prior)
+            incomplete = is_incomplete_checkpoint(latest)
+            if resume or incomplete:
+                target = max_steps or int(prior.get("total_steps") or 0) or "…"
+                why = "explicit --resume" if resume else "incomplete checkpoint (auto-resume)"
+                console.print(
+                    f"Resume: continuing from step {done}/{target} "
+                    f"({why}; adapters.safetensors + train_chunks.json). "
+                    "Each finished chunk is a checkpoint — crash-safe with --resume."
+                )
+            elif (latest / "adapters.safetensors").is_file() and not resume:
+                console.print(
+                    "Note: existing adapters will be wiped unless you pass "
+                    "--resume (or an incomplete train_chunks.json auto-resumes). "
+                    "Use --force-retrain to wipe deliberately."
+                )
     progress_holder: dict = {}
 
     def _make_plain_progress_callback():
