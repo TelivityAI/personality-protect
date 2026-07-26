@@ -2,9 +2,9 @@
 
 **Stop sounding like everyone else's AI.**
 
-Train a small LoRA on *your* writing. Filter AI drafts so they carry your cadence — not LinkedIn-style mush. Runs locally on quantized Qwen3.5-9B (~5–7 GB). Your corpus, SFT JSONL, and adapters **never leave this machine**.
+v1 CLI — shipped and working. Train a small LoRA on *your* writing. Filter AI drafts so they carry your cadence — not LinkedIn-style mush. Runs locally on quantized Qwen3.5-9B (~5–7 GB). Your corpus, SFT JSONL, and adapters **never leave this machine**.
 
-Built by [Telivity](https://telivity.com). Apache-2.0. **Alpha** — the pipeline is real; voice-match quality is still climbing. Don't expect magic after one short train.
+Built by [Telivity](https://telivity.com). Apache-2.0. The on-device pipe is real: ingest → select → chunked train → filter → compare. Voice fidelity (leave-alone + cadence) is what we're sharpening next — not “does the product work?”
 
 <p align="center">
   <img src="docs/images/cli-demo.png" alt="personality-protect demo: synthetic AI slop draft rewritten locally" width="760" />
@@ -26,7 +26,7 @@ Cloud fine-tunes are a non-option for personal writing. Notes, emails, and posts
 
 PersonalityProtect is the other path: keep the corpus on disk, train a small adapter on a quantized base (MLX on Apple Silicon, or CUDA), then rewrite drafts *before* they go public. The weights that carry your voice stay under your profile directory. Nothing leaves the machine.
 
-Alpha honesty: this will not make every draft sound exactly like you on day one. More (and better) personal writing → better results. Treat early outputs as drafts you still edit.
+Honest about the hard part: the pipeline ships; sounding *exactly* like you is the ongoing craft. More (and better) personal writing → better leave-alone and cadence. Treat outputs as drafts you still own — we are not claiming “indistinguishable from your LinkedIn” as a solved problem.
 
 ---
 
@@ -52,11 +52,11 @@ Local profile state after a real run:
 
 ---
 
-## Status (honest)
+## Status
 
-| Ready | Still improving |
+| Shipped (v1 CLI) | Sharpening |
 | --- | --- |
-| End-to-end CLI pipeline | How closely output matches *your* voice |
+| End-to-end local pipeline | Voice fidelity (leave-alone + cadence) |
 | Quantized download (~5–7 GB) | Eval metrics / automatic quality gates |
 | Chunked, resumable MLX train | CUDA path polish |
 | Privacy defaults + sanitize CI | Browser extension (API stub only) |
