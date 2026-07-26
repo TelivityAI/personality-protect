@@ -900,13 +900,19 @@ def demo_cmd(
     ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Run synthetic corpus end-to-end (safe for public screenshots)."""
+    """Optional synthetic mock tour (not the shipped mlx/llama path)."""
     _banner_from_ctx(ctx, json_mode=as_json)
     result = run_demo(home=home, draft=draft)
     if as_json:
         typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
         return
-    console.print("[bold]Demo complete[/bold] (synthetic data only; nothing left the machine).")
+    console.print(
+        "[bold]Mock tour complete[/bold] "
+        "(synthetic data + mock adapter only — not the shipped product path)."
+    )
+    console.print(
+        "[dim]Shipped path: train --backend mlx|cuda → filter/compare with llama|mlx.[/dim]"
+    )
     console.print(f"Ingested: {result['ingested']}  Selected: {result['selected']}")
     console.print(f"Train: {result['train_status']} via {result['train_backend']}")
     console.print("")
