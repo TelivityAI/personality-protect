@@ -29,6 +29,13 @@ DEFAULT_MIN_WORDS = 50
 DEFAULT_THROUGH_YEAR = 2024
 DEFAULT_PROFILE = "default"
 
+# Corpus size gates for credible full train (bypass with --force / --smoke)
+CORPUS_WARN_BELOW = 50
+CORPUS_BLOCK_BELOW = 20
+
+# Explicit smoke / CI low-step default (not a silent full-train stand-in)
+SMOKE_MAX_STEPS = 2
+
 
 def default_home() -> Path:
     """Root for all local PersonalityProtect state (never committed)."""
@@ -110,6 +117,11 @@ class ProfilePaths:
         return self.adapters_dir / "adapter_meta.json"
 
     @property
+    def evals_dir(self) -> Path:
+        """Local before/after eval receipts (never commit)."""
+        return self.root / "evals"
+
+    @property
     def models_dir(self) -> Path:
         """Shared quantized model cache (GGUF etc.) under the home root."""
         return self.home / "models"
@@ -123,6 +135,7 @@ class ProfilePaths:
             self.cache_dir,
             self.sft_dir,
             self.adapters_dir,
+            self.evals_dir,
             self.models_dir,
             self.home / "profiles",
         ):

@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import io
-import os
 import subprocess
 from pathlib import Path
-
-import pytest
 
 from personality_protect.logo import render_logo, resolve_mode
 

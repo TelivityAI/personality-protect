@@ -11,8 +11,11 @@ from rich.console import Console
 from rich.table import Table
 
 from personality_protect import __version__
-from personality_protect.api import DEFAULT_HOST, DEFAULT_PORT, serve as serve_api
+from personality_protect.api import DEFAULT_HOST, DEFAULT_PORT
+from personality_protect.api import serve as serve_api
 from personality_protect.config import (
+    CORPUS_BLOCK_BELOW,
+    CORPUS_WARN_BELOW,
     DEFAULT_BASE_MODEL,
     DEFAULT_GGUF_FILE,
     DEFAULT_GGUF_SIZE_HINT,
@@ -27,6 +30,12 @@ from personality_protect.config import (
 )
 from personality_protect.demo import run_demo
 from personality_protect.download import run_download
+from personality_protect.eval_compare import (
+    list_synthetic_drafts,
+    resolve_eval_draft,
+    run_compare,
+    run_eval,
+)
 from personality_protect.filter import filter_draft, read_draft_input
 from personality_protect.ingest import run_ingest
 from personality_protect.logo import (
@@ -38,7 +47,13 @@ from personality_protect.logo import (
 )
 from personality_protect.models import load_index, summarize_by_source_year
 from personality_protect.select import run_select
-from personality_protect.train import backend_docs, detect_backend, run_train
+from personality_protect.train import (
+    MockFallbackError,
+    auto_max_steps,
+    backend_docs,
+    detect_backend,
+    run_train,
+)
 
 app = typer.Typer(
     name="personality-protect",
@@ -123,7 +138,8 @@ def main(
         typer.echo("Run with --help for commands. Data never leaves this machine.")
         typer.echo("")
         typer.echo(
-            "Commands: init | download | ingest | select | train | filter | demo | api | logo"
+            "Commands: init | download | ingest | select | train | filter | "
+            "eval | compare | demo | api | logo | status"
         )
 
 
@@ -291,6 +307,11 @@ def select_cmd(
         "--source",
         help="Only these sources (repeatable).",
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=f"Allow continuing with fewer than {CORPUS_BLOCK_BELOW} pieces.",
+    ),
     profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
     home: Optional[Path] = typer.Option(None, "--home"),
     as_json: bool = typer.Option(False, "--json"),
@@ -312,12 +333,30 @@ def select_cmd(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
 
+    n = len(selected)
+    gate_error = None
+    gate_warn = None
+    if n < CORPUS_BLOCK_BELOW and not force:
+        gate_error = (
+            f"Only {n} pieces selected (need >={CORPUS_BLOCK_BELOW} for full train). "
+            "Ingest more writing or pass --force."
+        )
+    elif n < CORPUS_WARN_BELOW:
+        gate_warn = (
+            f"Only {n} pieces selected (recommend >={CORPUS_WARN_BELOW} "
+            "for a credible voice adapter)."
+        )
+
     payload = selection.to_dict()
+    payload["corpus_warn"] = gate_warn
+    payload["corpus_block"] = gate_error
     if as_json:
         typer.echo(json.dumps(payload, indent=2))
+        if gate_error:
+            raise typer.Exit(2)
         return
     console.print(
-        f"Selected [bold]{len(selected)}[/bold] pieces "
+        f"Selected [bold]{n}[/bold] pieces "
         f"(min_words={selection.min_words}, through_year={selection.through_year})."
     )
     if selection.summary.get("undated_in_index"):
@@ -326,6 +365,11 @@ def select_cmd(
             f"(use --include-undated or --include <id>)."
         )
     _print_summary(selection.summary)
+    if gate_warn:
+        console.print(f"[yellow]{gate_warn}[/yellow]")
+    if gate_error:
+        console.print(f"[red]{gate_error}[/red]")
+        raise typer.Exit(2)
     console.print(f"Saved: {paths.selection_path}")
     console.print("Next: personality-protect train")
 
@@ -371,11 +415,30 @@ def train_cmd(
         "--backend",
         help="auto | mlx | cuda | cpu | mock",
     ),
-    max_steps: int = typer.Option(100, "--max-steps", help="Train steps/iters."),
+    max_steps: Optional[int] = typer.Option(
+        None,
+        "--max-steps",
+        help="Train steps/iters (default: auto from SFT count, or smoke low-step).",
+    ),
+    smoke: bool = typer.Option(
+        False,
+        "--smoke",
+        help="CI/low-step train (does not silently substitute mock).",
+    ),
+    allow_mock: bool = typer.Option(
+        False,
+        "--allow-mock",
+        help="Permit mock fallback when a real backend is unavailable.",
+    ),
     mock: bool = typer.Option(
         False,
         "--mock",
         help="Smoke-train without downloading any multi-GB model.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=f"Allow train with fewer than {CORPUS_BLOCK_BELOW} SFT examples.",
     ),
     sft_only: bool = typer.Option(
         False,
@@ -393,20 +456,39 @@ def train_cmd(
         console.print(f"[red]Unknown backend: {backend}[/red]")
         raise typer.Exit(2)
 
-    detected = detect_backend("mock" if mock else backend)  # type: ignore[arg-type]
+    try:
+        detected = detect_backend(
+            "mock" if mock else backend,  # type: ignore[arg-type]
+            allow_mock=allow_mock or mock,
+        )
+    except MockFallbackError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
     if not as_json and not sft_only:
         console.print(f"Backend: [bold]{detected}[/bold]")
         console.print(backend_docs(detected))
-
+        if max_steps is None and not smoke and not mock:
+            console.print(
+                f"Steps: auto (≈{auto_max_steps(100)} for 100 examples; "
+                "scaled from your SFT count)"
+            )
+        elif smoke or mock:
+            console.print(
+                f"Steps: smoke/low-step ({max_steps or auto_max_steps(1, smoke=True)})"
+            )
     try:
         result = run_train(
             paths,
             backend=backend,  # type: ignore[arg-type]
             max_steps=max_steps,
             mock=mock,
+            smoke=smoke,
+            allow_mock=allow_mock,
+            force=force,
             sft_only=sft_only,
         )
-    except (FileNotFoundError, RuntimeError) as exc:
+    except (FileNotFoundError, RuntimeError, MockFallbackError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
 
@@ -414,12 +496,13 @@ def train_cmd(
         typer.echo(json.dumps(result.to_dict(), indent=2))
         return
     console.print(f"Status: [bold]{result.status}[/bold] ({result.backend})")
-    console.print(f"Examples: {result.examples}")
+    console.print(f"Examples: {result.examples}  Steps: {result.steps}")
     console.print(f"Adapter dir: {result.adapter_dir}")
     if result.notes:
         console.print(result.notes)
     if result.status == "ok":
         console.print("Next: personality-protect filter --text '…'")
+        console.print("Or: personality-protect compare --synthetic slop_branding")
 
 
 @app.command("filter")
@@ -472,6 +555,105 @@ def filter_cmd(
     console.print(rewritten)
     if out:
         console.print(f"[dim]wrote {out}[/dim]")
+
+
+@app.command("eval")
+def eval_cmd(
+    ctx: typer.Context,
+    text: Optional[str] = typer.Option(None, "--text", help="Draft text to eval."),
+    file: Optional[Path] = typer.Option(None, "--file", help="Read draft from file."),
+    synthetic: Optional[str] = typer.Option(
+        None,
+        "--synthetic",
+        help="Packaged synthetic draft stem (see data/evals/).",
+    ),
+    backend: str = typer.Option(
+        "auto",
+        "--backend",
+        help="auto | llama | gguf | mlx | transformers | mock",
+    ),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Write before/after filter receipts under the local profile evals/ dir."""
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    try:
+        draft, label = resolve_eval_draft(text=text, file=file, synthetic=synthetic)
+    except (ValueError, FileNotFoundError) as exc:
+        if text is None and file is None and synthetic is None:
+            names = ", ".join(p.stem for p in list_synthetic_drafts()) or "(none)"
+            console.print(f"[red]{exc}[/red]")
+            console.print(f"Packaged synthetics: {names}")
+            raise typer.Exit(2) from exc
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+
+    try:
+        result = run_eval(paths, draft, backend=backend, label=label)
+    except (FileNotFoundError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    if as_json:
+        typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+    console.print(f"[bold]Eval[/bold] backend={result['backend']}")
+    console.print(f"slop before={result['slop_before']} after={result['slop_after']}")
+    console.print(f"Wrote: {result['dir']}")
+    console.print("")
+    console.print("[bold]After[/bold]")
+    console.print(result["rewritten"])
+
+
+@app.command("compare")
+def compare_cmd(
+    ctx: typer.Context,
+    text: Optional[str] = typer.Option(None, "--text", help="Draft text to compare."),
+    file: Optional[Path] = typer.Option(None, "--file", help="Read draft from file."),
+    synthetic: Optional[str] = typer.Option(
+        None,
+        "--synthetic",
+        help="Packaged synthetic draft stem (default: first under data/evals/).",
+    ),
+    backend: str = typer.Option(
+        "auto",
+        "--backend",
+        help="Filter backend for LoRA path: auto | llama | mlx | mock | …",
+    ),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Compare raw draft vs prompt few-shot baseline vs LoRA/mock filter."""
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    try:
+        draft, label = resolve_eval_draft(text=text, file=file, synthetic=synthetic)
+    except (ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+
+    try:
+        result = run_compare(paths, draft, backend=backend, label=label)
+    except (FileNotFoundError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    if as_json:
+        typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+    console.print(f"[bold]Compare[/bold] filter_backend={result['filter_backend']}")
+    console.print(
+        f"slop raw={result['slop']['raw']} "
+        f"prompt={result['slop']['prompt_baseline']} "
+        f"lora={result['slop']['lora']}"
+    )
+    console.print(f"Wrote: {result['dir']}")
+    console.print("")
+    console.print("[bold]LoRA / adapter path[/bold]")
+    console.print(result["lora"])
 
 
 @app.command("demo")

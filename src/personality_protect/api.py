@@ -15,7 +15,6 @@ from personality_protect import __version__
 from personality_protect.config import DEFAULT_PROFILE, get_paths, load_config
 from personality_protect.filter import filter_draft
 
-
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 

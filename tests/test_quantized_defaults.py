@@ -40,11 +40,23 @@ def test_resolve_gguf_path(tmp_path: Path):
     assert found == fake
 
 
-def test_download_missing_deps_is_honest(tmp_path: Path):
-    # Without huggingface_hub, should report missing_deps (or ok if hub installed)
+def test_download_missing_deps_is_honest(tmp_path: Path, monkeypatch):
+    """Never hit the network in unit tests even if huggingface_hub is installed."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "huggingface_hub" or (
+            isinstance(name, str) and name.startswith("huggingface_hub.")
+        ):
+            raise ImportError("blocked in unit tests")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
     result = run_download(format="gguf", home=tmp_path, profile="t")
     assert result.format == "gguf"
-    assert result.status in {"missing_deps", "ok", "exists", "error"}
+    assert result.status == "missing_deps"
     assert "5" in result.size_hint or "6" in result.size_hint or "7" in result.size_hint
     assert "18" not in result.size_hint and "20" not in result.size_hint
 

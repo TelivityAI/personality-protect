@@ -11,15 +11,21 @@ from personality_protect.models import Piece
 from personality_protect.select import selected_pieces
 
 SYSTEM_PROMPT = (
-    "You rewrite text so it matches the user's authentic personal writing voice. "
-    "Keep meaning; prefer their cadence, word choice, and structure. "
-    "Do not invent facts."
+    "You are a personal voice rewriter. Rewrite the draft so it matches the user's "
+    "authentic writing voice exactly. Keep factual meaning unchanged. Prefer their "
+    "cadence, sentence rhythm, word choice, punctuation habits, and paragraph shape. "
+    "Strip generic AI tells such as: leverage, synergies, delve, robust, "
+    "In today's fast-paced world, It is important to note, Moreover, Furthermore, "
+    "unlock, nestled, testament, vibrant. Do not invent facts, citations, or claims. "
+    "Do not add hashtags, emoji, or marketing slogans unless the voice reference uses them."
 )
 
 USER_TEMPLATE = (
-    "Rewrite the following draft in my voice.\n\n"
+    "Rewrite the draft in my voice. Match my cadence and diction from the reference. "
+    "Keep the same meaning. Remove AI-sounding filler.\n\n"
     "### Draft\n{draft}\n\n"
-    "### My voice (reference)\n{reference}"
+    "### My voice (reference)\n{reference}\n\n"
+    "### Rewritten"
 )
 
 
@@ -63,6 +69,8 @@ def _neutral_draft(text: str) -> str:
         ("In my experience,", "Often,"),
         ("Here's the thing:", "Note:"),
         ("Let me be clear:", "To clarify:"),
+        ("I cut the corporate fog", "Remove corporate language"),
+        ("I do not need", "One does not need"),
     )
     for a, b in replacements:
         draft = draft.replace(a, b)

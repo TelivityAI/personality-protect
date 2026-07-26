@@ -27,6 +27,12 @@ linkedin_export/
 **/cache/linkedin_*/
 **/demo_corpus/
 
+# Local profile eval receipts (not packaged synthetic drafts under src/.../data/evals/)
+**/profiles/**/evals/
+train_result.json
+adapter_meta.json
+
+
 # Archives / dumps that often hold personal exports
 *.zip
 *.7z
