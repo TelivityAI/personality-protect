@@ -49,6 +49,9 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     os.environ["PP_MLX_WIRED_BYTES"] = str(args.wired_bytes)
 
+    from personality_protect.mlx_runtime import assert_mlx_import_allowed
+
+    assert_mlx_import_allowed()
     install_wired_cap(args.wired_bytes)
     _patch_empty_val_dataset()
 
@@ -73,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     ns.learning_rate = args.learning_rate
     ns.resume_adapter_file = args.resume_adapter_file
     ns.fine_tune_type = "lora"
+    ns.mask_prompt = True
     ns.report_to = None
     ns.clear_cache_threshold = 2 * 10**9  # clear allocator if cache > 2 GB
 

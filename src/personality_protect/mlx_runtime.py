@@ -4,6 +4,10 @@ mlx-lm's ``generate.wired_limit`` and trainer both call
 ``mx.set_wired_limit(max_recommended_working_set_size)`` (~40 GB on a 48 GB
 Mac). That jetsam-kills Python ("quit unexpectedly"). Every MLX entrypoint
 must install this cap before load/generate/train.
+
+Importing ``mlx`` / ``mlx_lm`` inside Cursor's sandboxed shell also SIGABRTs
+(Metal unavailable → uncaught C++ terminate). Call ``assert_mlx_import_allowed``
+before any ``import mlx*``.
 """
 
 from __future__ import annotations
@@ -21,11 +25,27 @@ from personality_protect.mlx_train import (
 _CAP_INSTALLED_FOR: int | None = None
 
 
+def assert_mlx_import_allowed() -> None:
+    """Raise before ``import mlx*`` when Metal/GPU use is explicitly disabled.
+
+    Set ``PP_MLX_DISABLE=1`` in agent sandboxes / CI so a stray import fails
+    cleanly instead of SIGABRT via ``metal::load_device``.
+    """
+    flag = (os.environ.get("PP_MLX_DISABLE") or "").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        raise RuntimeError(
+            "MLX import blocked (PP_MLX_DISABLE=1). "
+            "Do not load mlx/mlx_lm in sandboxed or headless sessions — "
+            "Metal abort kills Python. Use mock backend or a full-GPU shell."
+        )
+
+
 def install_wired_cap(limit_bytes: int) -> int:
     """Monkeypatch ``mx.set_wired_limit`` so callers cannot request more than ``limit_bytes``.
 
     Returns the effective limit applied.
     """
+    assert_mlx_import_allowed()
     import mlx.core as mx
 
     limit = max(1_000_000_000, int(limit_bytes))
@@ -66,7 +86,9 @@ def ensure_mlx_wired_cap(*, memory_gb: float | None = None) -> int:
     """Install a safe wired cap for the current process (idempotent).
 
     Honors ``PP_MLX_WIRED_BYTES`` / ``PP_MLX_MEMORY_GB`` env overrides.
+    Default hard cap is 16 GB. Prefer ``PP_MLX_MEMORY_GB<=16`` on Studio.
     """
+    assert_mlx_import_allowed()
     env_bytes = os.environ.get("PP_MLX_WIRED_BYTES")
     if env_bytes:
         try:

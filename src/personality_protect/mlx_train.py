@@ -29,7 +29,7 @@ DEFAULT_MAX_SEQ_LENGTH = 512
 DEFAULT_NUM_LAYERS = 8
 # Cap wired Metal memory: leave OS/apps breathing room.
 DEFAULT_WIRED_FRACTION = 0.40
-DEFAULT_WIRED_CAP_BYTES = 20 * 10**9  # 20 GB hard cap
+DEFAULT_WIRED_CAP_BYTES = 16 * 10**9  # 16 GB hard cap (leave Studio headroom)
 PROOF_MAX_STEPS = 150  # enough for real receipts without a marathon
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -209,6 +209,8 @@ def build_mlx_lora_argv(
         str(max(1, iters)),
         "--learning-rate",
         "1e-5",
+        # Loss on assistant tokens only — rewrite SFT, not draft echo.
+        "--mask-prompt",
     ]
     if resume_adapter is not None and resume_adapter.is_file():
         argv.extend(["--resume-adapter-file", str(resume_adapter)])
@@ -327,12 +329,15 @@ def run_mlx_chunk_subprocess(
 def detect_device_memory() -> tuple[int, int]:
     """Return (memory_size, max_recommended_working_set_size) from MLX if possible."""
     try:
+        from personality_protect.mlx_runtime import assert_mlx_import_allowed
+
+        assert_mlx_import_allowed()
         import mlx.core as mx
 
         info = mx.device_info()
         return int(info["memory_size"]), int(info["max_recommended_working_set_size"])
     except Exception:
-        # Sensible fallbacks for tests / non-Metal hosts
+        # Sensible fallbacks for tests / non-Metal hosts / PP_MLX_DISABLE
         return 48 * 10**9, 40 * 10**9
 
 

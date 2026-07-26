@@ -18,7 +18,9 @@ from personality_protect.filter import (
     FILTER_TEMPERATURE,
     build_filter_prompt,
     filter_draft,
+    mlx_prompt_baseline,
     read_draft_input,
+    strip_ai_tells,
 )
 from personality_protect.sft import SYSTEM_PROMPT
 
@@ -91,55 +93,68 @@ def _load_voice_anchors(paths: ProfilePaths, limit: int = 3) -> list[str]:
     return []
 
 
-def prompt_baseline_rewrite(draft: str, paths: ProfilePaths) -> str:
-    """Few-shot prompt baseline without LoRA weights (deterministic local heuristic).
+def _few_shot_block(anchors: list[str]) -> str:
+    if not anchors:
+        return ""
+    examples = []
+    for i, a in enumerate(anchors, 1):
+        examples.append(f"Example {i} (voice):\n{a}")
+    return "\n\n".join(examples)
 
-    Uses the same system prompt + voice anchors. Does not call a multi-GB model —
-    applies the same AI-tell cleanup as the mock filter, then prepends a cadence cue.
-    This keeps `compare` runnable in CI while still documenting the three-way split.
-    """
+
+def heuristic_prompt_baseline(draft: str, paths: ProfilePaths) -> str:
+    """Deterministic strip+tag baseline for CI / mock (no multi-GB model)."""
     anchors = _load_voice_anchors(paths)
-    few_shot = ""
-    if anchors:
-        examples = []
-        for i, a in enumerate(anchors, 1):
-            examples.append(f"Example {i} (voice):\n{a}")
-        few_shot = "\n\n".join(examples)
-
-    # Record the prompt that a real model would see (for receipts)
+    few_shot = _few_shot_block(anchors)
     _ = build_filter_prompt(draft, few_shot=few_shot or None)
-
-    body = draft
-    body = re.sub(
-        r"\bIn today's (?:fast-paced\s+)?(?:digital\s+)?(?:fast-paced\s+)?world,?\s*",
-        "",
-        body,
-        flags=re.I,
-    )
-    body = re.sub(r"\bIt is important to note that\s*", "", body, flags=re.I)
-    body = re.sub(r"\bMoreover,\s*", "Also, ", body, flags=re.I)
-    body = re.sub(r"\bFurthermore,\s*", "And ", body, flags=re.I)
-    body = re.sub(r"\butilize\b", "use", body, flags=re.I)
-    body = re.sub(r"\bleverage\b", "use", body, flags=re.I)
-    body = re.sub(r"\brobust\b", "solid", body, flags=re.I)
-    body = re.sub(r"\bsynergies\b", "strengths", body, flags=re.I)
-    body = re.sub(r"\bdelve into\b", "look at", body, flags=re.I)
-    body = re.sub(r"\s{2,}", " ", body).strip()
-    if body:
-        body = body[0].upper() + body[1:]
-
+    body = strip_ai_tells(draft)
     if anchors:
-        cue = anchors[0].split("\n", 1)[0].strip()
-        if 20 < len(cue) < 160:
-            return (
-                f"{body}\n\n"
-                f"— prompt-baseline (few-shot anchors={len(anchors)}; "
-                f"temp={FILTER_TEMPERATURE}; no LoRA)"
-            ).strip()
+        return (
+            f"{body}\n\n"
+            f"— prompt-baseline (heuristic strip; anchors={len(anchors)}; "
+            f"temp={FILTER_TEMPERATURE}; no LoRA)"
+        ).strip()
     return (
         f"{body}\n\n"
-        f"— prompt-baseline (system prompt only; temp={FILTER_TEMPERATURE}; no LoRA)"
+        f"— prompt-baseline (heuristic strip; temp={FILTER_TEMPERATURE}; no LoRA)"
     ).strip()
+
+
+def prompt_baseline_rewrite(
+    draft: str,
+    paths: ProfilePaths,
+    *,
+    backend: str = "auto",
+) -> tuple[str, str]:
+    """Return (rewritten, baseline_kind).
+
+    For MLX backends: real base-model generation (no adapter) with few-shot anchors.
+    Otherwise: local heuristic strip (CI / mock).
+    """
+    anchors = _load_voice_anchors(paths)
+    few_shot = _few_shot_block(anchors) or None
+    want_mlx = backend in {"mlx", "auto"}
+    if want_mlx:
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("mlx_lm") is not None:
+                text = mlx_prompt_baseline(draft, paths, few_shot=few_shot)
+                kind = "mlx_base_fewshot" if few_shot else "mlx_base"
+                return text, kind
+        except Exception as exc:  # noqa: BLE001 — fall back honestly
+            heuristic = heuristic_prompt_baseline(draft, paths)
+            return (
+                f"{heuristic}\n\n— mlx baseline failed ({type(exc).__name__}); "
+                "fell back to heuristic"
+            ).strip(), "heuristic_fallback"
+    return heuristic_prompt_baseline(draft, paths), "heuristic"
+
+
+# Back-compat alias used by older tests / callers
+def prompt_baseline_rewrite_text(draft: str, paths: ProfilePaths) -> str:
+    text, _ = prompt_baseline_rewrite(draft, paths, backend="mock")
+    return text
 
 
 def run_eval(
@@ -190,10 +205,10 @@ def run_compare(
     backend: str = "auto",
     label: str | None = None,
 ) -> dict[str, Any]:
-    """Three-way compare: raw vs prompt few-shot baseline vs LoRA/mock filter."""
+    """Three-way compare: raw vs prompt baseline vs LoRA/mock filter."""
     load_config(paths)
     paths.ensure()
-    baseline = prompt_baseline_rewrite(draft, paths)
+    baseline, baseline_kind = prompt_baseline_rewrite(draft, paths, backend=backend)
     lora_text, used = filter_draft(draft, paths, backend=backend)  # type: ignore[arg-type]
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -208,6 +223,7 @@ def run_compare(
         "kind": "compare",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "filter_backend": used,
+        "baseline_kind": baseline_kind,
         "label": label,
         "slop": {
             "raw": slop_score(draft),
@@ -223,6 +239,7 @@ def run_compare(
     return {
         "dir": str(out_dir),
         "filter_backend": used,
+        "baseline_kind": baseline_kind,
         "raw": draft.strip(),
         "prompt_baseline": baseline,
         "lora": lora_text.strip(),

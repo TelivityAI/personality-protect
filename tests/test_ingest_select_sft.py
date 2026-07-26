@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -125,6 +126,32 @@ def test_sft_builder(profile_home):
     assert roles == ["system", "user", "assistant"]
 
 
+def test_normalize_corpus_text_unwraps_linkedin_csv_quotes():
+    from personality_protect.sft import normalize_corpus_text
+
+    raw = (
+        'Let\'s be real."\n'
+        '""\n'
+        '"I absolutely get why Anthropic would get into this. They have 0 knowledge '
+        'about the vertical."\n'
+        '"But Travelport? WTH?!"\n'
+        '""\n'
+        '"Travelport — you tied one end of your life vest to a speed boat."'
+    )
+    clean = normalize_corpus_text(raw)
+    assert '""' not in clean
+    assert not clean.startswith('"')
+    assert '\n"' not in clean
+    assert clean.startswith("Let's be real.")
+    assert "life vest" in clean
+    # Paragraph wrappers gone; no dangling line-start/line-end CSV quotes
+    for line in clean.splitlines():
+        if not line.strip():
+            continue
+        assert not line.startswith('"'), line
+        assert not line.endswith('"'), line
+
+
 def test_piece_to_example_has_assistant_voice():
     from personality_protect.models import Piece
 
@@ -136,3 +163,48 @@ def test_piece_to_example_has_assistant_voice():
     )
     ex = piece_to_example(p)
     assert ex["messages"][-1]["content"] == p.text
+    user = ex["messages"][1]["content"]
+    draft = user.split("### Draft\n", 1)[1].split("\n\n### Rewritten", 1)[0]
+    assert draft != p.text
+    assert "### My voice" not in user
+    assert "leverage" in draft.lower() or "important to note" in draft.lower() or "moreover" in draft.lower()
+
+
+def test_neutral_draft_is_not_near_identity_copy():
+    """Draft must teach rewrite→voice, not strip-opener-and-copy."""
+    from personality_protect.models import Piece
+    from personality_protect.sft import _neutral_draft, normalize_corpus_text
+
+    text = (
+        "Let's be real.\n\n"
+        "I absolutely get why Anthropic would get into this. They have 0 knowledge "
+        "about the vertical.\n\n"
+        "But Travelport? WTH?!\n\n"
+        "Travelport — you are about to give away decades of domain expertise. "
+        "You tied one end of your life vest to a speed boat and the other to a submarine."
+    )
+    target = normalize_corpus_text(text)
+    draft = _neutral_draft(text)
+    assert draft != target
+    assert "leverage" in draft.lower() or "important to note" in draft.lower()
+    # Cadence markers must be flattened out of the draft side
+    assert "let's be real" not in draft.lower()
+    assert "wth" not in draft.lower()
+    assert "life vest" not in draft.lower()
+    assert "—" not in draft
+    # Lexical overlap must drop below near-copy (was ~100% before fix)
+    tw = set(re.findall(r"[a-z0-9']+", target.lower()))
+    dw = set(re.findall(r"[a-z0-9']+", draft.lower()))
+    overlap = len(tw & dw) / max(1, len(tw))
+    assert overlap < 0.75, f"draft still near-identity (overlap={overlap:.2f})"
+    # Entities / meaning retained
+    assert "travelport" in draft.lower()
+    assert "anthropic" in draft.lower()
+
+    ex = piece_to_example(
+        Piece(id="y", source="linkedin_post", text=text, year=2026, word_count=80)
+    )
+    assert "Let's be real" in ex["messages"][-1]["content"]
+    assert "life vest" in ex["messages"][-1]["content"]
+    assert "### My voice" not in ex["messages"][1]["content"]
+    assert ex["messages"][1]["content"].count("### Draft") == 1

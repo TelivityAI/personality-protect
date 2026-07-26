@@ -14,7 +14,7 @@ from personality_protect.config import (
     load_config,
 )
 from personality_protect.download import resolve_gguf_path
-from personality_protect.sft import SYSTEM_PROMPT, USER_TEMPLATE
+from personality_protect.sft import SYSTEM_PROMPT, USER_TEMPLATE, USER_TEMPLATE_INFER
 
 FilterBackend = Literal["auto", "llama", "gguf", "mlx", "transformers", "mock"]
 
@@ -38,12 +38,7 @@ def build_filter_user_content(draft: str, *, reference: str | None = None) -> st
     draft = draft.strip()
     if reference and reference.strip():
         return USER_TEMPLATE.format(draft=draft, reference=reference.strip())
-    return (
-        "Rewrite the draft in my voice. Match my cadence and diction. "
-        "Keep the same meaning. Remove AI-sounding filler.\n\n"
-        f"### Draft\n{draft}\n\n"
-        "### Rewritten"
-    )
+    return USER_TEMPLATE_INFER.format(draft=draft)
 
 
 def build_filter_messages(
@@ -376,12 +371,14 @@ def _filter_mlx(
     max_tokens: int,
     *,
     paths: ProfilePaths | None = None,
+    use_adapter: bool = True,
+    few_shot: str | None = None,
 ) -> str:
     # CRITICAL: mlx_lm.generate installs wired_limit(~40GB) which jetsam-kills
-    # Python on a 48GB Mac. Cap BEFORE importing/loading.
+    # Python on a 48GB Mac. Cap BEFORE importing/loading. Default ≤16 GB.
     from personality_protect.mlx_runtime import ensure_mlx_wired_cap, release_mlx_memory
 
-    ensure_mlx_wired_cap()
+    ensure_mlx_wired_cap(memory_gb=16.0)
 
     try:
         from mlx_lm import generate, load
@@ -391,12 +388,13 @@ def _filter_mlx(
             "or use --backend llama|mock"
         ) from exc
 
-    adapter = str(adapter_dir) if _has_mlx_adapter(adapter_dir) else None
+    adapter = None
+    if use_adapter and _has_mlx_adapter(adapter_dir):
+        adapter = str(adapter_dir)
     # Do NOT paste a long SFT assistant snippet as "### My voice (reference)":
     # weak adapters regurgitate that corpus block instead of rewriting the draft.
-    # LoRA weights carry voice; a short cadence cue (if any) stays out of the
-    # training-shaped reference slot.
-    messages = build_filter_messages(draft, reference=None)
+    # LoRA weights carry voice; few-shot (prompt baseline) may inject anchors above.
+    messages = build_filter_messages(draft, reference=None, few_shot=few_shot)
 
     try:
         model, tokenizer = load(base_model, adapter_path=adapter)
@@ -413,7 +411,7 @@ def _filter_mlx(
                 enable_thinking=False,
             )
         else:
-            prompt = build_filter_prompt(draft, reference=None)
+            prompt = build_filter_prompt(draft, reference=None, few_shot=few_shot)
 
         # Stop on template markers so we never loop Draft/Rewritten sections.
         for stop in FILTER_STOP:
@@ -422,7 +420,9 @@ def _filter_mlx(
             except Exception:
                 pass
 
-        gen_kwargs: dict = {"max_tokens": max_tokens, "verbose": False}
+        # Keep generations short enough that cadence shows; avoid long echo loops.
+        gen_max = min(max_tokens, 320)
+        gen_kwargs: dict = {"max_tokens": gen_max, "verbose": False}
         try:
             from mlx_lm.sample_utils import make_sampler
 
@@ -436,6 +436,28 @@ def _filter_mlx(
     finally:
         release_mlx_memory()
 
+
+def mlx_prompt_baseline(
+    draft: str,
+    paths: ProfilePaths,
+    *,
+    max_tokens: int = 320,
+    few_shot: str | None = None,
+) -> str:
+    """Rewrite with base MLX weights only (no LoRA) — honest prompt baseline."""
+    config = load_config(paths)
+    model_id = config.base_model or DEFAULT_MLX_MODEL
+    adapter_dir = paths.adapters_dir / "latest"
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    return _filter_mlx(
+        draft,
+        adapter_dir,
+        model_id,
+        max_tokens,
+        paths=paths,
+        use_adapter=False,
+        few_shot=few_shot,
+    )
 
 def _filter_transformers(
     draft: str, adapter_dir: Path, base_model: str, max_tokens: int

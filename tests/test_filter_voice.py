@@ -8,8 +8,9 @@ from personality_protect.filter import (
     build_filter_messages,
     build_filter_user_content,
     extract_rewrite,
+    finalize_rewrite,
 )
-from personality_protect.sft import SYSTEM_PROMPT, USER_TEMPLATE
+from personality_protect.sft import SYSTEM_PROMPT, USER_TEMPLATE, USER_TEMPLATE_INFER
 
 
 def test_extract_rewrite_strips_template_echo_loops():
@@ -68,6 +69,19 @@ def test_filter_user_content_without_reference_still_ends_at_rewritten():
     assert "### My voice (reference)" not in user
     assert user.rstrip().endswith("### Rewritten")
     assert "leverage" in user  # draft preserved; rewrite is model's job
+    # Default inference shape must match SFT (no reference dump to regurgitate)
+    assert user == USER_TEMPLATE_INFER.format(draft="Draft with leverage.")
+    assert "cadence" in user.lower()
+
+
+def test_filter_messages_default_omits_long_reference():
+    """LoRA path: cadence via weights, not pasted corpus blocks."""
+    messages = build_filter_messages("We must leverage synergies.")
+    assert messages[0] == {"role": "system", "content": SYSTEM_PROMPT}
+    assert "### My voice" not in messages[1]["content"]
+    assert messages[1]["content"] == USER_TEMPLATE_INFER.format(
+        draft="We must leverage synergies."
+    )
 
 
 def test_filter_messages_are_chat_roles():
@@ -82,8 +96,6 @@ def test_filter_messages_are_chat_roles():
 
 
 def test_finalize_rewrite_strips_slop_after_template_cut():
-    from personality_protect.filter import finalize_rewrite
-
     text = (
         "In today's fast-paced world we must leverage robust synergies.\n\n"
         "### Draft\nmore"
@@ -92,7 +104,11 @@ def test_finalize_rewrite_strips_slop_after_template_cut():
     assert "###" not in out
     assert "leverage" not in out.lower()
     assert "synergies" not in out.lower()
+
+
+def test_mlx_wired_cap_clamps_generate_requests(monkeypatch):
     """mlx_lm.generate.wired_limit requests max_recommended (~40GB); we must clamp."""
+    monkeypatch.delenv("PP_MLX_DISABLE", raising=False)
     calls: list[int] = []
 
     def fake_set(requested=None):

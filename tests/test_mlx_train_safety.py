@@ -60,8 +60,28 @@ def test_build_mlx_lora_argv_is_memory_safe():
     assert argv[argv.index("--max-seq-length") + 1] == str(DEFAULT_MAX_SEQ_LENGTH)
     assert DEFAULT_MAX_SEQ_LENGTH <= 512
     assert argv[argv.index("--iters") + 1] == "50"
+    # Train loss on assistant rewrite only — otherwise LoRA memorizes the draft.
+    assert "--mask-prompt" in argv
     # resume only if file exists — Path may not exist in unit test
     assert int(argv[argv.index("--steps-per-eval") + 1]) >= 10**6
+
+
+def test_default_wired_cap_is_at_most_16gb():
+    """Studio stays usable; never default to mlx-lm's ~40GB recommendation."""
+    from personality_protect.mlx_train import DEFAULT_WIRED_CAP_BYTES
+
+    assert DEFAULT_WIRED_CAP_BYTES <= 16 * 10**9
+
+
+def test_mlx_import_blocked_when_disabled(monkeypatch):
+    from personality_protect import mlx_runtime as rt
+
+    monkeypatch.setenv("PP_MLX_DISABLE", "1")
+    try:
+        rt.assert_mlx_import_allowed()
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError as exc:
+        assert "PP_MLX_DISABLE" in str(exc)
 
 
 def test_parse_iter_from_line():
