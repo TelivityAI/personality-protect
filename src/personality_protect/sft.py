@@ -14,12 +14,15 @@ from personality_protect.models import Piece
 from personality_protect.select import selected_pieces
 
 SYSTEM_PROMPT = (
-    "You are a personal voice rewriter. Rewrite the draft so it matches the user's "
-    "authentic writing voice exactly — their cadence, short punches, rhetorical "
-    "questions, metaphors, contractions, and paragraph rhythm — not generic clean prose. "
-    "Keep factual meaning unchanged. Prefer their diction and punctuation habits. "
-    "Even when the draft is already clean, professional, or free of AI tells, rewrite it "
-    "into the user's distinctive voice — do not return the draft unchanged. "
+    "You are a personal voice rewriter. Match the user's authentic writing voice — "
+    "cadence, short punches, rhetorical questions, metaphors, contractions, and "
+    "paragraph rhythm — not generic clean prose. Keep factual meaning unchanged. "
+    "Preserve paragraph breaks and blank lines; never flatten multi-paragraph drafts "
+    "into a single block. Keep a strong opener in place unless it is sloppy or AI-tell "
+    "scaffolding — do not reorder or soften openings just to sound different. "
+    "If the draft already matches the user's voice (rhythm, diction, paragraphing), "
+    "return it unchanged — do not fidget, paraphrase, or polish for its own sake. "
+    "When the draft is flat, corporate, or AI-slop, restyle it into the user's voice. "
     "Strip generic AI tells such as: leverage, synergies, delve, robust, "
     "In today's fast-paced world, It is important to note, Moreover, Furthermore, "
     "unlock, nestled, testament, vibrant. Do not invent facts, citations, or claims. "
@@ -28,19 +31,21 @@ SYSTEM_PROMPT = (
 
 # Inference-aligned user turn (no reference dump — LoRA must carry voice).
 USER_TEMPLATE_INFER = (
-    "Rewrite the draft in my voice. Match my cadence and diction — short punches, "
-    "direct address, rhetorical bite — not bland marketing. "
-    "Even if the draft already reads clean, restyle it into my voice; "
-    "do not leave it unchanged. Keep the same meaning. Remove AI-sounding filler.\n\n"
+    "Rewrite the draft in my voice when it needs it. Match my cadence and diction — "
+    "short punches, direct address, rhetorical bite — not bland marketing. "
+    "Preserve my paragraph breaks. Keep a strong opener unless it is sloppy. "
+    "If the draft already sounds like me, return it unchanged. "
+    "Keep the same meaning. Remove AI-sounding filler.\n\n"
     "### Draft\n{draft}\n\n"
     "### Rewritten"
 )
 
 # Optional few-shot / receipts shape (reference present).
 USER_TEMPLATE = (
-    "Rewrite the draft in my voice. Match my cadence and diction from the reference. "
-    "Even if the draft already reads clean, restyle it into my voice; "
-    "do not leave it unchanged. Keep the same meaning. Remove AI-sounding filler.\n\n"
+    "Rewrite the draft in my voice when it needs it. Match my cadence and diction "
+    "from the reference. Preserve paragraph breaks. Keep a strong opener unless it "
+    "is sloppy. If the draft already sounds like me, return it unchanged. "
+    "Keep the same meaning. Remove AI-sounding filler.\n\n"
     "### Draft\n{draft}\n\n"
     "### My voice (reference)\n{reference}\n\n"
     "### Rewritten"
@@ -70,16 +75,49 @@ _METAPHOR_FLATTEN = (
 
 
 class _HTMLTextExtractor(HTMLParser):
+    """Pull text from HTML while keeping block-level paragraph breaks."""
+
+    _BLOCK = frozenset(
+        {
+            "p",
+            "div",
+            "section",
+            "article",
+            "li",
+            "tr",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "blockquote",
+        }
+    )
+
     def __init__(self) -> None:
         super().__init__()
         self._chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[no-untyped-def]
+        if tag == "br":
+            self._chunks.append("\n")
+        elif tag in self._BLOCK:
+            self._chunks.append("\n\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._BLOCK:
+            self._chunks.append("\n\n")
 
     def handle_data(self, data: str) -> None:
         if data and data.strip():
             self._chunks.append(data.strip())
 
     def text(self) -> str:
-        return "\n".join(self._chunks)
+        raw = "".join(self._chunks)
+        raw = re.sub(r"[ \t]+\n", "\n", raw)
+        raw = re.sub(r"\n{3,}", "\n\n", raw)
+        return raw.strip()
 
 
 def _strip_html_css(text: str) -> str:
@@ -134,11 +172,22 @@ def normalize_corpus_text(text: str) -> str:
 
 
 def _truncate_for_seq_budget(text: str, max_chars: int) -> str:
-    """Word-boundary truncate so masked MLX examples stay inside max_seq_length."""
+    """Word-boundary truncate so masked MLX examples stay inside max_seq_length.
+
+    Preserves internal newlines/paragraph breaks in the kept prefix.
+    """
     text = (text or "").strip()
     if len(text) <= max_chars:
         return text
-    cut = text[: max_chars - 1].rsplit(" ", 1)[0].rstrip(",;:—-")
+    prefix = text[: max_chars - 1]
+    # Prefer cutting at paragraph, then newline, then word.
+    for sep in ("\n\n", "\n", " "):
+        idx = prefix.rfind(sep)
+        if idx >= max_chars // 3:
+            cut = prefix[:idx].rstrip(",;:—- \t")
+            break
+    else:
+        cut = prefix.rsplit(" ", 1)[0].rstrip(",;:—-") if " " in prefix else prefix
     return (cut or text[: max_chars - 1]).rstrip() + "…"
 
 
@@ -147,12 +196,36 @@ def _truncate_voice_target(text: str, max_chars: int = MAX_SFT_TARGET_CHARS) -> 
     return _truncate_for_seq_budget(text, max_chars)
 
 
-def piece_to_examples(piece: Piece) -> list[dict]:
-    """Map one corpus piece to slop→voice and clean→voice supervised pairs.
+def _example_row(
+    *,
+    draft: str,
+    target: str,
+    piece: Piece,
+    pair_kind: str,
+) -> dict:
+    return {
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": USER_TEMPLATE_INFER.format(draft=draft)},
+            {"role": "assistant", "content": target},
+        ],
+        "meta": {
+            "piece_id": piece.id,
+            "source": piece.source,
+            "year": piece.year,
+            "word_count": piece.word_count,
+            "pair_kind": pair_kind,
+        },
+    }
 
-    Both keep the same assistant target (authentic text). Slop pairs teach
-    AI-tell stripping + cadence restore; clean pairs teach style transfer when
-    the draft is already professional / free of tells.
+
+def piece_to_examples(piece: Piece) -> list[dict]:
+    """Map one corpus piece to supervised rewrite pairs.
+
+    Pair kinds:
+    - slop→voice: AI-tell draft → authentic text (strip + restore cadence)
+    - clean→voice: flat professional draft → authentic text with real paragraphs
+    - leave_alone: already-voice draft → identical assistant (do not fidget)
     """
     target = _truncate_voice_target(normalize_corpus_text(piece.text))
     if not target.strip():
@@ -162,22 +235,19 @@ def piece_to_examples(piece: Piece) -> list[dict]:
         draft = _truncate_for_seq_budget(draft_fn(target), MAX_SFT_DRAFT_CHARS)
         if not draft.strip() or draft.strip() == target.strip():
             continue
-        user = USER_TEMPLATE_INFER.format(draft=draft)
+        out.append(_example_row(draft=draft, target=target, piece=piece, pair_kind=kind))
+
+    # Leave-alone only for multi-paragraph voice pieces — teaches "don't flatten /
+    # don't fidget" without training pass-through on flat clean prose.
+    leave_draft = _truncate_for_seq_budget(target, MAX_SFT_DRAFT_CHARS)
+    if leave_draft.strip() and "\n\n" in leave_draft:
         out.append(
-            {
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user},
-                    {"role": "assistant", "content": target},
-                ],
-                "meta": {
-                    "piece_id": piece.id,
-                    "source": piece.source,
-                    "year": piece.year,
-                    "word_count": piece.word_count,
-                    "pair_kind": kind,
-                },
-            }
+            _example_row(
+                draft=leave_draft,
+                target=leave_draft,
+                piece=piece,
+                pair_kind="leave_alone",
+            )
         )
     return out
 

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from personality_protect.filter import (
     build_filter_messages,
     build_filter_user_content,
     extract_rewrite,
     finalize_rewrite,
+    similarity_guard,
+    strip_ai_tells,
 )
 from personality_protect.sft import SYSTEM_PROMPT, USER_TEMPLATE, USER_TEMPLATE_INFER
 
@@ -74,15 +76,48 @@ def test_filter_user_content_without_reference_still_ends_at_rewritten():
     assert "cadence" in user.lower()
 
 
-def test_prompts_require_voice_transfer_on_clean_drafts():
-    """Clean drafts must be restyled — identity copy is failure, not success."""
+def test_prompts_preserve_paragraphs_and_allow_leave_alone():
+    """Voice filter must keep paragraph rhythm and not force fidget rewrites."""
     sys_l = SYSTEM_PROMPT.lower()
-    assert "already clean" in sys_l or "free of ai tells" in sys_l
-    assert "do not return the draft unchanged" in sys_l or "not return the draft unchanged" in sys_l
+    assert "paragraph" in sys_l
+    assert "unchanged" in sys_l
+    assert "opener" in sys_l or "openings" in sys_l
     user = USER_TEMPLATE_INFER.format(draft="Companies need a clear point of view.")
     user_l = user.lower()
-    assert "even if" in user_l and "already" in user_l
-    assert "leave it unchanged" in user_l or "return it unchanged" in user_l
+    assert "paragraph" in user_l
+    assert "unchanged" in user_l
+    assert "opener" in user_l or "openings" in user_l
+
+
+def test_strip_ai_tells_preserves_paragraph_breaks():
+    text = (
+        "In today's fast-paced world we must leverage synergies.\n\n"
+        "Second punch stays on its own line.\n\n"
+        "Third short one."
+    )
+    out = strip_ai_tells(text)
+    assert "\n\n" in out
+    assert out.count("\n\n") >= 2
+    assert "leverage" not in out.lower()
+    assert "Second punch" in out
+
+
+def test_similarity_guard_returns_draft_when_near_identity():
+    draft = (
+        "These questions keep popping up every time I read another take.\n\n"
+        "How much is the first pass, and how much is cleanup?"
+    )
+    fidget = (
+        "These questions keep coming up every time I read another take.\n\n"
+        "How much is the first pass, and how much is cleanup?"
+    )
+    assert similarity_guard(draft, fidget) == draft
+    different = "I cut the fog and keep the branding honest."
+    assert similarity_guard(draft, different) == different
+    # Flat single-block drafts must still be allowed to rewrite (clean→voice).
+    flat = "Personal branding matters more than ever as AI tools flood every channel."
+    voiced = "Personal branding matters. AI floods every channel — say something real."
+    assert similarity_guard(flat, voiced) == voiced
 
 
 def test_filter_messages_default_omits_long_reference():

@@ -69,7 +69,11 @@ def build_filter_prompt(
 
 
 def strip_ai_tells(text: str) -> str:
-    """Remove common AI-tell phrases the system prompt asks the model to strip."""
+    """Remove common AI-tell phrases the system prompt asks the model to strip.
+
+    Preserves paragraph breaks / blank lines — never flatten multi-paragraph
+    rewrites into a single prose block (that was the vibe-draft B− failure mode).
+    """
     body = text
     body = re.sub(
         r"\bIn today's (?:fast-paced\s+)?(?:digital\s+)?(?:fast-paced\s+)?world,?\s*",
@@ -90,15 +94,59 @@ def strip_ai_tells(text: str) -> str:
     body = re.sub(r"\bnestled\b", "in", body, flags=re.I)
     body = re.sub(r"\ba testament to\b", "proof of", body, flags=re.I)
     body = re.sub(r"\bvibrant\b", "lively", body, flags=re.I)
-    body = re.sub(r"\s{2,}", " ", body).strip()
+    # Collapse horizontal whitespace only; keep newlines / paragraph rhythm.
+    body = re.sub(r"[^\S\n]{2,}", " ", body)
+    body = re.sub(r"[ \t]+\n", "\n", body)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    body = body.strip()
     if body:
-        body = body[0].upper() + body[1:]
+        # Capitalize first non-whitespace char without touching later lines.
+        for i, ch in enumerate(body):
+            if not ch.isspace():
+                body = body[:i] + ch.upper() + body[i + 1 :]
+                break
     return body
 
 
-def finalize_rewrite(text: str) -> str:
-    """Template-echo cut + AI-tell cleanup for model backends."""
-    return strip_ai_tells(extract_rewrite(text))
+def similarity_guard(
+    draft: str,
+    rewrite: str,
+    *,
+    ratio: float = 0.94,
+) -> str:
+    """If the rewrite only cosmetically edits a multi-paragraph draft, keep it.
+
+    Applies when the draft already has paragraph rhythm — the failure mode was
+    flattening LinkedIn-shaped posts. Flat single-block drafts still get a
+    real rewrite (clean→voice / slop→voice).
+    """
+    import difflib
+
+    draft = (draft or "").strip()
+    rewrite = (rewrite or "").strip()
+    if not draft:
+        return rewrite
+    if not rewrite:
+        return draft
+    if draft == rewrite:
+        return draft
+    # Only guard structured posts; don't freeze flat clean/slop one-liners.
+    draft_paras = [p for p in re.split(r"\n\s*\n", draft) if p.strip()]
+    if len(draft_paras) < 2 and draft.count("\n") < 2:
+        return rewrite
+    a = re.sub(r"\s+", " ", draft.lower())
+    b = re.sub(r"\s+", " ", rewrite.lower())
+    if difflib.SequenceMatcher(None, a, b).ratio() >= ratio:
+        return draft
+    return rewrite
+
+
+def finalize_rewrite(text: str, *, draft: str | None = None) -> str:
+    """Template-echo cut + AI-tell cleanup (+ optional near-identity keep-draft)."""
+    out = strip_ai_tells(extract_rewrite(text))
+    if draft is not None:
+        out = similarity_guard(draft, out)
+    return out
 
 
 def extract_rewrite(text: str) -> str:
@@ -262,21 +310,27 @@ def filter_draft(
         chosen = "llama"
 
     if chosen == "mock":
-        return _filter_mock(draft, adapter_dir), "mock"
-    if chosen == "llama":
+        rewritten = _filter_mock(draft, adapter_dir)
+    elif chosen == "llama":
         gguf_path = resolve_gguf_path(paths, filename=config.gguf_file, explicit=gguf)
         if gguf_path is None:
             raise RuntimeError(
                 "No local GGUF found. Run: personality-protect download --format gguf\n"
                 f"Expected under {paths.models_dir} (~5–7 GB quantized Qwen3.5-9B)."
             )
-        return _filter_llama(draft, gguf_path, adapter_dir, max_tokens), "llama"
-    if chosen == "mlx":
+        rewritten = _filter_llama(draft, gguf_path, adapter_dir, max_tokens)
+    elif chosen == "mlx":
         model_id = config.base_model or DEFAULT_MLX_MODEL
-        return _filter_mlx(draft, adapter_dir, model_id, max_tokens, paths=paths), "mlx"
-    if chosen == "transformers":
-        return _filter_transformers(draft, adapter_dir, config.base_model, max_tokens), "transformers"
-    raise RuntimeError(f"Unknown filter backend: {chosen}")
+        rewritten = _filter_mlx(draft, adapter_dir, model_id, max_tokens, paths=paths)
+    elif chosen == "transformers":
+        rewritten = _filter_transformers(
+            draft, adapter_dir, config.base_model, max_tokens
+        )
+    else:
+        raise RuntimeError(f"Unknown filter backend: {chosen}")
+
+    # Near-identity → keep original (paragraphs + opener intact).
+    return similarity_guard(draft, rewritten), chosen
 
 
 def _has_llama_cpp() -> bool:
@@ -361,7 +415,7 @@ def _filter_llama(
         stop=list(FILTER_STOP),
     )
     text = out["choices"][0]["text"] if out.get("choices") else str(out)
-    return finalize_rewrite(str(text))
+    return finalize_rewrite(str(text), draft=draft)
 
 
 def _filter_mlx(
@@ -420,8 +474,8 @@ def _filter_mlx(
             except Exception:
                 pass
 
-        # Keep generations short enough that cadence shows; avoid long echo loops.
-        gen_max = min(max_tokens, 320)
+        # Budget enough tokens for multi-paragraph posts; stop markers cut loops.
+        gen_max = min(max_tokens, 480)
         gen_kwargs: dict = {"max_tokens": gen_max, "verbose": False}
         try:
             from mlx_lm.sample_utils import make_sampler
@@ -432,7 +486,7 @@ def _filter_mlx(
         except Exception:
             pass
         out = generate(model, tokenizer, prompt=prompt, **gen_kwargs)
-        return finalize_rewrite(str(out))
+        return finalize_rewrite(str(out), draft=draft)
     finally:
         release_mlx_memory()
 
@@ -508,7 +562,7 @@ def _filter_transformers(
     text = tokenizer.decode(output[0], skip_special_tokens=True)
     if "### Rewritten" in text:
         text = text.split("### Rewritten", 1)[1].strip()
-    return finalize_rewrite(text)
+    return finalize_rewrite(text, draft=draft)
 
 
 def read_draft_input(text: str | None, file: Path | None) -> str:

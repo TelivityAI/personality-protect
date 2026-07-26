@@ -233,16 +233,20 @@ def test_piece_to_examples_includes_clean_draft_voice_pair():
     examples = piece_to_examples(
         Piece(id="z", source="demo", text=text, year=2026, word_count=80)
     )
-    assert len(examples) >= 2
+    assert len(examples) >= 3
     kinds = {ex["meta"]["pair_kind"] for ex in examples}
     assert "slop" in kinds
     assert "clean" in kinds
+    # Multi-paragraph voice pieces get leave-alone pairs (don't fidget / flatten)
+    assert "leave_alone" in kinds
 
     clean = next(ex for ex in examples if ex["meta"]["pair_kind"] == "clean")
     user = clean["messages"][1]["content"]
     draft = user.split("### Draft\n", 1)[1].split("\n\n### Rewritten", 1)[0]
     target = clean["messages"][-1]["content"]
     assert draft != target
+    # Assistant targets keep real paragraph structure from the corpus voice
+    assert "\n\n" in target
     # No heavy AI-tell scaffolding — this pair teaches voice-on-neutral rewrites
     assert "leverage" not in draft.lower()
     assert "fast-paced" not in draft.lower()
@@ -252,6 +256,13 @@ def test_piece_to_examples_includes_clean_draft_voice_pair():
     assert "let's be real" not in draft.lower()
     assert "cash cow" not in draft.lower()
     assert "northwind" in draft.lower()
+
+    leave = next(ex for ex in examples if ex["meta"]["pair_kind"] == "leave_alone")
+    leave_user = leave["messages"][1]["content"]
+    leave_draft = leave_user.split("### Draft\n", 1)[1].split("\n\n### Rewritten", 1)[0]
+    leave_target = leave["messages"][-1]["content"]
+    assert leave_draft == leave_target
+    assert "\n\n" in leave_target
 
 
 def test_clean_generic_draft_forces_rewrite_even_on_flat_prose():
