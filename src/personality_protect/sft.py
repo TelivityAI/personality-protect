@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
 
@@ -17,6 +18,8 @@ SYSTEM_PROMPT = (
     "authentic writing voice exactly — their cadence, short punches, rhetorical "
     "questions, metaphors, contractions, and paragraph rhythm — not generic clean prose. "
     "Keep factual meaning unchanged. Prefer their diction and punctuation habits. "
+    "Even when the draft is already clean, professional, or free of AI tells, rewrite it "
+    "into the user's distinctive voice — do not return the draft unchanged. "
     "Strip generic AI tells such as: leverage, synergies, delve, robust, "
     "In today's fast-paced world, It is important to note, Moreover, Furthermore, "
     "unlock, nestled, testament, vibrant. Do not invent facts, citations, or claims. "
@@ -27,7 +30,8 @@ SYSTEM_PROMPT = (
 USER_TEMPLATE_INFER = (
     "Rewrite the draft in my voice. Match my cadence and diction — short punches, "
     "direct address, rhetorical bite — not bland marketing. "
-    "Keep the same meaning. Remove AI-sounding filler.\n\n"
+    "Even if the draft already reads clean, restyle it into my voice; "
+    "do not leave it unchanged. Keep the same meaning. Remove AI-sounding filler.\n\n"
     "### Draft\n{draft}\n\n"
     "### Rewritten"
 )
@@ -35,7 +39,8 @@ USER_TEMPLATE_INFER = (
 # Optional few-shot / receipts shape (reference present).
 USER_TEMPLATE = (
     "Rewrite the draft in my voice. Match my cadence and diction from the reference. "
-    "Keep the same meaning. Remove AI-sounding filler.\n\n"
+    "Even if the draft already reads clean, restyle it into my voice; "
+    "do not leave it unchanged. Keep the same meaning. Remove AI-sounding filler.\n\n"
     "### Draft\n{draft}\n\n"
     "### My voice (reference)\n{reference}\n\n"
     "### Rewritten"
@@ -43,19 +48,59 @@ USER_TEMPLATE = (
 
 _QUOTE_ARTIFACT_RE = re.compile(r'(^|\n)\s*"+\s*(\n|$)')
 _TRAILING_ESCAPED_QUOTE_RE = re.compile(r'\\"+')
+# LinkedIn article exports often paste Medium/Ghost CSS ahead of the body.
+_CSS_RULE_RE = re.compile(
+    r"(?ms)^[ \t]*[a-zA-Z_*#.][^{;\n]{0,160}\{[^{}]*\}[ \t]*\n?"
+)
+_HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+# Bland public business idioms only — never encode user-specific metaphors.
 _METAPHOR_FLATTEN = (
-    (re.compile(r"\blife vest\b", re.I), "safety measure"),
-    (re.compile(r"\bspeed boat\b", re.I), "fast vehicle"),
-    (re.compile(r"\bsubmarine\b", re.I), "underwater vessel"),
     (re.compile(r"\bcash cow\b", re.I), "primary revenue source"),
     (re.compile(r"\btorch the\b", re.I), "damage the"),
     (re.compile(r"\bmoat\b", re.I), "competitive advantage"),
+    (re.compile(r"\bsilver bullet\b", re.I), "simple solution"),
+    (re.compile(r"\belephant in the room\b", re.I), "obvious issue"),
+    (re.compile(r"\blow-hanging fruit\b", re.I), "easy opportunity"),
 )
 
 
+class _HTMLTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._chunks: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        if data and data.strip():
+            self._chunks.append(data.strip())
+
+    def text(self) -> str:
+        return "\n".join(self._chunks)
+
+
+def _strip_html_css(text: str) -> str:
+    """Remove embedded CSS rules and HTML tags from corpus/article paste-ups."""
+    text = re.sub(r"(?is)<style[^>]*>.*?</style>", "\n", text)
+    prev = None
+    while prev != text:
+        prev = text
+        text = _CSS_RULE_RE.sub("\n", text)
+    if _HTML_TAG_RE.search(text):
+        parser = _HTMLTextExtractor()
+        try:
+            parser.feed(text)
+            extracted = parser.text()
+            if extracted.strip():
+                text = extracted
+        except Exception:
+            text = _HTML_TAG_RE.sub(" ", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return text
+
+
 def normalize_corpus_text(text: str) -> str:
-    """Fix LinkedIn/CSV quote wrapping without rewriting voice."""
+    """Fix LinkedIn/CSV quote wrapping and strip HTML/CSS without rewriting voice."""
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = _strip_html_css(text)
     text = _TRAILING_ESCAPED_QUOTE_RE.sub('"', text)
     lines_out: list[str] = []
     blank_pending = False
@@ -83,29 +128,64 @@ def normalize_corpus_text(text: str) -> str:
     return text.strip()
 
 
-def piece_to_example(piece: Piece) -> dict:
-    """Map a corpus piece to a supervised chat example.
+def piece_to_examples(piece: Piece) -> list[dict]:
+    """Map one corpus piece to slop→voice and clean→voice supervised pairs.
 
-    Training target is the user's real text. The draft side is a deliberately
-    slopified / cadence-flattened prompt so the adapter learns *rewrite into voice*,
-    not identity copy. Prompt shape matches filter inference (no reference).
+    Both keep the same assistant target (authentic text). Slop pairs teach
+    AI-tell stripping + cadence restore; clean pairs teach style transfer when
+    the draft is already professional / free of tells.
     """
     target = normalize_corpus_text(piece.text)
-    draft = _neutral_draft(target)
-    user = USER_TEMPLATE_INFER.format(draft=draft)
-    return {
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": target},
-        ],
-        "meta": {
-            "piece_id": piece.id,
-            "source": piece.source,
-            "year": piece.year,
-            "word_count": piece.word_count,
-        },
-    }
+    if not target.strip():
+        return []
+    out: list[dict] = []
+    for kind, draft_fn in (("slop", _neutral_draft), ("clean", _clean_generic_draft)):
+        draft = draft_fn(target)
+        if not draft.strip() or draft.strip() == target.strip():
+            continue
+        user = USER_TEMPLATE_INFER.format(draft=draft)
+        out.append(
+            {
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user},
+                    {"role": "assistant", "content": target},
+                ],
+                "meta": {
+                    "piece_id": piece.id,
+                    "source": piece.source,
+                    "year": piece.year,
+                    "word_count": piece.word_count,
+                    "pair_kind": kind,
+                },
+            }
+        )
+    return out
+
+
+def piece_to_example(piece: Piece) -> dict:
+    """Back-compat: return the slop→voice pair (or the only available pair)."""
+    examples = piece_to_examples(piece)
+    if not examples:
+        target = normalize_corpus_text(piece.text)
+        return {
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": USER_TEMPLATE_INFER.format(draft=target)},
+                {"role": "assistant", "content": target},
+            ],
+            "meta": {
+                "piece_id": piece.id,
+                "source": piece.source,
+                "year": piece.year,
+                "word_count": piece.word_count,
+                "pair_kind": "identity",
+            },
+        }
+    for ex in examples:
+        if ex["meta"].get("pair_kind") == "slop":
+            return ex
+    return examples[0]
 
 
 def _short_reference(text: str, max_chars: int = 400) -> str:
@@ -115,24 +195,18 @@ def _short_reference(text: str, max_chars: int = 400) -> str:
     return text[: max_chars - 1].rsplit(" ", 1)[0] + "…"
 
 
-def _neutral_draft(text: str) -> str:
-    """Turn authentic corpus text into a generic AI-ish draft for SFT pairing.
-
-    Must differ from the assistant target on almost every example — otherwise
-    LoRA learns identity copy and filter collapses to post-hoc slop stripping.
-    Flatten cadence markers (punches, metaphors, rhetorical bite) while keeping
-    entities / factual meaning so the model must *restore* voice.
-    """
+def _flatten_voice_markers(text: str) -> str:
+    """Flatten cadence/metaphor/contractions into plain continuous prose."""
     draft = normalize_corpus_text(text)
     if not draft:
         return draft
 
     # Flatten first-person / punchy voice into corporate diction.
     replacements = (
-        ("Let's be real.", "It is important to note that"),
-        ("Let's be honest.", "It is important to note that"),
+        ("Let's be real.", "It is worth noting that"),
+        ("Let's be honest.", "It is worth noting that"),
         ("Let me speculate", "One might explore"),
-        ("Bear with me.", "Furthermore,"),
+        ("Bear with me.", "Next,"),
         ("WTH?!", "this raises important questions."),
         ("WTF?!", "this raises important questions."),
         ("WTH?", "this raises important questions."),
@@ -168,10 +242,23 @@ def _neutral_draft(text: str) -> str:
     draft = re.sub(r"\bWhat's\b", "What is", draft)
     draft = re.sub(r"[?!]{1,3}", ".", draft)
 
-    # Flatten short punch paragraphs into continuous corporate prose.
+    # Flatten short punch paragraphs into continuous prose.
     parts = [p.strip() for p in re.split(r"\n\s*\n", draft) if p.strip()]
     flat = " ".join(p.replace("\n", " ") for p in parts)
-    flat = re.sub(r"\s{2,}", " ", flat).strip()
+    return re.sub(r"\s{2,}", " ", flat).strip()
+
+
+def _neutral_draft(text: str) -> str:
+    """Turn authentic corpus text into a generic AI-ish draft for SFT pairing.
+
+    Must differ from the assistant target on almost every example — otherwise
+    LoRA learns identity copy and filter collapses to post-hoc slop stripping.
+    Flatten cadence markers (punches, metaphors, rhetorical bite) while keeping
+    entities / factual meaning so the model must *restore* voice.
+    """
+    flat = _flatten_voice_markers(text)
+    if not flat:
+        return flat
 
     # Inject deterministic AI-tell scaffolding so drafts look like slop input.
     seed = int(hashlib.sha256(flat.encode("utf-8")).hexdigest()[:8], 16)
@@ -189,8 +276,6 @@ def _neutral_draft(text: str) -> str:
     opener = openers[seed % len(openers)]
     glue = mid_glue[(seed // 7) % len(mid_glue)]
 
-    if not flat:
-        return opener.strip()
     body = opener + flat[0].lower() + flat[1:] if len(flat) > 1 else opener + flat
     # Split roughly in half and inject mid-glue so draft ≠ target structure.
     mid = len(body) // 2
@@ -202,6 +287,27 @@ def _neutral_draft(text: str) -> str:
     return body.strip()
 
 
+def _clean_generic_draft(text: str) -> str:
+    """Cadence-flattened professional prose *without* AI-tell scaffolding.
+
+    Teaches voice injection on already-clean drafts — the gap where slop-only
+    SFT collapses to identity copy.
+    """
+    flat = _flatten_voice_markers(text)
+    if not flat:
+        return flat
+    # Mild professional softeners that are not in the slop-tell list.
+    soft = (
+        ("One finds that", "Research suggests that"),
+        ("It is understandable why", "It makes sense that"),
+        ("Stakeholders may wish to see", "It may be useful to see"),
+        ("It is worth noting that", "Notably,"),
+    )
+    for a, b in soft:
+        flat = flat.replace(a, b)
+    return flat.strip()
+
+
 def build_sft_jsonl(pieces: Iterable[Piece], out_path: Path) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
@@ -209,8 +315,9 @@ def build_sft_jsonl(pieces: Iterable[Piece], out_path: Path) -> int:
         for piece in pieces:
             if not piece.text.strip():
                 continue
-            fh.write(json.dumps(piece_to_example(piece), ensure_ascii=False) + "\n")
-            count += 1
+            for ex in piece_to_examples(piece):
+                fh.write(json.dumps(ex, ensure_ascii=False) + "\n")
+                count += 1
     return count
 
 

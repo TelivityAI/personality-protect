@@ -74,6 +74,17 @@ def test_filter_user_content_without_reference_still_ends_at_rewritten():
     assert "cadence" in user.lower()
 
 
+def test_prompts_require_voice_transfer_on_clean_drafts():
+    """Clean drafts must be restyled — identity copy is failure, not success."""
+    sys_l = SYSTEM_PROMPT.lower()
+    assert "already clean" in sys_l or "free of ai tells" in sys_l
+    assert "do not return the draft unchanged" in sys_l or "not return the draft unchanged" in sys_l
+    user = USER_TEMPLATE_INFER.format(draft="Companies need a clear point of view.")
+    user_l = user.lower()
+    assert "even if" in user_l and "already" in user_l
+    assert "leave it unchanged" in user_l or "return it unchanged" in user_l
+
+
 def test_filter_messages_default_omits_long_reference():
     """LoRA path: cadence via weights, not pasted corpus blocks."""
     messages = build_filter_messages("We must leverage synergies.")
