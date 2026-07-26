@@ -22,6 +22,12 @@ from personality_protect.config import (
     ProfilePaths,
     load_config,
 )
+from personality_protect.mlx_train import (
+    DEFAULT_CHUNK_STEPS,
+    PROOF_MAX_STEPS,
+    ProgressCallback,
+    run_chunked_mlx_train,
+)
 from personality_protect.sft import build_sft_from_profile
 
 BackendName = Literal["auto", "mlx", "cuda", "cpu", "mock"]
@@ -174,8 +180,12 @@ def backend_docs(backend: str) -> str:
             f"Default model: {DEFAULT_MLX_MODEL} ({DEFAULT_MLX_SIZE_HINT} on disk)\n"
             "Install: pip install -e \".[mlx]\" then: "
             "personality-protect download --format mlx\n"
+            "Train runs in memory-capped subprocess chunks (CLI progress bar) "
+            "so a 48 GB Mac stays usable — stock mlx-lm can wire ~40 GB and "
+            "jetsam-kill Python.\n"
             "Adapters stay under your profile only. "
-            f"Inference default is GGUF Q4 ({DEFAULT_GGUF_SIZE_HINT}) via llama.cpp."
+            f"Inference default is GGUF Q4 ({DEFAULT_GGUF_SIZE_HINT}) via llama.cpp.\n"
+            "Receipts without a marathon: personality-protect train --proof"
         )
     if backend == "cuda":
         return (
@@ -216,6 +226,10 @@ def run_train(
     force: bool = False,
     sft_only: bool = False,
     force_rebuild_sft: bool = True,
+    chunk_steps: int = DEFAULT_CHUNK_STEPS,
+    memory_gb: float | None = None,
+    proof: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> TrainResult:
     config = load_config(paths)
     if force_rebuild_sft or not paths.sft_jsonl.is_file():
@@ -225,6 +239,9 @@ def run_train(
         n = sum(1 for _ in sft_path.open(encoding="utf-8") if _.strip())
 
     corpus_note = check_corpus_size(n, force=force or sft_only, smoke=smoke or mock)
+    # --proof: real weights, bounded steps for receipts (not a silent mock).
+    if proof and max_steps is None and not smoke and not mock:
+        max_steps = PROOF_MAX_STEPS
     steps = auto_max_steps(n, smoke=smoke or mock, max_steps=max_steps)
 
     if sft_only:
@@ -271,7 +288,17 @@ def run_train(
         result = _train_mock(paths, sft_path, adapter_dir, model_id, n, steps=steps, smoke=smoke)
     elif chosen == "mlx":
         result = _train_mlx(
-            paths, sft_path, adapter_dir, model_id, n, steps, allow_mock=allow_mock
+            paths,
+            sft_path,
+            adapter_dir,
+            model_id,
+            n,
+            steps,
+            allow_mock=allow_mock,
+            chunk_steps=chunk_steps,
+            memory_gb=memory_gb,
+            progress_callback=progress_callback,
+            proof=proof,
         )
     elif chosen == "cuda":
         result = _train_cuda(paths, sft_path, adapter_dir, model_id, n, steps)
@@ -397,11 +424,15 @@ def _train_mlx(
     max_steps: int,
     *,
     allow_mock: bool = False,
+    chunk_steps: int = DEFAULT_CHUNK_STEPS,
+    memory_gb: float | None = None,
+    progress_callback: ProgressCallback | None = None,
+    proof: bool = False,
 ) -> TrainResult:
-    """LoRA fine-tune via mlx-lm on a 4-bit MLX base (~6 GB), not full BF16."""
-    try:
-        from mlx_lm import lora as mlx_lora  # type: ignore
-    except ImportError:
+    """LoRA fine-tune via chunked, memory-capped MLX subprocesses (not full BF16)."""
+    import importlib.util
+
+    if importlib.util.find_spec("mlx_lm") is None:
         if allow_mock:
             mock_result = _train_mock(
                 paths, sft_path, adapter_dir, base_model, n, steps=max_steps, smoke=True
@@ -431,51 +462,15 @@ def _train_mlx(
     shutil.copy(sft_path, data_dir / "train.jsonl")
 
     try:
-        import sys
-
-        argv = [
-            "lora",
-            "--model",
-            base_model,
-            "--data",
-            str(data_dir),
-            "--train",
-            "--batch-size",
-            "1",
-            "--iters",
-            str(max(1, max_steps)),
-            "--adapter-path",
-            str(adapter_dir),
-        ]
-        old = sys.argv
-        try:
-            sys.argv = argv
-            if hasattr(mlx_lora, "main"):
-                mlx_lora.main()
-            else:
-                if allow_mock:
-                    mock_result = _train_mock(
-                        paths, sft_path, adapter_dir, base_model, n, steps=max_steps, smoke=True
-                    )
-                    mock_result.notes = (
-                        "mlx_lm.lora API mismatch; wrote mock adapter (--allow-mock). "
-                        "Check mlx-lm docs for your version and re-run train."
-                    )
-                    return mock_result
-                return TrainResult(
-                    backend="mlx",
-                    status="error",
-                    adapter_dir=str(adapter_dir),
-                    base_model=base_model,
-                    examples=n,
-                    notes=(
-                        "mlx_lm.lora API mismatch (no main()). "
-                        "Refusing silent mock fallback — pass --allow-mock to override."
-                    ),
-                    steps=0,
-                )
-        finally:
-            sys.argv = old
+        meta = run_chunked_mlx_train(
+            model=base_model,
+            data_dir=data_dir,
+            adapter_dir=adapter_dir,
+            total_steps=max(1, max_steps),
+            chunk_steps=chunk_steps,
+            memory_gb=memory_gb,
+            progress_callback=progress_callback,
+        )
     except Exception as exc:  # noqa: BLE001 — surface train errors honestly
         return TrainResult(
             backend="mlx",
@@ -487,20 +482,28 @@ def _train_mlx(
                 f"MLX train failed: {exc}\n"
                 f"Expected quantized base {DEFAULT_MLX_MODEL} ({DEFAULT_MLX_SIZE_HINT}). "
                 "Prefetch with: personality-protect download --format mlx\n"
-                "Training may briefly need more unified memory than the on-disk size. "
+                "Train uses memory-capped subprocess chunks so a 48 GB Mac stays usable. "
+                "Try: --proof (bounded steps) or --memory-gb 16 --chunk-steps 25\n"
                 "For a no-download smoke test: --backend mock"
             ),
             steps=0,
+            meta={"error": str(exc)},
         )
 
+    proof_note = " [proof mode]" if proof else ""
     return TrainResult(
         backend="mlx",
         status="ok",
         adapter_dir=str(adapter_dir),
         base_model=base_model,
         examples=n,
-        notes=f"MLX LoRA adapter saved under {adapter_dir} (base={base_model}, steps={max_steps})",
-        meta={"loss": None},
+        notes=(
+            f"MLX LoRA adapter saved under {adapter_dir} "
+            f"(base={base_model}, steps={max_steps}, "
+            f"chunks={meta.get('chunks')}, "
+            f"wired_cap={meta.get('wired_limit_gb')} GB){proof_note}"
+        ),
+        meta={"loss": None, **meta},
         steps=max_steps,
     )
 

@@ -8,9 +8,18 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 
 from personality_protect import __version__
+from personality_protect.mlx_train import DEFAULT_CHUNK_STEPS, PROOF_MAX_STEPS
 from personality_protect.api import DEFAULT_HOST, DEFAULT_PORT
 from personality_protect.api import serve as serve_api
 from personality_protect.config import (
@@ -420,6 +429,21 @@ def train_cmd(
         "--max-steps",
         help="Train steps/iters (default: auto from SFT count, or smoke low-step).",
     ),
+    chunk_steps: int = typer.Option(
+        DEFAULT_CHUNK_STEPS,
+        "--chunk-steps",
+        help="MLX: iters per subprocess chunk (releases Metal memory between chunks).",
+    ),
+    memory_gb: Optional[float] = typer.Option(
+        None,
+        "--memory-gb",
+        help="MLX: cap Metal wired memory in GB (default: ~40% of RAM, max 20 GB).",
+    ),
+    proof: bool = typer.Option(
+        False,
+        "--proof",
+        help=f"Bounded real train ({PROOF_MAX_STEPS} steps) for receipts — not mock.",
+    ),
     smoke: bool = typer.Option(
         False,
         "--smoke",
@@ -468,15 +492,106 @@ def train_cmd(
     if not as_json and not sft_only:
         console.print(f"Backend: [bold]{detected}[/bold]")
         console.print(backend_docs(detected))
-        if max_steps is None and not smoke and not mock:
+        if proof and max_steps is None and not smoke and not mock:
+            console.print(
+                f"Steps: proof mode ({PROOF_MAX_STEPS}) in chunks of {chunk_steps}"
+            )
+        elif max_steps is None and not smoke and not mock:
             console.print(
                 f"Steps: auto (≈{auto_max_steps(100)} for 100 examples; "
-                "scaled from your SFT count)"
+                f"scaled from your SFT count), chunks of {chunk_steps}"
             )
         elif smoke or mock:
             console.print(
                 f"Steps: smoke/low-step ({max_steps or auto_max_steps(1, smoke=True)})"
             )
+        if memory_gb is not None:
+            console.print(f"Metal wired memory cap: {memory_gb} GB")
+
+    progress_holder: dict = {}
+
+    def _make_progress_callback():
+        if as_json or sft_only or detected not in {"mlx", "auto"} and backend != "mlx":
+            return None
+        if detected != "mlx" and backend != "auto":
+            return None
+        # Only show bar for real MLX path
+        if detected != "mlx":
+            return None
+
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("{task.fields[detail]}"),
+            console=console,
+            transient=False,
+        )
+        progress.start()
+        task_id = progress.add_task("train", total=None, detail="")
+        progress_holder["progress"] = progress
+        progress_holder["task_id"] = task_id
+
+        def on_progress(info: dict) -> None:
+            kind = info.get("kind")
+            tid = progress_holder["task_id"]
+            if kind == "start":
+                progress.update(
+                    tid,
+                    total=info.get("total_steps") or 0,
+                    completed=0,
+                    description="MLX LoRA",
+                    detail=(
+                        f"cap {info.get('wired_limit_gb')} GB · "
+                        f"{info.get('chunks')} chunks"
+                    ),
+                )
+            elif kind == "chunk_start":
+                progress.update(
+                    tid,
+                    detail=(
+                        f"chunk {info.get('chunk')}/{info.get('chunks')} "
+                        f"({info.get('chunk_iters')} iters)"
+                    ),
+                )
+            elif kind == "step":
+                progress.update(
+                    tid,
+                    completed=info.get("global_step") or 0,
+                    detail=str(info.get("line") or "")[:60],
+                )
+            elif kind == "chunk_done":
+                peak = info.get("peak_mem_gb")
+                peak_s = f" · peak {peak:.1f} GB" if peak else ""
+                progress.update(
+                    tid,
+                    completed=info.get("completed_steps") or 0,
+                    detail=f"chunk {info.get('chunk')} done{peak_s}",
+                )
+            elif kind == "done":
+                progress.update(
+                    tid,
+                    completed=info.get("total_steps") or 0,
+                    detail="adapter saved",
+                )
+            elif kind == "error":
+                progress.update(tid, detail="FAILED")
+
+        return on_progress
+
+    # Resolve whether we'll actually use mlx for the progress bar
+    show_mlx_progress = (
+        not as_json
+        and not sft_only
+        and not mock
+        and backend != "mock"
+        and detected == "mlx"
+    )
+    callback = _make_progress_callback() if show_mlx_progress else None
+
     try:
         result = run_train(
             paths,
@@ -487,10 +602,18 @@ def train_cmd(
             allow_mock=allow_mock,
             force=force,
             sft_only=sft_only,
+            chunk_steps=chunk_steps,
+            memory_gb=memory_gb,
+            proof=proof,
+            progress_callback=callback,
         )
     except (FileNotFoundError, RuntimeError, MockFallbackError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
+    finally:
+        prog = progress_holder.get("progress")
+        if prog is not None:
+            prog.stop()
 
     if as_json:
         typer.echo(json.dumps(result.to_dict(), indent=2))

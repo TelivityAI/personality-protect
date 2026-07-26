@@ -140,12 +140,14 @@ Corpus gates: **warn** below 50 selected pieces; **block** below 20 unless `--fo
 personality-protect train --sft-only
 personality-protect train --backend mock --smoke --force   # CI / pipeline only
 personality-protect train --backend mlx                    # auto steps from corpus size
+personality-protect train --backend mlx --proof            # bounded real train (receipts)
+personality-protect train --backend mlx --chunk-steps 50 --memory-gb 16
 personality-protect train --backend cuda --max-steps 200
 ```
 
 Adapters land under `~/.personality-protect/profiles/<name>/adapters/` only.
 
-**Honest hardware note:** train may briefly need more **RAM** than the ~5–7 GB on-disk footprint. The **download** story stays quantized — you should not need to keep a full BF16 copy as the happy path. CUDA’s first HF fetch can cache extra shards; day-to-day `filter` should use the GGUF under `models/`.
+**Honest hardware note:** MLX train is **memory-capped and chunked** (subprocess pieces + CLI progress bar) so a 48 GB Mac stays usable — stock `mlx-lm` can wire ~40 GB and jetsam-kill Python ("quit unexpectedly"). Peak train RAM is still higher than the ~5–7 GB on-disk footprint. The **download** story stays quantized. CUDA’s first HF fetch can cache extra shards; day-to-day `filter` should use the GGUF under `models/`.
 
 ### 6. Filter
 
