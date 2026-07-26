@@ -1,0 +1,5 @@
+2021-08-21
+
+Appreciate this thread. One caveat from the trenches: most "AI writing tips"
+optimize for average. Average is the enemy of a recognizable voice. Ship fewer
+words with more fingerprints. That is harder, and worth it every time.

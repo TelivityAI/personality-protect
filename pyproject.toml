@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personality-protect"
+version = "0.1.0"
+description = "Local-only CLI: personal writing-voice filter on quantized Qwen3.5-9B (~5–7 GB)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "Telivity" }]
+keywords = ["lora", "voice", "privacy", "local", "cli", "qwen", "gguf", "mlx"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Text Processing",
+]
+dependencies = [
+  "typer>=0.12",
+  "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+# Prefetch quantized GGUF / MLX artifacts from Hugging Face
+models = ["huggingface_hub>=0.24"]
+# llama.cpp GGUF runtime for filter (~5–7 GB Q4/Q5 on disk)
+gguf = ["llama-cpp-python>=0.3.0", "huggingface_hub>=0.24"]
+# Apple Silicon local train/infer on MLX 4-bit (~6 GB)
+mlx = ["mlx>=0.22", "mlx-lm>=0.22", "huggingface_hub>=0.24"]
+# CUDA / torch QLoRA path (install separately; heavy)
+cuda = [
+  "torch>=2.2",
+  "transformers>=4.45",
+  "peft>=0.13",
+  "datasets>=3.0",
+  "accelerate>=1.0",
+  "bitsandbytes>=0.44",
+]
+# Full optional train stack without CUDA bitsandbytes
+train = [
+  "transformers>=4.45",
+  "peft>=0.13",
+  "datasets>=3.0",
+  "accelerate>=1.0",
+]
+api = []  # stdlib http.server only; reserved for future deps
+
+[project.scripts]
+personality-protect = "personality_protect.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/TelivityAI/personality-protect"
+Documentation = "https://github.com/TelivityAI/personality-protect#readme"
+Repository = "https://github.com/TelivityAI/personality-protect"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+personality_protect = ["py.typed", "data/demo/*.md", "data/demo/*.txt", "data/demo/*.jsonl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

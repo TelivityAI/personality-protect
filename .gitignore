@@ -1,0 +1,92 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+.env/
+*.egg
+
+# Personal / local runtime — NEVER commit
+.personality-protect/
+~/.personality-protect/
+profiles/
+adapters/
+lora/
+sft/
+exports/
+linkedin_export/
+*_export/
+**/cache/linkedin_*/
+**/demo_corpus/
+
+# Archives / dumps that often hold personal exports
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.rar
+
+# Secrets / keys
+.env
+.env.*
+!.env.example
+*_key
+*_keys
+*.pem
+*.p12
+credentials.json
+secrets.json
+huggingface_token
+HF_TOKEN
+*.token
+.hf_token
+token.json
+
+# Model weights / caches (local downloads — huge)
+models/
+checkpoints/
+wandb/
+runs/
+outputs/
+*.gguf
+*.gguf.*
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.mlx
+*.npz
+*.npz.index
+adapter_config.json
+adapter_model*
+mock_adapter.json
+
+# Notebooks with possible personal cells
+*.ipynb_checkpoints/
+*.ipynb
+
+# Agent / IDE leftovers — never publish private discussion
+.cursor/
+.claude/
+.codex/
+agent-transcripts/
+*.plan.md
+PLAN.md
+NOTES.md
+TODO.private.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

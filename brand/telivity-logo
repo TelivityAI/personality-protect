@@ -1,0 +1,115 @@
+#!/usr/bin/env sh
+#
+# Terminal-friendly Telivity logo.
+# Usage: telivity-logo [--truecolor|--color|--plain|--ascii] [--mark-only]
+#
+
+mode=auto
+mark_only=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --truecolor) mode=truecolor ;;
+    --color) mode=color ;;
+    --plain|--no-color) mode=plain ;;
+    --ascii) mode=ascii ;;
+    --mark-only) mark_only=true ;;
+    -h|--help)
+      printf '%s\n' \
+        'Usage: telivity-logo [--truecolor|--color|--plain|--ascii] [--mark-only]' \
+        '' \
+        '  --truecolor  Use the full Telivity palette' \
+        '  --color      Use portable 16-color ANSI output' \
+        '  --plain      Use a monochrome block logo' \
+        '  --ascii      Use strict ASCII (safe for basic logs)' \
+        '  --mark-only  Show only the T symbol in any mode'
+      exit 0
+      ;;
+    *)
+      printf 'telivity-logo: unknown option: %s\n' "$arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ "$mode" = auto ]; then
+  if [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ] || [ "${TERM:-dumb}" = dumb ]; then
+    mode=plain
+  elif [ "${COLORTERM:-}" = truecolor ] || [ "${COLORTERM:-}" = 24bit ]; then
+    mode=truecolor
+  else
+    mode=color
+  fi
+fi
+
+if [ "$mark_only" = true ]; then
+  wordmark=''
+else
+  wordmark='  Telivity'
+fi
+
+if [ "$mode" = ascii ]; then
+  printf '%s\n' \
+    "       ____________      " \
+    "   ___/            \\___  " \
+    "  <______      ________>${wordmark}" \
+    "         \\    \\         " \
+    "          \\    \\        " \
+    "           \\    \\       " \
+    "            \\  /        " \
+    "             \\/         "
+  exit 0
+fi
+
+if [ "$mode" = plain ]; then
+  printf '%s\n' \
+    "       ▄▄▄▄▄▄▄▄▄▄▄▄▄▄       " \
+    "   ▄▄██████████████████▄▄   " \
+    " ▄████████████████████████▄ " \
+    "▀██████████████████████████▀${wordmark}" \
+    "        ██████               " \
+    "       ██████                " \
+    "      ██████                 " \
+    "     ██████                  " \
+    "     ██▀                     "
+  exit 0
+fi
+
+esc=$(printf '\033')
+reset="${esc}[0m"
+bold="${esc}[1m"
+
+if [ "$mode" = truecolor ]; then
+  orange="${esc}[38;2;255;126;30m"
+  red="${esc}[38;2;238;56;54m"
+  blue="${esc}[38;2;21;142;203m"
+  yellow="${esc}[38;2;255;183;26m"
+  teal="${esc}[38;2;20;184;180m"
+  cyan="${esc}[38;2;105;221;211m"
+else
+  orange="${esc}[38;5;208m"
+  red="${esc}[31m"
+  blue="${esc}[34m"
+  yellow="${esc}[33m"
+  teal="${esc}[36m"
+  cyan="${esc}[96m"
+fi
+
+if [ "$mark_only" = true ]; then
+  colored_wordmark=''
+else
+  # Use the terminal's foreground so the name remains visible on both
+  # light and dark themes.
+  colored_wordmark="${reset}${bold}  Telivity${reset}"
+fi
+
+printf '%b\n' \
+  "       ${orange}▄▄▄▄${red}▄▄${blue}▄▄▄▄${yellow}▄▄▄▄${reset}       " \
+  "   ${orange}▄▄████${red}██${blue}████${yellow}██████▄▄${reset}   " \
+  " ${orange}▄██████${red}██${blue}████${yellow}████████▄${reset} " \
+  "${orange}▀██████${red}██${blue}████${yellow}████████▀${reset}${colored_wordmark}" \
+  "        ${teal}██${blue}████${reset}           " \
+  "       ${teal}████${blue}██${reset}            " \
+  "      ${teal}████${cyan}██${reset}             " \
+  "     ${teal}████${cyan}██${reset}              " \
+  "     ${teal}██▀${reset}                  "
