@@ -239,6 +239,8 @@ def test_piece_to_examples_includes_clean_draft_voice_pair():
     assert "clean" in kinds
     # Multi-paragraph voice pieces get leave-alone pairs (don't fidget / flatten)
     assert "leave_alone" in kinds
+    # Short multi-para pieces also emit cadence oversampling pairs
+    assert "slop_cadence" in kinds or "clean_cadence" in kinds
 
     clean = next(ex for ex in examples if ex["meta"]["pair_kind"] == "clean")
     user = clean["messages"][1]["content"]
@@ -263,6 +265,48 @@ def test_piece_to_examples_includes_clean_draft_voice_pair():
     leave_target = leave["messages"][-1]["content"]
     assert leave_draft == leave_target
     assert "\n\n" in leave_target
+
+
+def test_ensure_voice_paragraphs_splits_flat_sentence_blocks():
+    """Flat multi-sentence voice must become multi-para rewrite targets."""
+    from personality_protect.sft import _ensure_voice_paragraphs, piece_to_examples
+    from personality_protect.models import Piece
+
+    flat = (
+        "Personal branding matters more than ever. AI tools flood every channel. "
+        "Companies need a clear point of view, not another template post."
+    )
+    para = _ensure_voice_paragraphs(flat)
+    assert "\n\n" in para
+    assert para.count("\n\n") >= 1
+    examples = piece_to_examples(
+        Piece(id="flat1", source="demo", text=flat, year=2026, word_count=30)
+    )
+    rewrite = [ex for ex in examples if ex["meta"]["pair_kind"] in {"slop", "clean"}]
+    assert rewrite
+    for ex in rewrite:
+        assert "\n\n" in ex["messages"][-1]["content"]
+    # Artificially paragraphized flats must NOT mint leave-alone pass-through
+    assert "leave_alone" not in {ex["meta"]["pair_kind"] for ex in examples}
+
+
+def test_synthetic_short_cadence_examples_are_multi_para_voice():
+    from personality_protect.sft import _synthetic_short_cadence_examples
+
+    rows = _synthetic_short_cadence_examples()
+    assert len(rows) >= 12
+    kinds = {r["meta"]["pair_kind"] for r in rows}
+    assert "slop" in kinds and "clean" in kinds
+    for r in rows:
+        user = r["messages"][1]["content"]
+        draft = user.split("### Draft\n", 1)[1].split("\n\n### Rewritten", 1)[0]
+        target = r["messages"][-1]["content"]
+        assert draft.strip() != target.strip()
+        assert "\n\n" in target
+        # Synthetic-only entities / no personal corpus paths
+        blob = (draft + "\n" + target).lower()
+        assert "travelport" not in blob
+        assert "linkedin.com" not in blob
 
 
 def test_clean_generic_draft_forces_rewrite_even_on_flat_prose():
@@ -331,6 +375,7 @@ def test_neutral_draft_is_not_near_identity_copy():
         Piece(id="y", source="demo", text=text, year=2026, word_count=80)
     )
     assert "Let's be real" in ex["messages"][-1]["content"]
-    assert "cash cow" in ex["messages"][-1]["content"]
+    # Target is seq-budget truncated; keep early voice markers + entities.
+    assert "Northwind" in ex["messages"][-1]["content"]
     assert "### My voice" not in ex["messages"][1]["content"]
     assert ex["messages"][1]["content"].count("### Draft") == 1

@@ -82,11 +82,14 @@ def test_prompts_preserve_paragraphs_and_allow_leave_alone():
     assert "paragraph" in sys_l
     assert "unchanged" in sys_l
     assert "opener" in sys_l or "openings" in sys_l
+    # Flat/slop must be rewritten into multi-para cadence, not a thesaurus line.
+    assert "thesaurus" in sys_l or "multi-paragraph" in sys_l or "blank lines" in sys_l
     user = USER_TEMPLATE_INFER.format(draft="Companies need a clear point of view.")
     user_l = user.lower()
     assert "paragraph" in user_l
     assert "unchanged" in user_l
     assert "opener" in user_l or "openings" in user_l
+    assert "multi-paragraph" in user_l or "thesaurus" in user_l or "blank lines" in user_l
 
 
 def test_strip_ai_tells_preserves_paragraph_breaks():
@@ -100,6 +103,22 @@ def test_strip_ai_tells_preserves_paragraph_breaks():
     assert out.count("\n\n") >= 2
     assert "leverage" not in out.lower()
     assert "Second punch" in out
+
+
+def test_strip_ai_tells_does_not_mint_thesaurus_mush():
+    """Phrase-level cleanup — not unlock→open / nestled→in nonsense."""
+    text = (
+        "We must leverage robust synergies to delve into authentic personal branding.\n\n"
+        "Unlocking nestled opportunities is a testament to vibrant innovation."
+    )
+    out = strip_ai_tells(text)
+    assert "\n\n" in out
+    assert "open in" not in out.lower()
+    assert "solid strengths" not in out.lower()
+    assert "leverage" not in out.lower()
+    assert "nestled" not in out.lower()
+    assert "testament" not in out.lower()
+    assert "branding" in out.lower()
 
 
 def test_similarity_guard_returns_draft_when_near_identity():
@@ -118,6 +137,22 @@ def test_similarity_guard_returns_draft_when_near_identity():
     flat = "Personal branding matters more than ever as AI tools flood every channel."
     voiced = "Personal branding matters. AI floods every channel — say something real."
     assert similarity_guard(flat, voiced) == voiced
+
+
+def test_similarity_guard_keeps_draft_when_only_reparagraphed():
+    """Leave-alone: same substance + new blank lines must not count as a rewrite."""
+    draft = (
+        "These questions keep popping up every time I read another vibe coding take.\n\n"
+        "How much of the labs' revenue is the first pass, and how much is cleanup?\n\n"
+        "Maybe we are too hard on vibe coders. Drucker said create a customer."
+    )
+    fidget = (
+        "These questions keep popping up every time I read another vibe coding take.\n\n"
+        "How much of the labs' revenue is the first pass, and how much is cleanup?\n\n"
+        "Maybe we are too hard on vibe coders.\n\n"
+        "Drucker said create a customer."
+    )
+    assert similarity_guard(draft, fidget) == draft
 
 
 def test_filter_messages_default_omits_long_reference():

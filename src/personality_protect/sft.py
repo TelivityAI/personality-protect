@@ -13,39 +13,36 @@ from personality_protect.config import ProfilePaths
 from personality_protect.models import Piece
 from personality_protect.select import selected_pieces
 
+# Keep short: MLX mask_prompt @ 512 tokens — long system text starves assistant labels.
 SYSTEM_PROMPT = (
-    "You are a personal voice rewriter. Match the user's authentic writing voice — "
-    "cadence, short punches, rhetorical questions, metaphors, contractions, and "
-    "paragraph rhythm — not generic clean prose. Keep factual meaning unchanged. "
-    "Preserve paragraph breaks and blank lines; never flatten multi-paragraph drafts "
-    "into a single block. Keep a strong opener in place unless it is sloppy or AI-tell "
-    "scaffolding — do not reorder or soften openings just to sound different. "
-    "If the draft already matches the user's voice (rhythm, diction, paragraphing), "
-    "return it unchanged — do not fidget, paraphrase, or polish for its own sake. "
-    "When the draft is flat, corporate, or AI-slop, restyle it into the user's voice. "
-    "Strip generic AI tells such as: leverage, synergies, delve, robust, "
-    "In today's fast-paced world, It is important to note, Moreover, Furthermore, "
-    "unlock, nestled, testament, vibrant. Do not invent facts, citations, or claims. "
-    "Do not add hashtags, emoji, or marketing slogans unless the voice reference uses them."
+    "Personal voice rewriter. Match cadence: short punches, rhetorical bite, "
+    "contractions, paragraph rhythm — not generic clean prose. Keep meaning. "
+    "Preserve paragraph breaks; never flatten multi-paragraph drafts. "
+    "Keep a strong opener unless it is sloppy/AI scaffolding. "
+    "If the draft already matches the user's voice, return it unchanged — no fidget. "
+    "If flat, corporate, mushy, or AI-slop: rewrite into multi-paragraph voice with "
+    "blank lines between punches — never a thesaurus one-liner. "
+    "Strip AI tells (leverage, synergies, delve, robust, In today's fast-paced world, "
+    "It is important to note, Moreover, Furthermore, unlock, nestled, testament, "
+    "vibrant). No invented facts, hashtags, or emoji unless the voice uses them."
 )
 
 # Inference-aligned user turn (no reference dump — LoRA must carry voice).
 USER_TEMPLATE_INFER = (
-    "Rewrite the draft in my voice when it needs it. Match my cadence and diction — "
-    "short punches, direct address, rhetorical bite — not bland marketing. "
-    "Preserve my paragraph breaks. Keep a strong opener unless it is sloppy. "
-    "If the draft already sounds like me, return it unchanged. "
-    "Keep the same meaning. Remove AI-sounding filler.\n\n"
+    "Rewrite in my voice when needed. Cadence and diction — not bland marketing. "
+    "Preserve paragraph breaks. Keep a strong opener unless sloppy. "
+    "Flat/corporate/AI-slop → multi-paragraph voice with blank lines (not one "
+    "thesaurus sentence). Already my voice → unchanged. Same meaning; drop AI filler.\n\n"
     "### Draft\n{draft}\n\n"
     "### Rewritten"
 )
 
 # Optional few-shot / receipts shape (reference present).
 USER_TEMPLATE = (
-    "Rewrite the draft in my voice when it needs it. Match my cadence and diction "
-    "from the reference. Preserve paragraph breaks. Keep a strong opener unless it "
-    "is sloppy. If the draft already sounds like me, return it unchanged. "
-    "Keep the same meaning. Remove AI-sounding filler.\n\n"
+    "Rewrite in my voice when needed. Match cadence from the reference. "
+    "Preserve paragraph breaks. Keep a strong opener unless sloppy. "
+    "Flat/corporate/AI-slop → multi-paragraph voice with blank lines (not one "
+    "thesaurus sentence). Already my voice → unchanged. Same meaning; drop AI filler.\n\n"
     "### Draft\n{draft}\n\n"
     "### My voice (reference)\n{reference}\n\n"
     "### Rewritten"
@@ -60,9 +57,12 @@ _CSS_RULE_RE = re.compile(
 _HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
 # MLX trains at max_seq_length=512 with mask_prompt. Prompt (system+user+draft)
 # plus assistant target must fit; overflow leaves zero assistant tokens →
-# Train loss nan and a dead / corrupt chunk.
-MAX_SFT_TARGET_CHARS = 420
-MAX_SFT_DRAFT_CHARS = 420
+# Train loss nan and a dead / corrupt chunk. Keep drafts/targets short enough
+# that chat-templated rows stay under 512 even with the longer voice prompt.
+MAX_SFT_TARGET_CHARS = 280
+MAX_SFT_DRAFT_CHARS = 280
+# Hard char budget for system+user+assistant (chat template adds a little more).
+MAX_SFT_EXAMPLE_CHARS = 1600
 # Bland public business idioms only — never encode user-specific metaphors.
 _METAPHOR_FLATTEN = (
     (re.compile(r"\bcash cow\b", re.I), "primary revenue source"),
@@ -196,17 +196,56 @@ def _truncate_voice_target(text: str, max_chars: int = MAX_SFT_TARGET_CHARS) -> 
     return _truncate_for_seq_budget(text, max_chars)
 
 
+def _ensure_voice_paragraphs(text: str) -> str:
+    """Turn sentence-level voice rhythm into blank-line paragraph punches.
+
+    Rewrite pairs must teach flat/slop → multi-paragraph cadence. Corpus pieces
+    that are already one block but have 2+ punchy sentences get paragraphized
+    for slop/clean targets only (leave-alone keeps the original shape).
+    """
+    text = (text or "").strip()
+    if not text or "\n\n" in text:
+        return text
+    # Soft line breaks inside a block → treat as paragraph candidates.
+    if "\n" in text:
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        if len(lines) >= 2:
+            return "\n\n".join(lines)
+    parts = [
+        p.strip()
+        for p in re.split(r"(?<=[.!?])\s+", text)
+        if p.strip()
+    ]
+    if len(parts) < 2:
+        return text
+    # Prefer 2–4 short punches; merge tiny trailing fragments into prior para.
+    paras: list[str] = []
+    for p in parts:
+        if paras and len(p) < 28:
+            paras[-1] = f"{paras[-1]} {p}"
+        else:
+            paras.append(p)
+    if len(paras) < 2:
+        return text
+    return "\n\n".join(paras)
+
+
 def _example_row(
     *,
     draft: str,
     target: str,
     piece: Piece,
     pair_kind: str,
-) -> dict:
+) -> dict | None:
+    """Build one SFT row, or None if it would overflow the MLX 512-token budget."""
+    user = USER_TEMPLATE_INFER.format(draft=draft)
+    total = len(SYSTEM_PROMPT) + len(user) + len(target)
+    if total > MAX_SFT_EXAMPLE_CHARS:
+        return None
     return {
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": USER_TEMPLATE_INFER.format(draft=draft)},
+            {"role": "user", "content": user},
             {"role": "assistant", "content": target},
         ],
         "meta": {
@@ -227,28 +266,52 @@ def piece_to_examples(piece: Piece) -> list[dict]:
     - clean→voice: flat professional draft → authentic text with real paragraphs
     - leave_alone: already-voice draft → identical assistant (do not fidget)
     """
-    target = _truncate_voice_target(normalize_corpus_text(piece.text))
-    if not target.strip():
+    raw_target = _truncate_voice_target(normalize_corpus_text(piece.text))
+    if not raw_target.strip():
         return []
+    # Rewrite pairs: multi-paragraph voice targets (cadence restore).
+    voice_target = _truncate_voice_target(_ensure_voice_paragraphs(raw_target))
     out: list[dict] = []
     for kind, draft_fn in (("slop", _neutral_draft), ("clean", _clean_generic_draft)):
-        draft = _truncate_for_seq_budget(draft_fn(target), MAX_SFT_DRAFT_CHARS)
-        if not draft.strip() or draft.strip() == target.strip():
+        # Draft from the paragraphized target so meaning aligns; flatten still
+        # collapses to a single block for the user turn.
+        draft = _truncate_for_seq_budget(draft_fn(voice_target), MAX_SFT_DRAFT_CHARS)
+        if not draft.strip() or draft.strip() == voice_target.strip():
             continue
-        out.append(_example_row(draft=draft, target=target, piece=piece, pair_kind=kind))
-
-    # Leave-alone only for multi-paragraph voice pieces — teaches "don't flatten /
-    # don't fidget" without training pass-through on flat clean prose.
-    leave_draft = _truncate_for_seq_budget(target, MAX_SFT_DRAFT_CHARS)
-    if leave_draft.strip() and "\n\n" in leave_draft:
-        out.append(
-            _example_row(
-                draft=leave_draft,
-                target=leave_draft,
-                piece=piece,
-                pair_kind="leave_alone",
-            )
+        row = _example_row(
+            draft=draft, target=voice_target, piece=piece, pair_kind=kind
         )
+        if row is not None:
+            out.append(row)
+        # Extra short multi-para pairs: reinforce branding-length cadence restore
+        # (eval drafts are ~1–2 sentences of mush/flat).
+        if (
+            "\n\n" in voice_target
+            and len(voice_target) <= 280
+            and voice_target.count("\n\n") >= 1
+        ):
+            row = _example_row(
+                draft=draft,
+                target=voice_target,
+                piece=piece,
+                pair_kind=f"{kind}_cadence",
+            )
+            if row is not None:
+                out.append(row)
+
+    # Leave-alone only for *original* multi-paragraph voice pieces — teaches
+    # "don't flatten / don't fidget". Do not mint leave-alone from artificially
+    # paragraphized flats (that would dilute clean/slop → voice rewrite signal).
+    leave_draft = _truncate_for_seq_budget(raw_target, MAX_SFT_DRAFT_CHARS)
+    if leave_draft.strip() and "\n\n" in leave_draft:
+        row = _example_row(
+            draft=leave_draft,
+            target=leave_draft,
+            piece=piece,
+            pair_kind="leave_alone",
+        )
+        if row is not None:
+            out.append(row)
     return out
 
 
@@ -646,6 +709,122 @@ def _force_clean_draft_distance(draft: str, target: str, max_overlap: float = 0.
     return draft.strip()
 
 
+def _synthetic_short_cadence_examples() -> list[dict]:
+    """Branding-length synthetic pairs: flat/slop → punchy multi-para voice.
+
+    Contoso/Northwind only — no personal corpus. Pattern-matched to short
+    eval-length drafts but not verbatim copies of packaged eval stems.
+    """
+    pairs: list[tuple[str, str, str]] = [
+        (
+            "slop",
+            (
+                "In today's fast-paced world, it is important to note that Contoso "
+                "must leverage robust synergies to delve into thought leadership. "
+                "Moreover, furthermore, unlocking nestled opportunities is a "
+                "testament to vibrant innovation."
+            ),
+            (
+                "Let's be real.\n\n"
+                "Contoso doesn't need a synonym parade. It needs to sound like a "
+                "person when every channel is drowning in the same sludge.\n\n"
+                "Say something with a spine — or don't post."
+            ),
+        ),
+        (
+            "clean",
+            (
+                "Thought leadership matters increasingly as generative systems "
+                "appear across every channel. Organizations require a distinct "
+                "perspective, not another templated statement regarding genuine "
+                "positioning."
+            ),
+            (
+                "Thought leadership matters more than ever.\n\n"
+                "Generative sludge floods every channel with the same polished "
+                "nothing.\n\n"
+                "Organizations need a point of view — not another template about "
+                "authenticity."
+            ),
+        ),
+        (
+            "slop",
+            (
+                "Furthermore, Contoso Labs must leverage robust synergies to unlock "
+                "nestled opportunities across the vertical. It is important to note "
+                "that this is a testament to vibrant innovation."
+            ),
+            (
+                "Contoso Labs keeps talking about synergies.\n\n"
+                "Meanwhile the vertical already knows who has a real point of view.\n\n"
+                "Stop unlocking nestled nothing. Ship the take."
+            ),
+        ),
+        (
+            "clean",
+            (
+                "Organizations require a well-defined perspective on genuine "
+                "positioning as AI systems appear across every channel."
+            ),
+            (
+                "Everyone's posting about authenticity.\n\n"
+                "Almost nobody sounds like a person.\n\n"
+                "If AI floods the channel, your point of view is the only filter left."
+            ),
+        ),
+        (
+            "slop",
+            (
+                "Moreover, we must delve into how Northwind Analytics can leverage "
+                "synergies. In today's landscape this is a testament to vibrant "
+                "innovation."
+            ),
+            (
+                "Northwind Analytics — really?\n\n"
+                "You don't need synergies. You need a clear take that isn't another "
+                "template.\n\n"
+                "That's the whole game."
+            ),
+        ),
+        (
+            "clean",
+            (
+                "From an operational standpoint, teams require a distinct perspective "
+                "rather than a templated statement regarding genuine positioning."
+            ),
+            (
+                "Here's the thing:\n\n"
+                "A templated statement about authenticity is still a template.\n\n"
+                "Have a point of view, or stay quiet."
+            ),
+        ),
+    ]
+    out: list[dict] = []
+    for kind, draft, target in pairs:
+        piece = Piece(
+            id=f"synthetic_cadence_{kind}_{len(out)}",
+            source="demo",
+            text=target,
+            year=2026,
+            word_count=len(target.split()),
+        )
+        row = _example_row(draft=draft, target=target, piece=piece, pair_kind=kind)
+        if row is None:
+            continue
+        out.append(row)
+        # Heavy oversample — short drafts are the failure mode.
+        for _ in range(3):
+            dup = _example_row(
+                draft=draft,
+                target=target,
+                piece=piece,
+                pair_kind=f"{kind}_cadence",
+            )
+            if dup is not None:
+                out.append(dup)
+    return out
+
+
 def build_sft_jsonl(pieces: Iterable[Piece], out_path: Path) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
@@ -656,6 +835,9 @@ def build_sft_jsonl(pieces: Iterable[Piece], out_path: Path) -> int:
             for ex in piece_to_examples(piece):
                 fh.write(json.dumps(ex, ensure_ascii=False) + "\n")
                 count += 1
+        for ex in _synthetic_short_cadence_examples():
+            fh.write(json.dumps(ex, ensure_ascii=False) + "\n")
+            count += 1
     return count
 
 

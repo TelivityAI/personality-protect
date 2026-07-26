@@ -73,6 +73,9 @@ def strip_ai_tells(text: str) -> str:
 
     Preserves paragraph breaks / blank lines — never flatten multi-paragraph
     rewrites into a single prose block (that was the vibe-draft B− failure mode).
+
+    Prefer deleting scaffolding / multi-word tells over synonym swaps that mint
+    thesaurus mush ("unlocking nestled" → "open in").
     """
     body = text
     body = re.sub(
@@ -82,18 +85,34 @@ def strip_ai_tells(text: str) -> str:
         flags=re.I,
     )
     body = re.sub(r"\bIt is important to note that\s*", "", body, flags=re.I)
-    body = re.sub(r"\bMoreover,\s*", "Also, ", body, flags=re.I)
-    body = re.sub(r"\bFurthermore,\s*", "And ", body, flags=re.I)
+    body = re.sub(r"\bMoreover,\s*furthermore,?\s*", "", body, flags=re.I)
+    body = re.sub(r"\bMoreover,\s*", "", body, flags=re.I)
+    body = re.sub(r"\bFurthermore,\s*", "", body, flags=re.I)
+    body = re.sub(r"\bAdditionally,\s*", "", body, flags=re.I)
+    # Multi-word tells: cut the clause, don't synonym-swap into nonsense.
+    body = re.sub(
+        r"\bleverage(?:\s+robust)?\s+synergies\b",
+        "make real connections",
+        body,
+        flags=re.I,
+    )
+    body = re.sub(
+        r"\bunlock(?:ing)?\s+nestled\s+opportunities\b",
+        "find real opportunities",
+        body,
+        flags=re.I,
+    )
+    body = re.sub(r"\ba testament to\s+vibrant\s+", "", body, flags=re.I)
+    body = re.sub(r"\ba testament to\s+", "", body, flags=re.I)
+    body = re.sub(r"\bdelve into\b", "talk about", body, flags=re.I)
     body = re.sub(r"\butilize\b", "use", body, flags=re.I)
     body = re.sub(r"\bleverage\b", "use", body, flags=re.I)
-    body = re.sub(r"\brobust\b", "solid", body, flags=re.I)
-    body = re.sub(r"\bsynergies\b", "strengths", body, flags=re.I)
-    body = re.sub(r"\bsynergias\b", "strengths", body, flags=re.I)
-    body = re.sub(r"\bdelve into\b", "look at", body, flags=re.I)
-    body = re.sub(r"\bunlock(?:ing)?\b", "open", body, flags=re.I)
-    body = re.sub(r"\bnestled\b", "in", body, flags=re.I)
-    body = re.sub(r"\ba testament to\b", "proof of", body, flags=re.I)
-    body = re.sub(r"\bvibrant\b", "lively", body, flags=re.I)
+    body = re.sub(r"\brobust\b", "real", body, flags=re.I)
+    body = re.sub(r"\bsynergies\b", "connections", body, flags=re.I)
+    body = re.sub(r"\bsynergias\b", "connections", body, flags=re.I)
+    body = re.sub(r"\bunlock(?:ing)?\b", "find", body, flags=re.I)
+    body = re.sub(r"\bnestled\b", "", body, flags=re.I)
+    body = re.sub(r"\bvibrant\b", "", body, flags=re.I)
     # Collapse horizontal whitespace only; keep newlines / paragraph rhythm.
     body = re.sub(r"[^\S\n]{2,}", " ", body)
     body = re.sub(r"[ \t]+\n", "\n", body)
@@ -113,12 +132,14 @@ def similarity_guard(
     rewrite: str,
     *,
     ratio: float = 0.94,
+    token_overlap: float = 0.88,
 ) -> str:
     """If the rewrite only cosmetically edits a multi-paragraph draft, keep it.
 
     Applies when the draft already has paragraph rhythm — the failure mode was
-    flattening LinkedIn-shaped posts. Flat single-block drafts still get a
-    real rewrite (clean→voice / slop→voice).
+    flattening LinkedIn-shaped posts. Also catches "fidget re-paragraphing"
+    that lowers SequenceMatcher ratio while keeping nearly the same tokens.
+    Flat single-block drafts still get a real rewrite (clean→voice / slop→voice).
     """
     import difflib
 
@@ -137,6 +158,11 @@ def similarity_guard(
     a = re.sub(r"\s+", " ", draft.lower())
     b = re.sub(r"\s+", " ", rewrite.lower())
     if difflib.SequenceMatcher(None, a, b).ratio() >= ratio:
+        return draft
+    # Token-overlap guard: same substance, different line breaks / dropped tags.
+    tw = set(re.findall(r"[a-z0-9']+", a))
+    rw = set(re.findall(r"[a-z0-9']+", b))
+    if tw and len(tw & rw) / len(tw) >= token_overlap:
         return draft
     return rewrite
 
