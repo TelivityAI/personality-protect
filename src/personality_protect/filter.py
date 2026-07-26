@@ -14,7 +14,7 @@ from personality_protect.config import (
     load_config,
 )
 from personality_protect.download import resolve_gguf_path
-from personality_protect.sft import SYSTEM_PROMPT
+from personality_protect.sft import SYSTEM_PROMPT, USER_TEMPLATE
 
 FilterBackend = Literal["auto", "llama", "gguf", "mlx", "transformers", "mock"]
 
@@ -22,25 +22,157 @@ FilterBackend = Literal["auto", "llama", "gguf", "mlx", "transformers", "mock"]
 FILTER_TEMPERATURE = 0.4
 FILTER_TOP_P = 0.9
 FILTER_REPEAT_PENALTY = 1.1
-FILTER_STOP = ("###", "</s>", "<|end|>", "<|im_end|>")
+FILTER_STOP = ("###", "</s>", "<|end|>", "<|im_end|>", "<|im_start|>")
+_TEMPLATE_SECTION_RE = re.compile(
+    r"\n\s*###\s*(?:Draft|Rewritten|My voice(?:\s*\(reference\))?)\b",
+    re.IGNORECASE,
+)
 
 
 def filter_system_prompt() -> str:
     return SYSTEM_PROMPT
 
 
-def build_filter_prompt(draft: str, *, few_shot: str | None = None) -> str:
-    """Stable user+system style prompt shared by real backends and compare baseline."""
-    parts = [filter_system_prompt(), ""]
-    if few_shot:
-        parts.append(few_shot.strip())
-        parts.append("")
-    parts.append(
-        "Rewrite the draft in the user's authentic writing voice. "
-        "Keep meaning; strip AI tells; do not invent facts.\n\n"
-        f"### Draft\n{draft.strip()}\n\n### Rewritten\n"
+def build_filter_user_content(draft: str, *, reference: str | None = None) -> str:
+    """User turn matching SFT shape so LoRA completes a rewrite, not a template loop."""
+    draft = draft.strip()
+    if reference and reference.strip():
+        return USER_TEMPLATE.format(draft=draft, reference=reference.strip())
+    return (
+        "Rewrite the draft in my voice. Match my cadence and diction. "
+        "Keep the same meaning. Remove AI-sounding filler.\n\n"
+        f"### Draft\n{draft}\n\n"
+        "### Rewritten"
     )
-    return "\n".join(parts)
+
+
+def build_filter_messages(
+    draft: str, *, reference: str | None = None, few_shot: str | None = None
+) -> list[dict[str, str]]:
+    """Chat messages aligned with SFT training (system + user)."""
+    user = build_filter_user_content(draft, reference=reference)
+    if few_shot and few_shot.strip() and not (reference and reference.strip()):
+        # Receipts / baseline: inject few-shot above the draft block.
+        user = few_shot.strip() + "\n\n" + user
+    return [
+        {"role": "system", "content": filter_system_prompt()},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_filter_prompt(
+    draft: str, *, few_shot: str | None = None, reference: str | None = None
+) -> str:
+    """Flat prompt for backends without chat templates (and compare receipts)."""
+    messages = build_filter_messages(draft, reference=reference, few_shot=few_shot)
+    parts = [messages[0]["content"], "", messages[1]["content"]]
+    # Ensure trailing newline after ### Rewritten so generation continues cleanly.
+    text = "\n".join(parts)
+    if not text.endswith("\n"):
+        text += "\n"
+    return text
+
+
+def strip_ai_tells(text: str) -> str:
+    """Remove common AI-tell phrases the system prompt asks the model to strip."""
+    body = text
+    body = re.sub(
+        r"\bIn today's (?:fast-paced\s+)?(?:digital\s+)?(?:fast-paced\s+)?world,?\s*",
+        "",
+        body,
+        flags=re.I,
+    )
+    body = re.sub(r"\bIt is important to note that\s*", "", body, flags=re.I)
+    body = re.sub(r"\bMoreover,\s*", "Also, ", body, flags=re.I)
+    body = re.sub(r"\bFurthermore,\s*", "And ", body, flags=re.I)
+    body = re.sub(r"\butilize\b", "use", body, flags=re.I)
+    body = re.sub(r"\bleverage\b", "use", body, flags=re.I)
+    body = re.sub(r"\brobust\b", "solid", body, flags=re.I)
+    body = re.sub(r"\bsynergies\b", "strengths", body, flags=re.I)
+    body = re.sub(r"\bsynergias\b", "strengths", body, flags=re.I)
+    body = re.sub(r"\bdelve into\b", "look at", body, flags=re.I)
+    body = re.sub(r"\bunlock(?:ing)?\b", "open", body, flags=re.I)
+    body = re.sub(r"\bnestled\b", "in", body, flags=re.I)
+    body = re.sub(r"\ba testament to\b", "proof of", body, flags=re.I)
+    body = re.sub(r"\bvibrant\b", "lively", body, flags=re.I)
+    body = re.sub(r"\s{2,}", " ", body).strip()
+    if body:
+        body = body[0].upper() + body[1:]
+    return body
+
+
+def finalize_rewrite(text: str) -> str:
+    """Template-echo cut + AI-tell cleanup for model backends."""
+    return strip_ai_tells(extract_rewrite(text))
+
+
+def extract_rewrite(text: str) -> str:
+    """Keep only the rewrite; drop thinking + SFT template echo loops."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    # Qwen / mlx-lm thinking blocks (tagged or plain "Thinking Process:")
+    for end_tag in ("</think>", "</longcat_think>", "<channel|>"):
+        if end_tag in text:
+            text = text.split(end_tag, 1)[-1].strip()
+    if re.match(r"(?is)^\s*(?:thinking\s+process|analysis)\s*:", text):
+        # Drop meta-reasoning preamble; keep text after a blank line if present.
+        parts = re.split(r"\n\s*\n", text, maxsplit=1)
+        if len(parts) == 2 and not re.match(
+            r"(?is)^\s*(?:thinking\s+process|analysis|\d+\.)", parts[1]
+        ):
+            text = parts[1].strip()
+        else:
+            # Entire output was thinking — treat as empty so callers see failure clearly.
+            # Prefer content after the last numbered step block if a rewrite follows.
+            m = re.search(
+                r"(?is)(?:^|\n)(?!thinking\s+process|analysis|\d+\.\s)([A-Z].{20,})$",
+                text,
+            )
+            text = m.group(1).strip() if m else ""
+
+    # If the model echoed a leading header, drop it.
+    if text.lower().startswith("### rewritten"):
+        text = text.split("\n", 1)[1].strip() if "\n" in text else ""
+    # Cut at the first subsequent template section.
+    m = _TEMPLATE_SECTION_RE.search("\n" + text)
+    if m:
+        text = text[: m.start()].rstrip()
+    for marker in ("\n### Draft", "\n### Rewritten", "\n### My voice"):
+        idx = text.find(marker)
+        if idx >= 0:
+            text = text[:idx].rstrip()
+    return text.strip()
+
+
+def _load_voice_reference(paths: ProfilePaths, *, max_chars: int = 400) -> str | None:
+    """Short corpus snippet so inference matches the SFT 'My voice (reference)' block."""
+    adapter = paths.adapters_dir / "latest" / "mock_adapter.json"
+    if adapter.is_file():
+        try:
+            data = json.loads(adapter.read_text(encoding="utf-8"))
+            for a in data.get("anchors") or []:
+                t = str(a).strip()
+                if len(t) > 40:
+                    return t[:max_chars]
+        except (OSError, json.JSONDecodeError):
+            pass
+    if paths.sft_jsonl.is_file():
+        try:
+            with paths.sft_jsonl.open(encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    for m in row.get("messages") or []:
+                        if m.get("role") == "assistant" and m.get("content"):
+                            t = m["content"].strip()
+                            if len(t) > 40:
+                                return t[:max_chars]
+        except (OSError, json.JSONDecodeError):
+            pass
+    return None
 
 
 def _latest_adapter(paths: ProfilePaths) -> Path:
@@ -146,7 +278,7 @@ def filter_draft(
         return _filter_llama(draft, gguf_path, adapter_dir, max_tokens), "llama"
     if chosen == "mlx":
         model_id = config.base_model or DEFAULT_MLX_MODEL
-        return _filter_mlx(draft, adapter_dir, model_id, max_tokens), "mlx"
+        return _filter_mlx(draft, adapter_dir, model_id, max_tokens, paths=paths), "mlx"
     if chosen == "transformers":
         return _filter_transformers(draft, adapter_dir, config.base_model, max_tokens), "transformers"
     raise RuntimeError(f"Unknown filter backend: {chosen}")
@@ -175,25 +307,7 @@ def _filter_mock(draft: str, adapter_dir: Path) -> str:
 
     body = draft
     # Soften generic AI tells
-    body = re.sub(
-        r"\bIn today's (?:fast-paced\s+)?(?:digital\s+)?(?:fast-paced\s+)?world,?\s*",
-        "",
-        body,
-        flags=re.I,
-    )
-    body = re.sub(r"\bIt is important to note that\s*", "", body, flags=re.I)
-    body = re.sub(r"\bMoreover,\s*", "Also, ", body, flags=re.I)
-    body = re.sub(r"\bFurthermore,\s*", "And ", body, flags=re.I)
-    body = re.sub(r"\butilize\b", "use", body, flags=re.I)
-    body = re.sub(r"\bleverage\b", "use", body, flags=re.I)
-    body = re.sub(r"\brobust\b", "solid", body, flags=re.I)
-    body = re.sub(r"\bsynergies\b", "strengths", body, flags=re.I)
-    body = re.sub(r"\bdelve into\b", "look at", body, flags=re.I)
-    body = re.sub(r"\s{2,}", " ", body).strip()
-    # Fix leftover capitalization after stripping openers
-    if body:
-        body = body[0].upper() + body[1:]
-
+    body = strip_ai_tells(body)
     if openers:
         # Blend: keep meaning of draft, tip cadence toward user's first lines
         cue = openers[0]
@@ -224,6 +338,7 @@ def _filter_llama(
             "or use --backend mlx|mock"
         ) from exc
 
+    # Prefer chat-aligned user content; paths not available here — no reference.
     prompt = build_filter_prompt(draft)
     # Optional GGUF LoRA if present next to adapter
     lora_path = None
@@ -251,10 +366,23 @@ def _filter_llama(
         stop=list(FILTER_STOP),
     )
     text = out["choices"][0]["text"] if out.get("choices") else str(out)
-    return str(text).strip()
+    return finalize_rewrite(str(text))
 
 
-def _filter_mlx(draft: str, adapter_dir: Path, base_model: str, max_tokens: int) -> str:
+def _filter_mlx(
+    draft: str,
+    adapter_dir: Path,
+    base_model: str,
+    max_tokens: int,
+    *,
+    paths: ProfilePaths | None = None,
+) -> str:
+    # CRITICAL: mlx_lm.generate installs wired_limit(~40GB) which jetsam-kills
+    # Python on a 48GB Mac. Cap BEFORE importing/loading.
+    from personality_protect.mlx_runtime import ensure_mlx_wired_cap, release_mlx_memory
+
+    ensure_mlx_wired_cap()
+
     try:
         from mlx_lm import generate, load
     except ImportError as exc:
@@ -264,19 +392,49 @@ def _filter_mlx(draft: str, adapter_dir: Path, base_model: str, max_tokens: int)
         ) from exc
 
     adapter = str(adapter_dir) if _has_mlx_adapter(adapter_dir) else None
-    # Prefer quantized MLX id from config (default ~6 GB 4-bit)
-    model, tokenizer = load(base_model, adapter_path=adapter)
-    prompt = build_filter_prompt(draft)
-    # mlx-lm generate: pass sampler kwargs when supported
-    gen_kwargs: dict = {"max_tokens": max_tokens, "verbose": False}
-    try:
-        from mlx_lm.sample_utils import make_sampler
+    # Do NOT paste a long SFT assistant snippet as "### My voice (reference)":
+    # weak adapters regurgitate that corpus block instead of rewriting the draft.
+    # LoRA weights carry voice; a short cadence cue (if any) stays out of the
+    # training-shaped reference slot.
+    messages = build_filter_messages(draft, reference=None)
 
-        gen_kwargs["sampler"] = make_sampler(temp=FILTER_TEMPERATURE, top_p=FILTER_TOP_P)
-    except Exception:
-        pass
-    out = generate(model, tokenizer, prompt=prompt, **gen_kwargs)
-    return str(out).strip()
+    try:
+        model, tokenizer = load(base_model, adapter_path=adapter)
+        # Match training: chat template + assistant generation prompt.
+        if getattr(tokenizer, "has_chat_template", False) or getattr(
+            tokenizer, "chat_template", None
+        ):
+            # Qwen3 defaults enable_thinking=True; that burns tokens on meta
+            # "Thinking Process" and never returns a clean rewrite.
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        else:
+            prompt = build_filter_prompt(draft, reference=None)
+
+        # Stop on template markers so we never loop Draft/Rewritten sections.
+        for stop in FILTER_STOP:
+            try:
+                tokenizer.add_eos_token(stop)
+            except Exception:
+                pass
+
+        gen_kwargs: dict = {"max_tokens": max_tokens, "verbose": False}
+        try:
+            from mlx_lm.sample_utils import make_sampler
+
+            gen_kwargs["sampler"] = make_sampler(
+                temp=FILTER_TEMPERATURE, top_p=FILTER_TOP_P
+            )
+        except Exception:
+            pass
+        out = generate(model, tokenizer, prompt=prompt, **gen_kwargs)
+        return finalize_rewrite(str(out))
+    finally:
+        release_mlx_memory()
 
 
 def _filter_transformers(
@@ -328,7 +486,7 @@ def _filter_transformers(
     text = tokenizer.decode(output[0], skip_special_tokens=True)
     if "### Rewritten" in text:
         text = text.split("### Rewritten", 1)[1].strip()
-    return text.strip()
+    return finalize_rewrite(text)
 
 
 def read_draft_input(text: str | None, file: Path | None) -> str:

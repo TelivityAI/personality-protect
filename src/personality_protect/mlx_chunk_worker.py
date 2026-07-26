@@ -11,26 +11,7 @@ import os
 import sys
 import types
 
-
-def _install_wired_cap(limit_bytes: int) -> None:
-    import mlx.core as mx
-
-    limit = max(1_000_000_000, int(limit_bytes))
-    original = mx.set_wired_limit
-
-    def _capped(requested=None, *args, **kwargs):  # noqa: ANN001
-        try:
-            req = int(requested) if requested is not None else limit
-        except (TypeError, ValueError):
-            req = limit
-        return original(min(req, limit))
-
-    mx.set_wired_limit = _capped  # type: ignore[method-assign]
-    # Apply immediately so load() also stays under the cap.
-    try:
-        mx.set_wired_limit(limit)
-    except Exception:
-        pass
+from personality_protect.mlx_runtime import install_wired_cap
 
 
 def _patch_empty_val_dataset() -> None:
@@ -68,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     os.environ["PP_MLX_WIRED_BYTES"] = str(args.wired_bytes)
 
-    _install_wired_cap(args.wired_bytes)
+    install_wired_cap(args.wired_bytes)
     _patch_empty_val_dataset()
 
     from mlx_lm.lora import CONFIG_DEFAULTS, run

@@ -147,7 +147,7 @@ personality-protect train --backend cuda --max-steps 200
 
 Adapters land under `~/.personality-protect/profiles/<name>/adapters/` only.
 
-**Honest hardware note:** MLX train is **memory-capped and chunked** (subprocess pieces + CLI progress bar) so a 48 GB Mac stays usable — stock `mlx-lm` can wire ~40 GB and jetsam-kill Python ("quit unexpectedly"). Peak train RAM is still higher than the ~5–7 GB on-disk footprint. The **download** story stays quantized. CUDA’s first HF fetch can cache extra shards; day-to-day `filter` should use the GGUF under `models/`.
+**Honest hardware note:** MLX train **and** filter/compare apply a **Metal wired-memory cap** (default ~40% of RAM, max 20 GB). Stock `mlx-lm` `generate`/`train` call `set_wired_limit(~40 GB)` on a 48 GB Mac and jetsam-kill Python ("quit unexpectedly"). Train additionally runs in subprocess chunks. Peak RAM is still higher than the ~5–7 GB on-disk footprint. CUDA’s first HF fetch can cache extra shards; day-to-day `filter` should use the GGUF under `models/` when available.
 
 ### 6. Filter
 
