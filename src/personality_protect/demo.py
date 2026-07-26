@@ -5,7 +5,7 @@ from __future__ import annotations
 from importlib import resources
 from pathlib import Path
 
-from personality_protect.config import ProfilePaths, init_profile
+from personality_protect.config import init_profile
 from personality_protect.filter import filter_draft
 from personality_protect.ingest import run_ingest
 from personality_protect.select import run_select
@@ -108,7 +108,14 @@ def run_demo(
         through_year=2024,
         include_undated=True,
     )
-    train = run_train(paths, backend="mock", mock=True, max_steps=1)
+    train = run_train(
+        paths,
+        backend="mock",
+        mock=True,
+        smoke=True,
+        force=True,
+        max_steps=1,
+    )
 
     sample_draft = draft or (
         "In today's fast-paced digital world, it is important to note that we must "

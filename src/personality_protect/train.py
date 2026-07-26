@@ -11,17 +11,25 @@ from pathlib import Path
 from typing import Any, Literal
 
 from personality_protect.config import (
+    CORPUS_BLOCK_BELOW,
+    CORPUS_WARN_BELOW,
     DEFAULT_BASE_MODEL,
     DEFAULT_GGUF_SIZE_HINT,
     DEFAULT_MLX_MODEL,
     DEFAULT_MLX_SIZE_HINT,
     FULL_PRECISION_BASE_MODEL,
+    SMOKE_MAX_STEPS,
     ProfilePaths,
     load_config,
 )
 from personality_protect.sft import build_sft_from_profile
 
 BackendName = Literal["auto", "mlx", "cuda", "cpu", "mock"]
+
+# Full-train defaults sized for hundreds of SFT examples (batch size 1).
+DEFAULT_EPOCHS = 3
+MIN_AUTO_STEPS = 50
+MAX_AUTO_STEPS = 2000
 
 
 @dataclass
@@ -33,18 +41,86 @@ class TrainResult:
     examples: int
     notes: str = ""
     meta: dict[str, Any] | None = None
+    steps: int = 0
+    smoke: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
-def detect_backend(preferred: BackendName = "auto") -> str:
+class MockFallbackError(RuntimeError):
+    """Raised when a real backend would silently degrade to mock."""
+
+
+def auto_max_steps(n_examples: int, *, smoke: bool = False, max_steps: int | None = None) -> int:
+    """Resolve train steps: explicit override, smoke low-step, or auto from corpus size."""
+    if max_steps is not None and max_steps > 0:
+        return max_steps
+    if smoke:
+        return SMOKE_MAX_STEPS
+    # ~epochs passes over the JSONL at batch size 1, clamped for tiny/huge corpora
+    n = max(1, int(n_examples))
+    return max(MIN_AUTO_STEPS, min(MAX_AUTO_STEPS, n * DEFAULT_EPOCHS))
+
+
+def check_corpus_size(n_examples: int, *, force: bool = False, smoke: bool = False) -> str | None:
+    """Warn below CORPUS_WARN_BELOW; block below CORPUS_BLOCK_BELOW unless force/smoke.
+
+    Returns a warning string (or None). Raises RuntimeError when blocked.
+    """
+    if smoke or force:
+        if n_examples < CORPUS_WARN_BELOW:
+            return (
+                f"Corpus has {n_examples} examples "
+                f"(warn threshold {CORPUS_WARN_BELOW}); proceeding due to "
+                f"{'smoke' if smoke else 'force'}."
+            )
+        return None
+    if n_examples < CORPUS_BLOCK_BELOW:
+        raise RuntimeError(
+            f"Corpus too small for full train: {n_examples} selected examples "
+            f"(need at least {CORPUS_BLOCK_BELOW}). "
+            "Ingest more writing, or pass --force / --smoke for a deliberate override."
+        )
+    if n_examples < CORPUS_WARN_BELOW:
+        return (
+            f"Warning: only {n_examples} selected examples "
+            f"(recommend >={CORPUS_WARN_BELOW} for a credible voice adapter)."
+        )
+    return None
+
+
+def detect_backend(
+    preferred: BackendName = "auto",
+    *,
+    allow_mock: bool = False,
+) -> str:
+    """Pick a train backend. Never silently falls back to mock unless allow_mock."""
     if preferred == "mock":
         return "mock"
+
     if preferred == "mlx":
-        return "mlx" if _has_mlx() else "mock"
+        if _has_mlx():
+            return "mlx"
+        if allow_mock:
+            return "mock"
+        raise MockFallbackError(
+            "MLX backend requested but mlx/mlx-lm is not available. "
+            'Install: pip install -e ".[mlx]" — or pass --allow-mock / --backend mock '
+            "for CI/smoke only."
+        )
+
     if preferred == "cuda":
-        return "cuda" if _has_cuda() else "mock"
+        if _has_cuda():
+            return "cuda"
+        if allow_mock:
+            return "mock"
+        raise MockFallbackError(
+            "CUDA backend requested but torch CUDA is not available. "
+            'Install: pip install -e ".[cuda]" on an NVIDIA machine — '
+            "or pass --allow-mock / --backend mock for CI/smoke only."
+        )
+
     if preferred == "cpu":
         return "cpu"
 
@@ -55,20 +131,18 @@ def detect_backend(preferred: BackendName = "auto") -> str:
         return "mlx"
     if _has_cuda():
         return "cuda"
-    # Honest: full 9B SFT on CPU is impractical
-    if preferred == "auto":
-        return "cpu"
-    return preferred
+    # Honest: full 9B SFT on CPU is impractical — do not pretend mock is a real train
+    return "cpu"
 
 
 def _has_mlx() -> bool:
-    try:
-        import mlx.core  # noqa: F401
-        import mlx_lm  # noqa: F401
+    """True when mlx + mlx_lm are importable (package present)."""
+    import importlib.util
 
-        return True
-    except ImportError:
-        return False
+    return (
+        importlib.util.find_spec("mlx") is not None
+        and importlib.util.find_spec("mlx_lm") is not None
+    )
 
 
 def _has_cuda() -> bool:
@@ -116,8 +190,8 @@ def backend_docs(backend: str) -> str:
     if backend == "cpu":
         return (
             "CPU training of Qwen3.5-9B is not practical for v1 "
-            "(multi-day / high RAM). Use --backend mock for pipeline smoke "
-            "tests, or run on Apple Silicon (MLX 4-bit) / CUDA QLoRA. "
+            "(multi-day / high RAM). Use --backend mock or --smoke --allow-mock for "
+            "pipeline smoke tests, or run on Apple Silicon (MLX 4-bit) / CUDA QLoRA. "
             "You can still build SFT JSONL with: personality-protect train --sft-only\n"
             f"For local filter without training GPU: download GGUF ({DEFAULT_GGUF_SIZE_HINT})."
         )
@@ -135,8 +209,11 @@ def run_train(
     paths: ProfilePaths,
     *,
     backend: BackendName = "auto",
-    max_steps: int = 100,
+    max_steps: int | None = None,
     mock: bool = False,
+    smoke: bool = False,
+    allow_mock: bool = False,
+    force: bool = False,
     sft_only: bool = False,
     force_rebuild_sft: bool = True,
 ) -> TrainResult:
@@ -147,27 +224,57 @@ def run_train(
         sft_path = paths.sft_jsonl
         n = sum(1 for _ in sft_path.open(encoding="utf-8") if _.strip())
 
+    corpus_note = check_corpus_size(n, force=force or sft_only, smoke=smoke or mock)
+    steps = auto_max_steps(n, smoke=smoke or mock, max_steps=max_steps)
+
     if sft_only:
-        return TrainResult(
+        result = TrainResult(
             backend="sft_only",
             status="sft_ready",
             adapter_dir=str(paths.adapters_dir),
             base_model=config.base_model,
             examples=n,
-            notes=f"SFT JSONL written to {sft_path} ({n} examples). No weights trained.",
+            notes=f"SFT JSONL written to {sft_path} ({n} examples). No weights trained."
+            + (f"\n{corpus_note}" if corpus_note else ""),
+            steps=0,
+            smoke=smoke,
+        )
+        _persist_train_meta(paths, result, sft_path, steps=0, corpus_note=corpus_note)
+        return result
+
+    # Explicit mock / --mock → mock path. Smoke alone is low-step, not mock.
+    want_mock = mock or backend == "mock"
+    if want_mock:
+        chosen = "mock"
+    else:
+        try:
+            chosen = detect_backend(
+                backend,
+                allow_mock=allow_mock,
+            )
+        except MockFallbackError:
+            raise
+
+    # If auto landed on something that isn't mock, but mlx/cuda was unavailable
+    # and detect returned cpu — that's honest, not a silent mock fallthrough.
+    if chosen == "mock" and not (mock or backend == "mock" or allow_mock):
+        raise MockFallbackError(
+            "Refusing silent mock fallback. Pass --backend mock, --allow-mock, "
+            "or use --smoke only for low-step real backends."
         )
 
-    chosen = "mock" if mock else detect_backend(backend)
     adapter_dir = paths.adapters_dir / "latest"
     adapter_dir.mkdir(parents=True, exist_ok=True)
     model_id = _train_model_id(config.base_model, chosen)
 
     if chosen == "mock":
-        result = _train_mock(paths, sft_path, adapter_dir, model_id, n)
+        result = _train_mock(paths, sft_path, adapter_dir, model_id, n, steps=steps, smoke=smoke)
     elif chosen == "mlx":
-        result = _train_mlx(paths, sft_path, adapter_dir, model_id, n, max_steps)
+        result = _train_mlx(
+            paths, sft_path, adapter_dir, model_id, n, steps, allow_mock=allow_mock
+        )
     elif chosen == "cuda":
-        result = _train_cuda(paths, sft_path, adapter_dir, model_id, n, max_steps)
+        result = _train_cuda(paths, sft_path, adapter_dir, model_id, n, steps)
     elif chosen == "cpu":
         result = TrainResult(
             backend="cpu",
@@ -177,20 +284,51 @@ def run_train(
             examples=n,
             notes=backend_docs("cpu")
             + f"\nSFT ready at {sft_path}. Re-run with --backend mock|mlx|cuda.",
+            steps=0,
+            smoke=smoke,
         )
     else:
         raise RuntimeError(f"Unknown backend: {chosen}")
 
+    if corpus_note:
+        result.notes = (result.notes + "\n" + corpus_note).strip()
+    result.steps = result.steps or steps
+    result.smoke = smoke or result.smoke
+
+    _persist_train_meta(paths, result, sft_path, steps=result.steps, corpus_note=corpus_note)
+    return result
+
+
+def _persist_train_meta(
+    paths: ProfilePaths,
+    result: TrainResult,
+    sft_path: Path,
+    *,
+    steps: int,
+    corpus_note: str | None,
+) -> None:
     meta = {
         "trained_at": datetime.now(timezone.utc).isoformat(),
-        "result": result.to_dict(),
+        "backend": result.backend,
+        "status": result.status,
+        "base_model": result.base_model,
+        "examples": result.examples,
+        "steps": steps,
+        "smoke": result.smoke,
+        "adapter_dir": result.adapter_dir,
         "sft_path": str(sft_path),
+        "corpus_note": corpus_note,
+        "result": result.to_dict(),
+        "loss": (result.meta or {}).get("loss"),
     }
+    paths.adapters_dir.mkdir(parents=True, exist_ok=True)
     paths.adapter_meta.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-    (adapter_dir / "train_result.json").write_text(
-        json.dumps(result.to_dict(), indent=2) + "\n", encoding="utf-8"
-    )
-    return result
+    adapter_dir = Path(result.adapter_dir)
+    if adapter_dir.is_dir() or result.backend == "sft_only":
+        target = adapter_dir if adapter_dir.is_dir() else paths.adapters_dir
+        (target / "train_result.json").write_text(
+            json.dumps(result.to_dict(), indent=2) + "\n", encoding="utf-8"
+        )
 
 
 def _train_mock(
@@ -199,6 +337,9 @@ def _train_mock(
     adapter_dir: Path,
     base_model: str,
     n: int,
+    *,
+    steps: int = SMOKE_MAX_STEPS,
+    smoke: bool = False,
 ) -> TrainResult:
     """Write a deterministic adapter stub + voice fingerprint for local filter smoke."""
     anchors: list[str] = []
@@ -219,6 +360,8 @@ def _train_mock(
         "type": "mock_voice_adapter",
         "base_model": base_model,
         "examples": n,
+        "steps": steps,
+        "smoke": smoke,
         "anchors": anchors,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "note": "Synthetic/local stub — not real LoRA weights.",
@@ -239,7 +382,9 @@ def _train_mock(
         base_model=base_model,
         examples=n,
         notes="Mock adapter written. Filter will use style anchors (no model download).",
-        meta={"anchors": len(anchors)},
+        meta={"anchors": len(anchors), "loss": None},
+        steps=steps,
+        smoke=smoke,
     )
 
 
@@ -250,11 +395,22 @@ def _train_mlx(
     base_model: str,
     n: int,
     max_steps: int,
+    *,
+    allow_mock: bool = False,
 ) -> TrainResult:
     """LoRA fine-tune via mlx-lm on a 4-bit MLX base (~6 GB), not full BF16."""
     try:
         from mlx_lm import lora as mlx_lora  # type: ignore
     except ImportError:
+        if allow_mock:
+            mock_result = _train_mock(
+                paths, sft_path, adapter_dir, base_model, n, steps=max_steps, smoke=True
+            )
+            mock_result.notes = (
+                "mlx-lm not installed; wrote mock adapter because --allow-mock/--smoke. "
+                'Install for real train: pip install -e ".[mlx]"'
+            )
+            return mock_result
         return TrainResult(
             backend="mlx",
             status="missing_deps",
@@ -263,8 +419,9 @@ def _train_mlx(
             examples=n,
             notes=(
                 "mlx-lm not installed. Run: pip install -e \".[mlx]\"\n"
-                "Or use --backend mock for a pipeline smoke train."
+                "Or use --backend mock / --allow-mock for a pipeline smoke train."
             ),
+            steps=0,
         )
 
     data_dir = paths.sft_dir / "mlx_data"
@@ -296,12 +453,27 @@ def _train_mlx(
             if hasattr(mlx_lora, "main"):
                 mlx_lora.main()
             else:
-                mock_result = _train_mock(paths, sft_path, adapter_dir, base_model, n)
-                mock_result.notes = (
-                    "mlx_lm.lora API mismatch; wrote mock adapter. "
-                    "Check mlx-lm docs for your version and re-run train."
+                if allow_mock:
+                    mock_result = _train_mock(
+                        paths, sft_path, adapter_dir, base_model, n, steps=max_steps, smoke=True
+                    )
+                    mock_result.notes = (
+                        "mlx_lm.lora API mismatch; wrote mock adapter (--allow-mock). "
+                        "Check mlx-lm docs for your version and re-run train."
+                    )
+                    return mock_result
+                return TrainResult(
+                    backend="mlx",
+                    status="error",
+                    adapter_dir=str(adapter_dir),
+                    base_model=base_model,
+                    examples=n,
+                    notes=(
+                        "mlx_lm.lora API mismatch (no main()). "
+                        "Refusing silent mock fallback — pass --allow-mock to override."
+                    ),
+                    steps=0,
                 )
-                return mock_result
         finally:
             sys.argv = old
     except Exception as exc:  # noqa: BLE001 — surface train errors honestly
@@ -318,6 +490,7 @@ def _train_mlx(
                 "Training may briefly need more unified memory than the on-disk size. "
                 "For a no-download smoke test: --backend mock"
             ),
+            steps=0,
         )
 
     return TrainResult(
@@ -326,7 +499,9 @@ def _train_mlx(
         adapter_dir=str(adapter_dir),
         base_model=base_model,
         examples=n,
-        notes=f"MLX LoRA adapter saved under {adapter_dir} (base={base_model})",
+        notes=f"MLX LoRA adapter saved under {adapter_dir} (base={base_model}, steps={max_steps})",
+        meta={"loss": None},
+        steps=max_steps,
     )
 
 
@@ -346,9 +521,9 @@ def _train_cuda(
             AutoModelForCausalLM,
             AutoTokenizer,
             BitsAndBytesConfig,
-            TrainingArguments,
-            Trainer,
             DataCollatorForLanguageModeling,
+            Trainer,
+            TrainingArguments,
         )
     except ImportError as exc:
         return TrainResult(
@@ -358,6 +533,7 @@ def _train_cuda(
             base_model=base_model,
             examples=n,
             notes=f"CUDA stack missing ({exc}). Install: pip install -e \".[cuda]\"",
+            steps=0,
         )
 
     if not torch.cuda.is_available():
@@ -368,8 +544,10 @@ def _train_cuda(
             base_model=base_model,
             examples=n,
             notes="torch installed but CUDA not available.",
+            steps=0,
         )
 
+    train_loss: float | None = None
     try:
         bnb = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -433,7 +611,11 @@ def _train_cuda(
             train_dataset=tokenized,
             data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
         )
-        trainer.train()
+        train_out = trainer.train()
+        try:
+            train_loss = float(train_out.training_loss)  # type: ignore[attr-defined]
+        except Exception:
+            train_loss = None
         model.save_pretrained(str(adapter_dir))
         tokenizer.save_pretrained(str(adapter_dir))
     except Exception as exc:  # noqa: BLE001
@@ -448,6 +630,7 @@ def _train_cuda(
                 "First run may need extra disk while HF caches shards; "
                 f"day-to-day runtime download target remains GGUF ({DEFAULT_GGUF_SIZE_HINT})."
             ),
+            steps=0,
         )
 
     return TrainResult(
@@ -456,5 +639,7 @@ def _train_cuda(
         adapter_dir=str(adapter_dir),
         base_model=base_model,
         examples=n,
-        notes=f"QLoRA adapter saved under {adapter_dir}",
+        notes=f"QLoRA adapter saved under {adapter_dir} (steps={max_steps})",
+        meta={"loss": train_loss},
+        steps=max_steps,
     )

@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any
 
-from personality_protect.config import DEFAULT_MIN_WORDS, DEFAULT_THROUGH_YEAR, ProfilePaths, load_config
+from personality_protect.config import (
+    DEFAULT_MIN_WORDS,
+    DEFAULT_THROUGH_YEAR,
+    ProfilePaths,
+    load_config,
+)
 from personality_protect.models import Piece, load_index, summarize_by_source_year
 
 

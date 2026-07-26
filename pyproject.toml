@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
 # Prefetch quantized GGUF / MLX artifacts from Hugging Face
 models = ["huggingface_hub>=0.24"]
 # llama.cpp GGUF runtime for filter (~5–7 GB Q4/Q5 on disk)
@@ -61,8 +61,23 @@ Repository = "https://github.com/TelivityAI/personality-protect"
 where = ["src"]
 
 [tool.setuptools.package-data]
-personality_protect = ["py.typed", "data/demo/*.md", "data/demo/*.txt", "data/demo/*.jsonl"]
+personality_protect = [
+  "py.typed",
+  "data/demo/*.md",
+  "data/demo/*.txt",
+  "data/demo/*.jsonl",
+  "data/evals/*.md",
+  "data/evals/*.txt",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]

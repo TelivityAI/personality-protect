@@ -9,8 +9,7 @@ from typer.testing import CliRunner
 
 from personality_protect.cli import app
 from personality_protect.demo import run_demo
-from personality_protect.filter import filter_draft
-from personality_protect.train import detect_backend, run_train
+from personality_protect.train import detect_backend
 
 runner = CliRunner()
 
@@ -65,6 +64,7 @@ def test_cli_init_ingest_select_train_filter(tmp_path: Path):
             "--min-words", "20",
             "--through-year", "2024",
             "--include-undated",
+            "--force",
             "--json",
         ],
     )
@@ -78,6 +78,8 @@ def test_cli_init_ingest_select_train_filter(tmp_path: Path):
             "--logo", "off", "train",
             "--home", home, "--profile", "t",
             "--backend", "mock",
+            "--smoke",
+            "--force",
             "--json",
         ],
     )
@@ -105,11 +107,12 @@ def test_detect_backend_mock():
 
 
 def test_api_health(tmp_path: Path):
-    from personality_protect.api import make_handler
-    from personality_protect.config import init_profile
-    from http.server import ThreadingHTTPServer
     import threading
     import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    from personality_protect.api import make_handler
+    from personality_protect.config import init_profile
 
     init_profile("default", home=tmp_path)
     # run demo so filter has adapter

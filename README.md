@@ -130,13 +130,17 @@ personality-protect select --include-undated
 
 ### 5. Train
 
-Builds local SFT JSONL, then fine-tunes a **small adapter** on top of the quantized base:
+Builds local SFT JSONL, then fine-tunes a **small adapter** on top of the quantized base.
+
+Full-train defaults scale steps from your SFT example count (≈3 epochs, clamped). Use `--smoke` for CI/low-step. Mock is never a silent fallback — pass `--backend mock` or `--allow-mock` explicitly.
+
+Corpus gates: **warn** below 50 selected pieces; **block** below 20 unless `--force`.
 
 ```bash
 personality-protect train --sft-only
-personality-protect train --backend mock              # no multi-GB download
-personality-protect train --backend mlx --max-steps 200   # MLX 4-bit base ~6 GB
-personality-protect train --backend cuda --max-steps 200  # QLoRA (4-bit in VRAM)
+personality-protect train --backend mock --smoke --force   # CI / pipeline only
+personality-protect train --backend mlx                    # auto steps from corpus size
+personality-protect train --backend cuda --max-steps 200
 ```
 
 Adapters land under `~/.personality-protect/profiles/<name>/adapters/` only.
@@ -152,7 +156,21 @@ personality-protect filter --file draft.txt --out voice.txt
 personality-protect filter --backend mock --text "…"   # after mock train / demo
 ```
 
-### 7. Local API stub (future browser extension)
+On Apple Silicon with an MLX adapter, `filter --backend auto` prefers MLX.
+
+### 7. Eval / compare
+
+Synthetic slop drafts ship under package `data/evals/`. Receipts write to the local profile `evals/` directory (gitignored — never commit).
+
+```bash
+personality-protect compare --synthetic slop_branding
+personality-protect eval --synthetic slop_branding
+personality-protect compare --text "It is important to note that we must leverage synergies."
+```
+
+Three-way compare: **raw** vs **prompt few-shot baseline** vs **LoRA/adapter filter**.
+
+### 8. Local API stub (future browser extension)
 
 Loopback only (`127.0.0.1`). Refuses non-local binds.
 
@@ -160,6 +178,17 @@ Loopback only (`127.0.0.1`). Refuses non-local binds.
 personality-protect api
 # GET  http://127.0.0.1:8765/health
 # POST http://127.0.0.1:8765/v1/filter  {"text":"…"}
+```
+
+## Launch / impress workflow
+
+See [docs/LAUNCH.md](docs/LAUNCH.md) for the operator checklist (hardware, privacy, steps).
+
+```bash
+chmod +x scripts/beast_demo.sh
+./scripts/beast_demo.sh --linkedin ~/Downloads/LinkedInExport
+# synthetic smoke (no personal data, no multi-GB download):
+./scripts/beast_demo.sh --skip-download
 ```
 
 ## CLI branding
@@ -182,9 +211,10 @@ Honors `NO_COLOR` and non-TTY (no ANSI).
 | Writing corpus & index | Real LinkedIn exports |
 | SFT JSONL | Emails, notes, personal paths |
 | LoRA / GGUF adapters | API keys, `.env`, tokens |
-| Profile cache + `models/*.gguf` | Personal adapters / weights |
+| Profile `evals/` receipts | Personal adapters / weights |
+| Profile cache + `models/*.gguf` | Cloud train uploads |
 
-Public git contains **code + synthetic demo fixtures only**.  
+Public git contains **code + synthetic demo/eval fixtures only**.  
 Hugging Face is used only to **download public quantized base weights** (GGUF / MLX 4-bit).
 
 ## Hardware notes
@@ -202,7 +232,20 @@ Hugging Face is used only to **download public quantized base weights** (GGUF / 
 ```bash
 pip install -e ".[dev]"
 pytest
+ruff check src tests
 ```
+
+### CI / branch protection
+
+Workflow: `.github/workflows/ci.yml`. Required check names:
+
+| Check name | What it runs |
+| --- | --- |
+| `lint` | `ruff check src tests` |
+| `test (3.11)` | `pytest` on Python 3.11 |
+| `test (3.12)` | `pytest` on Python 3.12 |
+| `sanitize` | Block private-path / discussion leaks in tracked files |
+| `cli-smoke` | `demo` + `compare` + mock `--smoke` train (no model download) |
 
 ## License
 

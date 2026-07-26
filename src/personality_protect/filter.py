@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import re
 from pathlib import Path
 from typing import Literal
@@ -13,8 +14,33 @@ from personality_protect.config import (
     load_config,
 )
 from personality_protect.download import resolve_gguf_path
+from personality_protect.sft import SYSTEM_PROMPT
 
 FilterBackend = Literal["auto", "llama", "gguf", "mlx", "transformers", "mock"]
+
+# Stable decoding for voice rewrite (deterministic-leaning, not creative chat)
+FILTER_TEMPERATURE = 0.4
+FILTER_TOP_P = 0.9
+FILTER_REPEAT_PENALTY = 1.1
+FILTER_STOP = ("###", "</s>", "<|end|>", "<|im_end|>")
+
+
+def filter_system_prompt() -> str:
+    return SYSTEM_PROMPT
+
+
+def build_filter_prompt(draft: str, *, few_shot: str | None = None) -> str:
+    """Stable user+system style prompt shared by real backends and compare baseline."""
+    parts = [filter_system_prompt(), ""]
+    if few_shot:
+        parts.append(few_shot.strip())
+        parts.append("")
+    parts.append(
+        "Rewrite the draft in the user's authentic writing voice. "
+        "Keep meaning; strip AI tells; do not invent facts.\n\n"
+        f"### Draft\n{draft.strip()}\n\n### Rewritten\n"
+    )
+    return "\n".join(parts)
 
 
 def _latest_adapter(paths: ProfilePaths) -> Path:
@@ -41,6 +67,20 @@ def _has_mlx_adapter(adapter_dir: Path) -> bool:
     return (adapter_dir / "adapters.safetensors").is_file()
 
 
+def _is_apple_silicon() -> bool:
+    return platform.system() == "Darwin" and platform.machine().lower() in {
+        "arm64",
+        "aarch64",
+    }
+
+
+def _has_mlx() -> bool:
+    """True when mlx_lm is importable (package present)."""
+    import importlib.util
+
+    return importlib.util.find_spec("mlx_lm") is not None
+
+
 def filter_draft(
     draft: str,
     paths: ProfilePaths,
@@ -51,7 +91,8 @@ def filter_draft(
 ) -> tuple[str, str]:
     """Return (rewritten_text, backend_used).
 
-    Auto preference: mock-only adapter → mock; else local GGUF/llama.cpp →
+    Auto preference on Apple Silicon with an MLX adapter: MLX first.
+    Otherwise: mock-only adapter → mock; else local GGUF/llama.cpp →
     MLX 4-bit → transformers → mock.
     """
     config = load_config(paths)
@@ -70,22 +111,26 @@ def filter_draft(
         # Demo/smoke: mock adapter alone → no multi-GB runtime required
         if mock_only and resolve_gguf_path(paths, explicit=gguf) is None:
             chosen = "mock"
+        elif (
+            _is_apple_silicon()
+            and _has_mlx()
+            and (_has_mlx_adapter(adapter_dir) or not mock_only)
+        ):
+            # Prefer MLX train+filter on Apple Silicon when adapter/runtime available
+            chosen = "mlx"
         else:
             gguf_path = resolve_gguf_path(paths, filename=config.gguf_file, explicit=gguf)
             if gguf_path is not None and _has_llama_cpp():
                 chosen = "llama"
+            elif _has_mlx():
+                chosen = "mlx"
             else:
                 try:
-                    import mlx_lm  # noqa: F401
+                    import peft  # noqa: F401
 
-                    chosen = "mlx"
+                    chosen = "transformers"
                 except ImportError:
-                    try:
-                        import peft  # noqa: F401
-
-                        chosen = "transformers"
-                    except ImportError:
-                        chosen = "mock"
+                    chosen = "mock"
     elif backend == "gguf":
         chosen = "llama"
 
@@ -179,11 +224,7 @@ def _filter_llama(
             "or use --backend mlx|mock"
         ) from exc
 
-    prompt = (
-        "Rewrite the draft in the user's authentic writing voice. "
-        "Keep meaning; do not invent facts.\n\n"
-        f"### Draft\n{draft}\n\n### Rewritten\n"
-    )
+    prompt = build_filter_prompt(draft)
     # Optional GGUF LoRA if present next to adapter
     lora_path = None
     for name in ("adapter.gguf", "lora.gguf"):
@@ -204,8 +245,10 @@ def _filter_llama(
     out = llm(
         prompt,
         max_tokens=max_tokens,
-        temperature=0.7,
-        stop=["###", "</s>", "<|end|>"],
+        temperature=FILTER_TEMPERATURE,
+        top_p=FILTER_TOP_P,
+        repeat_penalty=FILTER_REPEAT_PENALTY,
+        stop=list(FILTER_STOP),
     )
     text = out["choices"][0]["text"] if out.get("choices") else str(out)
     return str(text).strip()
@@ -223,12 +266,16 @@ def _filter_mlx(draft: str, adapter_dir: Path, base_model: str, max_tokens: int)
     adapter = str(adapter_dir) if _has_mlx_adapter(adapter_dir) else None
     # Prefer quantized MLX id from config (default ~6 GB 4-bit)
     model, tokenizer = load(base_model, adapter_path=adapter)
-    prompt = (
-        "Rewrite the draft in the user's authentic writing voice. "
-        "Keep meaning; do not invent facts.\n\n"
-        f"### Draft\n{draft}\n\n### Rewritten\n"
-    )
-    out = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
+    prompt = build_filter_prompt(draft)
+    # mlx-lm generate: pass sampler kwargs when supported
+    gen_kwargs: dict = {"max_tokens": max_tokens, "verbose": False}
+    try:
+        from mlx_lm.sample_utils import make_sampler
+
+        gen_kwargs["sampler"] = make_sampler(temp=FILTER_TEMPERATURE, top_p=FILTER_TOP_P)
+    except Exception:
+        pass
+    out = generate(model, tokenizer, prompt=prompt, **gen_kwargs)
     return str(out).strip()
 
 
@@ -266,16 +313,18 @@ def _filter_transformers(
         model = PeftModel.from_pretrained(model, str(adapter_dir))
     model.eval()
 
-    prompt = (
-        "Rewrite the draft in the user's authentic writing voice. "
-        "Keep meaning; do not invent facts.\n\n"
-        f"### Draft\n{draft}\n\n### Rewritten\n"
-    )
+    prompt = build_filter_prompt(draft)
     inputs = tokenizer(prompt, return_tensors="pt")
     if torch.cuda.is_available():
         inputs = {k: v.cuda() for k, v in inputs.items()}
     with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=True, temperature=0.7)
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=True,
+            temperature=FILTER_TEMPERATURE,
+            top_p=FILTER_TOP_P,
+        )
     text = tokenizer.decode(output[0], skip_special_tokens=True)
     if "### Rewritten" in text:
         text = text.split("### Rewritten", 1)[1].strip()
