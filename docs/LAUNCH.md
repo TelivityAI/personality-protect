@@ -37,10 +37,13 @@ MLX train is chunked and checkpointed — a crash does not wipe a full run; use 
 ## One-shot script
 
 ```bash
+# Full local run (real train when backend allows):
 ./scripts/beast_demo.sh --linkedin ~/path/to/linkedin-export
-# or synthetic smoke (no personal data):
+# Synthetic smoke only (mock — not the shipped mlx/llama path):
 ./scripts/beast_demo.sh --smoke --allow-mock --backend mock --skip-download
 ```
+
+`scripts/beast_demo.sh` is an operator helper for PersonalityProtect. It is not a separate “PersonalityProtect demo” product.
 
 ## Branch protection checks
 

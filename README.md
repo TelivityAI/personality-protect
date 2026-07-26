@@ -6,15 +6,24 @@ v1 CLI — shipped and working. Train a small LoRA on *your* writing. Filter AI 
 
 Built by [Telivity](https://telivity.com). Apache-2.0. The on-device pipe is real: ingest → select → chunked train → filter → compare. Voice fidelity (leave-alone + cadence) is what we're sharpening next — not “does the product work?”
 
-<p align="center">
-  <img src="docs/images/cli-demo.png" alt="personality-protect demo: synthetic AI slop draft rewritten locally" width="760" />
-</p>
+---
+
+## `demo` vs the shipped product
+
+| | What it is | What it is **not** |
+| --- | --- | --- |
+| **`personality-protect demo`** | Optional **synthetic mock tour** — ingest fake docs → mock train → mock filter. No model download. | Not the product. Not a real LoRA. Ending on “Mock tour complete” does **not** mean PersonalityProtect is only a demo. |
+| **Shipped path** | `init` → `download` → `ingest` → `select` → **`train` (mlx/cuda)** → **`filter` / `compare` (llama/mlx)** | Not `demo`. Real quantized weights + your adapter on disk. |
 
 ```text
-your writing ──► ingest ──► select ──► train (local LoRA) ──► filter ──► your voice
-                      ▲                        │
-                      └── demo (synthetic) ─────┘
+your writing ──► ingest ──► select ──► train (local LoRA) ──► filter / compare ──► your voice
+                                         ▲
+                    demo (optional mock tour; synthetic only)
 ```
+
+<p align="center">
+  <img src="docs/images/cli-shipped.png" alt="personality-protect shipped path: train --backend mlx --proof then filter with llama" width="760" />
+</p>
 
 ---
 
@@ -32,23 +41,29 @@ Honest about the hard part: the pipeline ships; sounding *exactly* like you is t
 
 ## Screenshots
 
-Synthetic demo only — safe for public docs. No personal corpus.
+Public docs use **synthetic Contoso / synergy-slop text only**. No personal corpus.
 
-| Demo (before → after) | Filter a draft | Telivity mark |
+| Shipped path | Compare (synthetic) | Filter (docs tour) |
 | --- | --- | --- |
-| <img src="docs/images/cli-demo.png" alt="demo before/after" width="360" /> | <img src="docs/images/cli-filter.png" alt="filter command" width="360" /> | <img src="docs/images/cli-logo.png" alt="Telivity CLI logo" width="280" /> |
+| <img src="docs/images/cli-shipped.png" alt="train --proof then filter" width="360" /> | <img src="docs/images/cli-compare.png" alt="compare synthetic draft" width="360" /> | <img src="docs/images/cli-filter.png" alt="filter command — mock adapter in docs shot" width="360" /> |
+
+Filter / compare PNGs above are **docs-tour shots** (`backend=mock` + synthetic draft) so screenshots stay private and light. After a real `train`, the same commands use **`llama` or `mlx`**.
+
+Optional mock tour (window title says *demo tour*, not the product name):
+
+| Mock tour only | Telivity mark | Status (synthetic profile) |
+| --- | --- | --- |
+| <img src="docs/images/cli-demo.png" alt="optional mock demo tour" width="360" /> | <img src="docs/images/cli-logo.png" alt="Telivity CLI logo" width="280" /> | <img src="docs/images/cli-status.png" alt="status on synthetic demo profile" width="280" /> |
 
 ```bash
-personality-protect demo          # synthetic ingest → mock train → filter
-personality-protect logo          # Telivity terminal mark
+# Shipped path (real adapters)
+personality-protect train --backend mlx --proof
 personality-protect filter --text "In today's fast-paced world…"
+personality-protect compare --synthetic slop_branding
+
+# Optional mock tour only (no download)
+personality-protect demo
 ```
-
-Local profile state after a real run:
-
-<p align="center">
-  <img src="docs/images/cli-status.png" alt="personality-protect status on a local demo profile" width="480" />
-</p>
 
 ---
 
@@ -124,16 +139,7 @@ pip install -e ".[cuda]"     # NVIDIA QLoRA train
 
 ## Quick start
 
-### 1. Synthetic demo (no download)
-
-```bash
-personality-protect demo
-personality-protect demo --json    # machine-readable; no logo
-```
-
-Runs: init → ingest synthetic docs → select → mock train → filter.
-
-### 2. Real local path
+### 1. Shipped local path (real train + filter)
 
 ```bash
 personality-protect init
@@ -158,6 +164,15 @@ personality-protect compare --synthetic slop_branding
 ```
 
 Filter auto-prefers local GGUF when present (`llama`), then MLX, then requires an explicit mock.
+
+### 2. Optional mock tour (no download)
+
+```bash
+personality-protect demo
+personality-protect demo --json    # machine-readable; no logo
+```
+
+Runs: init → ingest synthetic docs → select → **mock** train → **mock** filter. Useful for a smoke walkthrough. **This is not the shipped mlx/llama path.**
 
 ---
 
@@ -240,7 +255,7 @@ If a run dies mid-train, **`--resume` continues from the last good chunk** inste
 personality-protect filter --text "In today's fast-paced world we must leverage synergies."
 personality-protect filter --backend llama --text "Contoso must ship the Q3 plan by Friday."
 personality-protect filter --file draft.txt --out voice.txt
-personality-protect filter --backend mock --text "…"   # after mock train / demo
+personality-protect filter --backend mock --text "…"   # after mock train / demo tour
 ```
 
 On Apple Silicon with an MLX adapter, `filter --backend auto` prefers MLX.
@@ -283,7 +298,7 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 | `filter` | Rewrite a draft through the adapter |
 | `compare` | Raw vs few-shot vs adapter |
 | `eval` | Score a draft (synthetic or yours) |
-| `demo` | Full synthetic pipeline smoke |
+| `demo` | Optional synthetic **mock tour** (not the shipped path) |
 | `status` | Show profile / artifact state |
 | `api` | Loopback HTTP filter stub |
 | `logo` | Print Telivity CLI mark |
