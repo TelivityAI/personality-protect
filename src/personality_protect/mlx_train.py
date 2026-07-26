@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -35,9 +36,32 @@ PROOF_MAX_STEPS = 150  # enough for real receipts without a marathon
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 CHECKPOINT_META_NAME = "train_chunks.json"
+# Snapshot before each chunk so nan / crash never leaves a wiped or poisoned adapter.
+LAST_GOOD_ADAPTER_NAME = "adapters.safetensors.last_good"
 
 _ITER_RE = re.compile(r"^Iter\s+(\d+)\s*:", re.MULTILINE)
 _PEAK_RE = re.compile(r"Peak mem\s+([0-9.]+)\s*GB", re.IGNORECASE)
+_NAN_LOSS_RE = re.compile(r"Train loss\s+nan\b", re.IGNORECASE)
+
+
+def snapshot_last_good_adapter(adapter_dir: Path) -> Path | None:
+    """Copy current adapters.safetensors aside before a risky chunk."""
+    src = adapter_dir / "adapters.safetensors"
+    if not src.is_file():
+        return None
+    dest = adapter_dir / LAST_GOOD_ADAPTER_NAME
+    shutil.copy2(src, dest)
+    return dest
+
+
+def restore_last_good_adapter(adapter_dir: Path) -> bool:
+    """Restore adapters.safetensors from the pre-chunk snapshot if present."""
+    src = adapter_dir / LAST_GOOD_ADAPTER_NAME
+    if not src.is_file():
+        return False
+    dest = adapter_dir / "adapters.safetensors"
+    shutil.copy2(src, dest)
+    return True
 
 
 def plan_train_chunks(total_steps: int, chunk_size: int) -> list[int]:
@@ -222,6 +246,11 @@ def parse_iter_from_line(line: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def stdout_reports_nan_loss(text: str) -> bool:
+    """True when mlx-lm printed Train loss nan (usually empty masked labels)."""
+    return bool(_NAN_LOSS_RE.search(text or ""))
+
+
 def parse_peak_mem_gb(text: str) -> float | None:
     matches = _PEAK_RE.findall(text)
     if not matches:
@@ -327,17 +356,24 @@ def run_mlx_chunk_subprocess(
 
 
 def detect_device_memory() -> tuple[int, int]:
-    """Return (memory_size, max_recommended_working_set_size) from MLX if possible."""
+    """Return (memory_size, max_recommended_working_set_size) from MLX if possible.
+
+    Never import ``mlx`` when ``PP_MLX_DISABLE`` is set — sandboxed Cursor shells
+    SIGABRT on ``metal::load_device`` (~80ms) and take Python down with them.
+    """
     try:
         from personality_protect.mlx_runtime import assert_mlx_import_allowed
 
         assert_mlx_import_allowed()
+    except Exception:
+        return 48 * 10**9, 40 * 10**9
+    try:
         import mlx.core as mx
 
         info = mx.device_info()
         return int(info["memory_size"]), int(info["max_recommended_working_set_size"])
     except Exception:
-        # Sensible fallbacks for tests / non-Metal hosts / PP_MLX_DISABLE
+        # Sensible fallbacks for tests / non-Metal hosts
         return 48 * 10**9, 40 * 10**9
 
 
@@ -399,7 +435,11 @@ def run_chunked_mlx_train(
             progress_callback({"kind": "done", **meta})
         return meta
 
-    mem_size, max_rec = detect_device_memory()
+    # Explicit memory_gb: skip mlx.device_info() entirely (sandbox-safe for unit tests).
+    if memory_gb is not None and memory_gb > 0:
+        mem_size, max_rec = 48 * 10**9, 40 * 10**9
+    else:
+        mem_size, max_rec = detect_device_memory()
     wired = resolve_wired_limit_bytes(
         memory_size=mem_size,
         max_recommended=max_rec,
@@ -433,6 +473,8 @@ def run_chunked_mlx_train(
         resume_adapter = adapter_file if adapter_file.is_file() else None
         chunk_index = prior_chunks_done + i
         total_chunk_count = prior_chunks_done + len(chunks)
+        # Preserve any good weights before this chunk can overwrite them.
+        had_good_snapshot = snapshot_last_good_adapter(adapter_dir) is not None
         if progress_callback:
             progress_callback(
                 {
@@ -474,9 +516,17 @@ def run_chunked_mlx_train(
         if result.peak_mem_gb is not None:
             peaks.append(result.peak_mem_gb)
 
-        if result.returncode != 0 or not result.adapters_ok:
+        if (
+            result.returncode != 0
+            or not result.adapters_ok
+            or stdout_reports_nan_loss(result.stdout)
+        ):
             err_tail = result.stdout[-2000:] if result.stdout else ""
-            # Persist partial progress so --resume can continue.
+            nan_loss = stdout_reports_nan_loss(result.stdout)
+            restored = False
+            if had_good_snapshot:
+                restored = restore_last_good_adapter(adapter_dir)
+            # Persist partial progress so --resume can continue from last good steps.
             write_train_checkpoint_meta(
                 adapter_dir,
                 {
@@ -495,6 +545,8 @@ def run_chunked_mlx_train(
                     "already_completed": plan.already_completed,
                     "error_chunk": chunk_index,
                     "returncode": result.returncode,
+                    "nan_loss": nan_loss,
+                    "restored_last_good": restored,
                 },
             )
             if progress_callback:
@@ -503,6 +555,8 @@ def run_chunked_mlx_train(
                         "kind": "error",
                         "chunk": chunk_index,
                         "returncode": result.returncode,
+                        "nan_loss": nan_loss,
+                        "restored_last_good": restored,
                         "detail": err_tail,
                     }
                 )
@@ -520,10 +574,24 @@ def run_chunked_mlx_train(
                     "do not restart-kill mid-train. If SIGKILL: check jetsam/OOM. "
                     "Re-run with --resume to continue from the last good chunk."
                 )
+            nan_hint = ""
+            if nan_loss:
+                nan_hint = (
+                    f" Train loss nan under mask_prompt/max_seq_length={max_seq_length} "
+                    "(usually oversized SFT examples → empty assistant labels)."
+                )
+            restore_hint = ""
+            if restored:
+                restore_hint = (
+                    " Restored adapters.safetensors from pre-chunk snapshot "
+                    f"({LAST_GOOD_ADAPTER_NAME}); good weights were not wiped."
+                )
+            elif had_good_snapshot:
+                restore_hint = " Pre-chunk snapshot restore failed."
             raise RuntimeError(
                 f"MLX train chunk {chunk_index}/{total_chunk_count} failed "
                 f"(exit={result.returncode}, adapters_ok={result.adapters_ok})."
-                f"{sig_hint}\n"
+                f"{nan_hint}{restore_hint}{sig_hint}\n"
                 f"Wired limit was {wired / 1e9:.1f} GB (capped; mlx-lm alone would "
                 f"try ~{max_rec / 1e9:.0f} GB and can kill the Mac).\n"
                 f"Completed steps so far: {completed}/{plan.total_steps}. "

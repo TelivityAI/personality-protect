@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from personality_protect.config import init_profile
 from personality_protect.mlx_train import (
     DEFAULT_CHUNK_STEPS,
@@ -88,6 +90,63 @@ def test_parse_iter_from_line():
     assert parse_iter_from_line("Iter 12: Train loss 1.234, Peak mem 9.1 GB") == 12
     assert parse_iter_from_line("Loading pretrained model") is None
     assert parse_iter_from_line("Saved final weights to /x") is None
+
+
+def test_stdout_reports_nan_loss():
+    from personality_protect.mlx_train import stdout_reports_nan_loss
+
+    assert stdout_reports_nan_loss(
+        "Iter 5: Train loss nan, Learning Rate 1.000e-05, Peak mem 13.7 GB"
+    )
+    assert not stdout_reports_nan_loss("Iter 5: Train loss 0.42, Peak mem 13.7 GB")
+
+
+def test_nan_chunk_restores_last_good_adapter(tmp_path: Path):
+    """Failed/nan chunks must not leave poisoned weights; restore pre-chunk snapshot."""
+    from personality_protect.mlx_train import (
+        LAST_GOOD_ADAPTER_NAME,
+        run_chunked_mlx_train,
+    )
+
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapters.safetensors").write_bytes(b"GOOD_750")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "train.jsonl").write_text("{}\n", encoding="utf-8")
+
+    with patch("personality_protect.mlx_train.run_mlx_chunk_subprocess") as mock_chunk:
+
+        def _side_effect(**kwargs):
+            # Simulate mlx-lm overwriting weights then reporting nan.
+            (kwargs["adapter_dir"] / "adapters.safetensors").write_bytes(b"POISON")
+            return MagicMock(
+                returncode=0,
+                adapters_ok=True,
+                last_iter=10,
+                peak_mem_gb=13.0,
+                stdout="Iter 10: Train loss nan, Learning Rate 1.000e-05, Peak mem 13.0 GB\n",
+                stderr="",
+            )
+
+        mock_chunk.side_effect = _side_effect
+        with pytest.raises(RuntimeError, match="Train loss nan"):
+            run_chunked_mlx_train(
+                model="m",
+                data_dir=data_dir,
+                adapter_dir=adapter_dir,
+                total_steps=800,
+                chunk_steps=50,
+                memory_gb=16.0,
+                resume=True,
+            )
+
+    assert (adapter_dir / "adapters.safetensors").read_bytes() == b"GOOD_750"
+    assert (adapter_dir / LAST_GOOD_ADAPTER_NAME).read_bytes() == b"GOOD_750"
+    meta = json.loads((adapter_dir / "train_chunks.json").read_text(encoding="utf-8"))
+    assert meta["nan_loss"] is True
+    assert meta["restored_last_good"] is True
+    assert meta["completed_steps"] == 0  # no prior checkpoint meta → already=0
 
 
 def test_run_train_mlx_uses_chunks_and_progress(tmp_path: Path):

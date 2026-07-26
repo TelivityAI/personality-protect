@@ -119,22 +119,28 @@ def test_finalize_rewrite_strips_slop_after_template_cut():
 
 def test_mlx_wired_cap_clamps_generate_requests(monkeypatch):
     """mlx_lm.generate.wired_limit requests max_recommended (~40GB); we must clamp."""
-    monkeypatch.delenv("PP_MLX_DISABLE", raising=False)
+    import types
+
+    monkeypatch.setenv("PP_MLX_DISABLE", "0")
     calls: list[int] = []
 
-    def fake_set(requested=None):
+    def fake_set(requested=None, *args, **kwargs):
         calls.append(int(requested))
         return requested
 
-    fake_mx = MagicMock()
-    fake_mx.set_wired_limit = fake_set
+    fake_core = types.ModuleType("mlx.core")
+    fake_core.set_wired_limit = fake_set  # type: ignore[attr-defined]
+    fake_mlx = types.ModuleType("mlx")
+    fake_mlx.core = fake_core  # type: ignore[attr-defined]
 
-    with patch.dict("sys.modules", {"mlx.core": fake_mx}):
+    # Stub mlx.core BEFORE install_wired_cap imports it — never load real Metal.
+    with patch.dict("sys.modules", {"mlx": fake_mlx, "mlx.core": fake_core}):
         import personality_protect.mlx_runtime as rt
 
+        monkeypatch.setattr(rt, "assert_mlx_import_allowed", lambda: None)
         rt._CAP_INSTALLED_FOR = None
         limit = rt.install_wired_cap(16 * 10**9)
         assert limit == 16 * 10**9
         # Simulate mlx_lm.generate.wired_limit requesting ~40 GB
-        fake_mx.set_wired_limit(40 * 10**9)
+        fake_core.set_wired_limit(40 * 10**9)
         assert calls[-1] == 16 * 10**9

@@ -599,18 +599,14 @@ def train_cmd(
         return on_progress
 
     def _make_progress_callback():
-        if as_json or sft_only or detected not in {"mlx", "auto"} and backend != "mlx":
-            return None
-        if detected != "mlx" and backend != "auto":
-            return None
-        # Only show bar for real MLX path
-        if detected != "mlx":
+        if sft_only or detected != "mlx":
             return None
 
         # Rich Live + subprocess PIPE is hostile to nohup/redirected logs:
         # the monitor shows an empty file after the banner even while (or after)
-        # the worker dies. Prefer plain flushed lines when stdout is not a TTY.
-        if not sys.stdout.isatty():
+        # the worker dies. Prefer plain flushed lines when stdout is not a TTY
+        # or when --json is used (final JSON still prints after training).
+        if as_json or not sys.stdout.isatty():
             return _make_plain_progress_callback()
 
         progress = Progress(
@@ -676,10 +672,9 @@ def train_cmd(
 
         return on_progress
 
-    # Resolve whether we'll actually use mlx for the progress bar
+    # Stream MLX progress even with --json so redirected/nohup logs aren't empty.
     show_mlx_progress = (
-        not as_json
-        and not sft_only
+        not sft_only
         and not mock
         and backend != "mock"
         and detected == "mlx"

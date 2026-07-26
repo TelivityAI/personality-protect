@@ -53,6 +53,11 @@ _CSS_RULE_RE = re.compile(
     r"(?ms)^[ \t]*[a-zA-Z_*#.][^{;\n]{0,160}\{[^{}]*\}[ \t]*\n?"
 )
 _HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+# MLX trains at max_seq_length=512 with mask_prompt. Prompt (system+user+draft)
+# plus assistant target must fit; overflow leaves zero assistant tokens →
+# Train loss nan and a dead / corrupt chunk.
+MAX_SFT_TARGET_CHARS = 420
+MAX_SFT_DRAFT_CHARS = 420
 # Bland public business idioms only — never encode user-specific metaphors.
 _METAPHOR_FLATTEN = (
     (re.compile(r"\bcash cow\b", re.I), "primary revenue source"),
@@ -128,6 +133,20 @@ def normalize_corpus_text(text: str) -> str:
     return text.strip()
 
 
+def _truncate_for_seq_budget(text: str, max_chars: int) -> str:
+    """Word-boundary truncate so masked MLX examples stay inside max_seq_length."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    cut = text[: max_chars - 1].rsplit(" ", 1)[0].rstrip(",;:—-")
+    return (cut or text[: max_chars - 1]).rstrip() + "…"
+
+
+def _truncate_voice_target(text: str, max_chars: int = MAX_SFT_TARGET_CHARS) -> str:
+    """Keep assistant targets inside the masked MLX sequence budget."""
+    return _truncate_for_seq_budget(text, max_chars)
+
+
 def piece_to_examples(piece: Piece) -> list[dict]:
     """Map one corpus piece to slop→voice and clean→voice supervised pairs.
 
@@ -135,12 +154,12 @@ def piece_to_examples(piece: Piece) -> list[dict]:
     AI-tell stripping + cadence restore; clean pairs teach style transfer when
     the draft is already professional / free of tells.
     """
-    target = normalize_corpus_text(piece.text)
+    target = _truncate_voice_target(normalize_corpus_text(piece.text))
     if not target.strip():
         return []
     out: list[dict] = []
     for kind, draft_fn in (("slop", _neutral_draft), ("clean", _clean_generic_draft)):
-        draft = draft_fn(target)
+        draft = _truncate_for_seq_budget(draft_fn(target), MAX_SFT_DRAFT_CHARS)
         if not draft.strip() or draft.strip() == target.strip():
             continue
         user = USER_TEMPLATE_INFER.format(draft=draft)
@@ -167,11 +186,12 @@ def piece_to_example(piece: Piece) -> dict:
     """Back-compat: return the slop→voice pair (or the only available pair)."""
     examples = piece_to_examples(piece)
     if not examples:
-        target = normalize_corpus_text(piece.text)
+        target = _truncate_voice_target(normalize_corpus_text(piece.text))
+        draft = _truncate_for_seq_budget(target, MAX_SFT_DRAFT_CHARS)
         return {
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": USER_TEMPLATE_INFER.format(draft=target)},
+                {"role": "user", "content": USER_TEMPLATE_INFER.format(draft=draft)},
                 {"role": "assistant", "content": target},
             ],
             "meta": {

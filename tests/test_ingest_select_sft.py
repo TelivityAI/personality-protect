@@ -177,6 +177,29 @@ def test_normalize_corpus_text_strips_embedded_html_css():
     assert "8.4/10" in clean
 
 
+def test_sft_truncates_long_targets_for_masked_seq_budget():
+    """512-token mask_prompt trains NaN when prompt+target overflow the window."""
+    from personality_protect.models import Piece
+    from personality_protect.sft import (
+        MAX_SFT_DRAFT_CHARS,
+        MAX_SFT_TARGET_CHARS,
+        piece_to_examples,
+    )
+
+    huge = ("Travel tech changes fast. " * 400).strip()
+    assert len(huge) > MAX_SFT_TARGET_CHARS * 2
+    examples = piece_to_examples(
+        Piece(id="long", source="note", text=huge, year=2024, word_count=2000)
+    )
+    assert examples
+    for ex in examples:
+        target = ex["messages"][-1]["content"]
+        assert len(target) <= MAX_SFT_TARGET_CHARS + 5
+        user = ex["messages"][1]["content"]
+        draft = user.split("### Draft\n", 1)[1].split("\n\n### Rewritten", 1)[0]
+        assert len(draft) <= MAX_SFT_DRAFT_CHARS + 5
+
+
 def test_piece_to_example_has_assistant_voice():
     from personality_protect.models import Piece
 
