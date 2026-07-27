@@ -93,13 +93,20 @@ def _word_set(text: str) -> set[str]:
 #
 # Proper-noun floors are channel p10s on the author's real corpus under
 # ``count_proper_nouns`` (excludes sentence-initial capitals). A single 48/1k
-# gate rejected ~34% of posts and ~17% of articles. Numbers floor stays at the
-# article corpus floor. Median sentence / short-line / you>I are advisory only.
+# gate rejected ~34% of posts and ~17% of articles.
+#
+# Numbers: ~48% of real posts have zero figures (p10/p25 = 0) — no hard gate
+# on LinkedIn. Articles keep the corpus floor (~6.6/1k). Demanding numbers
+# when ``numbers_available`` is empty pushes the drafter to invent them.
+# Median sentence / short-line / you>I are advisory only.
 SCORECARD_MIN_PROPER_PER_1K_POST = 20.0
 SCORECARD_MIN_PROPER_PER_1K_ARTICLE = 42.0
 # Back-compat alias → article floor (stricter default when channel omitted).
 SCORECARD_MIN_PROPER_PER_1K = SCORECARD_MIN_PROPER_PER_1K_ARTICLE
-SCORECARD_MIN_NUMBERS_PER_1K = 5.0
+SCORECARD_MIN_NUMBERS_PER_1K_POST = 0.0
+SCORECARD_MIN_NUMBERS_PER_1K_ARTICLE = 6.6
+# Back-compat alias → article numbers floor.
+SCORECARD_MIN_NUMBERS_PER_1K = SCORECARD_MIN_NUMBERS_PER_1K_ARTICLE
 
 
 def resolve_proper_floor(
@@ -116,6 +123,22 @@ def resolve_proper_floor(
     if words is not None and int(words) < 500:
         return SCORECARD_MIN_PROPER_PER_1K_POST
     return SCORECARD_MIN_PROPER_PER_1K_ARTICLE
+
+
+def resolve_numbers_floor(
+    channel: str | None = None,
+    *,
+    words: int | None = None,
+) -> float:
+    """Pick numbers /1k floor. Posts: 0 (advisory only). Articles: corpus floor."""
+    ch = (channel or "").strip().lower()
+    if ch in {"linkedin", "post", "posts", "li", "short"}:
+        return SCORECARD_MIN_NUMBERS_PER_1K_POST
+    if ch in {"article", "articles", "longform", "long"}:
+        return SCORECARD_MIN_NUMBERS_PER_1K_ARTICLE
+    if words is not None and int(words) < 500:
+        return SCORECARD_MIN_NUMBERS_PER_1K_POST
+    return SCORECARD_MIN_NUMBERS_PER_1K_ARTICLE
 
 _COMMON_CAPS = frozenset(
     {
@@ -264,14 +287,15 @@ def specificity_scorecard(
     *,
     channel: str | None = None,
     min_proper_per_1k: float | None = None,
-    min_numbers_per_1k: float = SCORECARD_MIN_NUMBERS_PER_1K,
+    min_numbers_per_1k: float | None = None,
 ) -> dict[str, Any]:
     """Deterministic draft gate: specificity before any voice filter.
 
-    Hard FAIL: proper nouns /1k and numbers /1k at corpus floors.
-    Proper-noun floor is channel-aware (posts ~20, articles ~42) unless
-    ``min_proper_per_1k`` is passed explicitly.
-    Advisory only (never FAIL): median sentence, short-line ratio, you vs I.
+    Hard FAIL: proper nouns /1k (channel p10). Numbers /1k are hard only on
+    articles (~6.6); on LinkedIn posts they are advisory (floor 0) — half of
+    real posts have zero figures.
+    Advisory only (never FAIL): median sentence, short-line ratio, you vs I,
+    and post-channel numbers.
     A voice filter cannot insert named entities or a benchmark table.
     """
     body = (text or "").strip()
@@ -279,6 +303,8 @@ def specificity_scorecard(
     n_words = max(1, len(words))
     if min_proper_per_1k is None:
         min_proper_per_1k = resolve_proper_floor(channel, words=len(words))
+    if min_numbers_per_1k is None:
+        min_numbers_per_1k = resolve_numbers_floor(channel, words=len(words))
     proper = count_proper_nouns(body)
     numbers = count_numbers(body)
     sent_counts = _sentence_word_counts(body)
@@ -301,10 +327,12 @@ def specificity_scorecard(
     you_1k = you_n * 1000.0 / n_words
     i_1k = i_n * 1000.0 / n_words
 
-    checks = {
+    checks: dict[str, bool] = {
         "proper_nouns_per_1k": proper_1k >= float(min_proper_per_1k),
-        "numbers_per_1k": numbers_1k >= float(min_numbers_per_1k),
     }
+    # Floor 0 → advisory only (do not hard-fail LinkedIn posts with no figures).
+    if float(min_numbers_per_1k) > 0:
+        checks["numbers_per_1k"] = numbers_1k >= float(min_numbers_per_1k)
     failed = [k for k, ok in checks.items() if not ok]
     advisory = {
         "median_sentence_words": round(median_sent, 2),
@@ -314,6 +342,8 @@ def specificity_scorecard(
         "you_per_1k": round(you_1k, 2),
         "i_per_1k": round(i_1k, 2),
         "you_gt_i": you_n > i_n,
+        "numbers_per_1k": round(numbers_1k, 2),
+        "numbers_hard_gate": float(min_numbers_per_1k) > 0,
     }
     ch_norm = (channel or "").strip().lower() or (
         "linkedin" if len(words) < 500 else "article"
