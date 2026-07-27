@@ -14,7 +14,7 @@ from personality_protect.config import (
     load_config,
 )
 from personality_protect.download import resolve_gguf_path
-from personality_protect.sft import SYSTEM_PROMPT, USER_TEMPLATE, USER_TEMPLATE_INFER
+from personality_protect.sft import USER_TEMPLATE
 
 FilterBackend = Literal["auto", "llama", "gguf", "mlx", "transformers", "mock"]
 
@@ -23,14 +23,62 @@ FILTER_TEMPERATURE = 0.4
 FILTER_TOP_P = 0.9
 FILTER_REPEAT_PENALTY = 1.1
 FILTER_STOP = ("###", "</s>", "<|end|>", "<|im_end|>", "<|im_start|>")
+DEFAULT_MAX_TOKENS = 512
+MAX_MAX_TOKENS = 4096
+# Rough English chars/token; rewrite needs ≥ draft length plus margin.
+_CHARS_PER_TOKEN = 3
 _TEMPLATE_SECTION_RE = re.compile(
     r"\n\s*###\s*(?:Draft|Rewritten|My voice(?:\s*\(reference\))?)\b",
     re.IGNORECASE,
 )
 
+# Inference-only prompts. Training still uses sft.SYSTEM_PROMPT / USER_TEMPLATE_INFER
+# (leave-alone pairs). At filter time we push harder: polished-generic Claude is not
+# "already my voice," and long drafts must not be truncated mid-sentence.
+FILTER_SYSTEM_PROMPT = (
+    "Personal voice rewriter. Match cadence: short punches, rhetorical bite, "
+    "contractions, paragraph rhythm — not generic clean prose. Keep meaning. "
+    "Preserve paragraph breaks; never flatten multi-paragraph drafts. "
+    "Keep section headers when the draft has them (long-form needs scanability). "
+    "Keep a strong opener unless it is sloppy/AI scaffolding. "
+    "Polished frontier prose is NOT automatically your voice — rewrite diction and "
+    "cadence when it reads clean-generic (throat-clearing like "
+    "'Here's what X actually looked like:', soft setups that promise content, "
+    "padded transitions). Return unchanged only when punches and bite already match. "
+    "If flat, corporate, mushy, or AI-slop: rewrite into multi-paragraph voice with "
+    "blank lines between punches — never a thesaurus one-liner. "
+    "Strip AI tells (leverage, synergies, delve, robust, In today's fast-paced world, "
+    "It is important to note, Moreover, Furthermore, unlock, nestled, testament, "
+    "vibrant). No invented facts, hashtags, or emoji unless the voice uses them. "
+    "Never truncate: rewrite the full draft through the final sentence."
+)
+
+FILTER_USER_TEMPLATE_INFER = (
+    "Rewrite in my voice. Cadence and diction — not bland marketing or "
+    "polished-generic. Preserve paragraph breaks and section headers. Keep a strong "
+    "opener unless sloppy. Flat/corporate/AI-slop/throat-clearing → multi-paragraph "
+    "voice with blank lines (not one thesaurus sentence). Leave unchanged ONLY if it "
+    "already sounds like me. Same meaning; drop AI filler. Cover the whole draft — "
+    "do not stop mid-piece.\n\n"
+    "### Draft\n{draft}\n\n"
+    "### Rewritten"
+)
+
+
+def suggest_max_tokens(draft: str, *, override: int | None = None) -> int:
+    """Token budget large enough to finish a full rewrite of ``draft``.
+
+    Default 512 (and the old hard MLX cap of 480) truncates ~1k-word articles
+    mid-sentence. Scale with draft length; clamp to ``MAX_MAX_TOKENS``.
+    """
+    if override is not None:
+        return max(64, min(MAX_MAX_TOKENS, int(override)))
+    approx = max(1, (len(draft or "") + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN)
+    return min(MAX_MAX_TOKENS, max(DEFAULT_MAX_TOKENS, approx + 256))
+
 
 def filter_system_prompt() -> str:
-    return SYSTEM_PROMPT
+    return FILTER_SYSTEM_PROMPT
 
 
 def build_filter_user_content(draft: str, *, reference: str | None = None) -> str:
@@ -38,7 +86,7 @@ def build_filter_user_content(draft: str, *, reference: str | None = None) -> st
     draft = draft.strip()
     if reference and reference.strip():
         return USER_TEMPLATE.format(draft=draft, reference=reference.strip())
-    return USER_TEMPLATE_INFER.format(draft=draft)
+    return FILTER_USER_TEMPLATE_INFER.format(draft=draft)
 
 
 def build_filter_messages(
@@ -175,6 +223,25 @@ def finalize_rewrite(text: str, *, draft: str | None = None) -> str:
     return out
 
 
+def rewrite_quality_flags(draft: str, rewrite: str) -> dict[str, bool | float]:
+    """Detect no-op / likely-truncated filter output for CLI/studio warnings."""
+    draft = (draft or "").strip()
+    rewrite = (rewrite or "").strip()
+    unchanged = bool(draft) and draft == rewrite
+    ratio = (len(rewrite) / len(draft)) if draft else 1.0
+    ends_clean = bool(rewrite) and rewrite[-1] in ".!?'\"”’)"
+    likely_truncated = bool(draft) and (
+        not rewrite
+        or (ratio < 0.55 and not ends_clean)
+        or (ratio < 0.40)
+    )
+    return {
+        "unchanged": unchanged,
+        "likely_truncated": likely_truncated,
+        "length_ratio": round(ratio, 3),
+    }
+
+
 def extract_rewrite(text: str) -> str:
     """Keep only the rewrite; drop thinking + SFT template echo loops."""
     text = (text or "").strip()
@@ -287,7 +354,7 @@ def filter_draft(
     paths: ProfilePaths,
     *,
     backend: FilterBackend = "auto",
-    max_tokens: int = 512,
+    max_tokens: int | None = None,
     gguf: Path | None = None,
 ) -> tuple[str, str]:
     """Return (rewritten_text, backend_used).
@@ -295,12 +362,15 @@ def filter_draft(
     Auto preference on Apple Silicon with an MLX adapter: MLX first.
     Otherwise: mock-only adapter → mock; else local GGUF/llama.cpp →
     MLX 4-bit → transformers → mock.
+
+    ``max_tokens`` defaults to a draft-length budget (see ``suggest_max_tokens``).
     """
     config = load_config(paths)
     adapter_dir = _latest_adapter(paths)
     draft = draft.strip()
     if not draft:
         return "", "none"
+    budget = suggest_max_tokens(draft, override=max_tokens)
 
     chosen: str = backend
     if backend == "auto":
@@ -344,13 +414,13 @@ def filter_draft(
                 "No local GGUF found. Run: personality-protect download --format gguf\n"
                 f"Expected under {paths.models_dir} (~5–7 GB quantized Qwen3.5-9B)."
             )
-        rewritten = _filter_llama(draft, gguf_path, adapter_dir, max_tokens)
+        rewritten = _filter_llama(draft, gguf_path, adapter_dir, budget)
     elif chosen == "mlx":
         model_id = config.base_model or DEFAULT_MLX_MODEL
-        rewritten = _filter_mlx(draft, adapter_dir, model_id, max_tokens, paths=paths)
+        rewritten = _filter_mlx(draft, adapter_dir, model_id, budget, paths=paths)
     elif chosen == "transformers":
         rewritten = _filter_transformers(
-            draft, adapter_dir, config.base_model, max_tokens
+            draft, adapter_dir, config.base_model, budget
         )
     else:
         raise RuntimeError(f"Unknown filter backend: {chosen}")
@@ -500,9 +570,13 @@ def _filter_mlx(
             except Exception:
                 pass
 
-        # Budget enough tokens for multi-paragraph posts; stop markers cut loops.
-        gen_max = min(max_tokens, 480)
-        gen_kwargs: dict = {"max_tokens": gen_max, "verbose": False}
+        # Budget enough tokens for full rewrites (articles need >>512).
+        # Stop markers cut Draft/Rewritten template loops; do not hard-cap below
+        # the caller budget — that truncated ~1k-word articles mid-sentence.
+        gen_kwargs: dict = {
+            "max_tokens": max(64, min(MAX_MAX_TOKENS, int(max_tokens))),
+            "verbose": False,
+        }
         try:
             from mlx_lm.sample_utils import make_sampler
 

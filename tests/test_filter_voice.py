@@ -5,12 +5,16 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from personality_protect.filter import (
+    FILTER_SYSTEM_PROMPT,
+    FILTER_USER_TEMPLATE_INFER,
     build_filter_messages,
     build_filter_user_content,
     extract_rewrite,
     finalize_rewrite,
+    rewrite_quality_flags,
     similarity_guard,
     strip_ai_tells,
+    suggest_max_tokens,
 )
 from personality_protect.sft import SYSTEM_PROMPT, USER_TEMPLATE, USER_TEMPLATE_INFER
 
@@ -71,13 +75,13 @@ def test_filter_user_content_without_reference_still_ends_at_rewritten():
     assert "### My voice (reference)" not in user
     assert user.rstrip().endswith("### Rewritten")
     assert "leverage" in user  # draft preserved; rewrite is model's job
-    # Default inference shape must match SFT (no reference dump to regurgitate)
-    assert user == USER_TEMPLATE_INFER.format(draft="Draft with leverage.")
+    # Inference shape (stronger than train leave-alone) still ends at ### Rewritten
+    assert user == FILTER_USER_TEMPLATE_INFER.format(draft="Draft with leverage.")
     assert "cadence" in user.lower()
 
 
 def test_prompts_preserve_paragraphs_and_allow_leave_alone():
-    """Voice filter must keep paragraph rhythm and not force fidget rewrites."""
+    """Training prompt keeps leave-alone; filter prompt still allows it sparingly."""
     sys_l = SYSTEM_PROMPT.lower()
     assert "paragraph" in sys_l
     assert "unchanged" in sys_l
@@ -90,6 +94,36 @@ def test_prompts_preserve_paragraphs_and_allow_leave_alone():
     assert "unchanged" in user_l
     assert "opener" in user_l or "openings" in user_l
     assert "multi-paragraph" in user_l or "thesaurus" in user_l or "blank lines" in user_l
+
+
+def test_filter_prompt_pushes_past_polished_generic():
+    """Inference must not treat clean Claude drafts as automatic leave-alone."""
+    sys_l = FILTER_SYSTEM_PROMPT.lower()
+    assert "polished" in sys_l or "frontier" in sys_l or "generic" in sys_l
+    assert "truncate" in sys_l or "full draft" in sys_l
+    assert "header" in sys_l
+    user_l = FILTER_USER_TEMPLATE_INFER.lower()
+    assert "throat-clearing" in user_l or "only if" in user_l
+    assert "whole draft" in user_l or "mid-piece" in user_l
+
+
+def test_suggest_max_tokens_scales_for_articles():
+    short = "Short post.\n\nSecond beat."
+    assert suggest_max_tokens(short) == 512
+    article = "x" * 7000  # ~1k-word article size
+    budget = suggest_max_tokens(article)
+    assert budget >= 2500
+    assert budget <= 4096
+    assert suggest_max_tokens(article, override=900) == 900
+    assert suggest_max_tokens(article, override=99999) == 4096
+
+
+def test_rewrite_quality_flags_detect_noop_and_truncation():
+    draft = "One.\n\nTwo.\n\nThree complete sentences here."
+    assert rewrite_quality_flags(draft, draft)["unchanged"] is True
+    cut = "One.\n\nTwo mid"
+    flags = rewrite_quality_flags(draft * 20, cut)
+    assert flags["likely_truncated"] is True
 
 
 def test_strip_ai_tells_preserves_paragraph_breaks():
@@ -158,9 +192,9 @@ def test_similarity_guard_keeps_draft_when_only_reparagraphed():
 def test_filter_messages_default_omits_long_reference():
     """LoRA path: cadence via weights, not pasted corpus blocks."""
     messages = build_filter_messages("We must leverage synergies.")
-    assert messages[0] == {"role": "system", "content": SYSTEM_PROMPT}
+    assert messages[0] == {"role": "system", "content": FILTER_SYSTEM_PROMPT}
     assert "### My voice" not in messages[1]["content"]
-    assert messages[1]["content"] == USER_TEMPLATE_INFER.format(
+    assert messages[1]["content"] == FILTER_USER_TEMPLATE_INFER.format(
         draft="We must leverage synergies."
     )
 
@@ -170,7 +204,7 @@ def test_filter_messages_are_chat_roles():
         "We must leverage synergies.",
         reference="I keep it plain.",
     )
-    assert messages[0] == {"role": "system", "content": SYSTEM_PROMPT}
+    assert messages[0] == {"role": "system", "content": FILTER_SYSTEM_PROMPT}
     assert messages[1]["role"] == "user"
     assert "### Rewritten" in messages[1]["content"]
     assert "I keep it plain." in messages[1]["content"]

@@ -74,10 +74,12 @@ def make_handler(profile: str = DEFAULT_PROFILE) -> type[BaseHTTPRequestHandler]
             try:
                 paths = get_paths(profile)
                 load_config(paths)
+                mt = data.get("max_tokens")
                 rewritten, backend = filter_draft(
                     draft,
                     paths,
                     backend=str(data.get("backend") or "auto"),  # type: ignore[arg-type]
+                    max_tokens=int(mt) if mt is not None else None,
                 )
             except FileNotFoundError as exc:
                 _json_response(self, 404, {"ok": False, "error": str(exc)})
