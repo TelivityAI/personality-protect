@@ -107,19 +107,60 @@ def test_filter_prompt_pushes_past_polished_generic():
     assert "whole draft" in user_l or "mid-piece" in user_l
 
 
-def test_force_prompt_forbids_leave_alone():
+def test_force_prompt_keeps_substance_over_delete():
     from personality_protect.filter import (
         FILTER_SYSTEM_PROMPT_FORCE,
         FILTER_USER_TEMPLATE_FORCE,
         build_filter_messages,
     )
 
-    assert "always rewrite" in FILTER_SYSTEM_PROMPT_FORCE.lower()
-    assert "do not copy" in FILTER_USER_TEMPLATE_FORCE.lower()
+    sys_l = FILTER_SYSTEM_PROMPT_FORCE.lower()
+    assert "never delete" in sys_l or "worse than" in sys_l
+    assert "here's what" in sys_l
+    assert "parallel" in sys_l or "blank lines" in sys_l
+    user_l = FILTER_USER_TEMPLATE_FORCE.lower()
+    assert "load-bearing" in user_l or "argument" in user_l
     msgs = build_filter_messages("Clean polished draft.", force=True)
     assert msgs[0]["content"] == FILTER_SYSTEM_PROMPT_FORCE
-    assert "ALWAYS rewrite" in msgs[1]["content"]
     assert "Clean polished draft." in msgs[1]["content"]
+
+
+def test_substance_guard_rejects_dropped_arguments():
+    from personality_protect.filter import substance_guard
+
+    draft = (
+        "Nothing about the analysis was wrong. Nothing about it was even questioned.\n\n"
+        "What got audited was the texture of the prose.\n\n"
+        "In a previous piece, I argued that compressed thinking gets misread as slop."
+    )
+    # Drops load-bearing sentences + only keeps the middle beat.
+    skinny = "What got audited was the texture of the prose."
+    assert substance_guard(draft, skinny) == draft
+    # Keeps claims, light trim — allowed.
+    kept = (
+        "Nothing about the analysis was wrong. Nothing was even questioned.\n\n"
+        "What got audited was the texture of the prose.\n\n"
+        "In a previous piece, I argued that compressed thinking gets misread as slop."
+    )
+    assert substance_guard(draft, kept) == kept
+
+
+def test_substance_guard_rejects_blank_line_inflation():
+    from personality_protect.filter import substance_guard
+
+    draft = (
+        "Empty prose says little in many words. Dense prose says a lot in few.\n\n"
+        "That parallelism is the point."
+    )
+    split = (
+        "Empty prose says little in many words.\n\n"
+        "Dense prose says a lot in few.\n\n"
+        "That\n\n"
+        "parallelism\n\n"
+        "is\n\n"
+        "the point."
+    )
+    assert substance_guard(draft, split) == draft
 
 
 def test_suggest_max_tokens_scales_for_articles():

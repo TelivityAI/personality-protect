@@ -818,7 +818,11 @@ def filter_cmd(
     if flags["unchanged"]:
         console.print(
             "[yellow]Filter left draft unchanged "
-            "(leave-alone / similarity guard — try --force).[/yellow]"
+            "(leave-alone / similarity / substance guard — try --force).[/yellow]"
+        )
+    if flags.get("substance_loss"):
+        console.print(
+            "[red]Rewrite dropped too much substance — kept draft.[/red]"
         )
     if flags["likely_truncated"]:
         console.print(

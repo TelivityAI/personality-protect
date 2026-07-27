@@ -67,26 +67,32 @@ FILTER_USER_TEMPLATE_INFER = (
 # Force mode: never leave-alone. Adapter was trained to copy "already voice"
 # drafts; polished frontier prose often triggers that path. Force requires a rewrite.
 FILTER_SYSTEM_PROMPT_FORCE = (
-    "Personal voice rewriter. ALWAYS rewrite — never return the draft unchanged. "
-    "Match cadence: short punches, rhetorical bite, contractions, paragraph rhythm. "
-    "Keep meaning and facts. Preserve paragraph breaks and section headers. "
-    "Tighten throat-clearing setups ('Here's what X actually looked like:') into "
-    "verdicts. Cut soft transitions. Prefer your diction over polished-generic clarity. "
+    "Personal voice rewriter. Prefer a real rewrite over a copy — but NEVER delete "
+    "arguments, claims, evidence, or context callbacks (e.g. 'In a previous piece'). "
+    "A pass that removes substance is worse than leaving the draft unchanged. "
+    "Only cut throat-clearing setups and AI filler. Every 'Here's what X…:' line "
+    "must become a short verdict (same rule every time — no skipping). "
+    "Keep meaning and facts. Preserve section headers. "
+    "Do NOT split matched parallel sentences into separate paragraphs just to add "
+    "blank lines — keep intentional pairs/triads together. "
+    "Light diction/cadence trims are enough; do not pad with whitespace. "
     "Strip AI tells (leverage, synergies, delve, robust, In today's fast-paced world, "
     "It is important to note, Moreover, Furthermore, unlock, nestled, testament, "
     "vibrant). No invented facts, hashtags, or emoji unless the voice uses them. "
-    "Never truncate: rewrite the full draft through the final sentence."
+    "Never truncate: cover the full draft through the final sentence."
 )
 
 FILTER_USER_TEMPLATE_FORCE = (
-    "ALWAYS rewrite this in my voice — do not copy the draft. Change cadence and "
-    "diction. Preserve paragraph breaks and section headers. Keep meaning; drop "
-    "throat-clearing and AI filler. Cover the whole draft — do not stop mid-piece.\n\n"
+    "Rewrite in my voice. Cut throat-clearing and AI filler only — keep every "
+    "argument and context beat. Do not drop load-bearing sentences. Do not "
+    "reparagraph just to insert blank lines; keep parallel lines together. "
+    "Tighten 'Here's what X…:' into a verdict every time. Same meaning; full draft.\n\n"
     "### Draft\n{draft}\n\n"
     "### Rewritten"
 )
 
-FILTER_TEMPERATURE_FORCE = 0.7
+# Lower than creative chat: force should trim, not invent or delete.
+FILTER_TEMPERATURE_FORCE = 0.55
 
 
 def suggest_max_tokens(draft: str, *, override: int | None = None) -> int:
@@ -253,18 +259,74 @@ def similarity_guard(
     return rewrite
 
 
-def finalize_rewrite(
-    text: str, *, draft: str | None = None, apply_guard: bool = True
+def substance_guard(
+    draft: str,
+    rewrite: str,
+    *,
+    min_token_keep: float = 0.78,
+    max_extra_breaks: int = 3,
 ) -> str:
-    """Template-echo cut + AI-tell cleanup (+ optional near-identity keep-draft)."""
+    """Reject rewrites that drop arguments or mostly insert blank lines.
+
+    Force/leave-alone similarity guards are separate. This one exists because a
+    voicing pass that deletes load-bearing sentences is worse than a no-op.
+    """
+    draft = (draft or "").strip()
+    rewrite = (rewrite or "").strip()
+    if not draft:
+        return rewrite
+    if not rewrite:
+        return draft
+    if draft == rewrite:
+        return draft
+
+    def _tokens(s: str) -> set[str]:
+        # Skip tiny function words so keep-rate tracks content, not "the/a/of".
+        return {
+            t
+            for t in re.findall(r"[a-z0-9']+", s.lower())
+            if len(t) > 2
+        }
+
+    dt = _tokens(draft)
+    rt = _tokens(rewrite)
+    if dt:
+        keep = len(dt & rt) / len(dt)
+        if keep < min_token_keep:
+            return draft
+
+    draft_words = len(re.findall(r"\b\w+\b", draft))
+    rewrite_words = len(re.findall(r"\b\w+\b", rewrite))
+    draft_breaks = draft.count("\n\n")
+    rewrite_breaks = rewrite.count("\n\n")
+    # Blank-line tic: more paragraph breaks while losing words → keep draft.
+    if (
+        rewrite_breaks > draft_breaks + max_extra_breaks
+        and rewrite_words <= draft_words
+    ):
+        return draft
+    return rewrite
+
+
+def finalize_rewrite(
+    text: str,
+    *,
+    draft: str | None = None,
+    apply_guard: bool = True,
+    apply_substance: bool = True,
+) -> str:
+    """Template-echo cut + AI-tell cleanup (+ optional near-identity / substance)."""
     out = strip_ai_tells(extract_rewrite(text))
-    if apply_guard and draft is not None:
-        out = similarity_guard(draft, out)
+    if draft is not None:
+        if apply_guard:
+            out = similarity_guard(draft, out)
+        if apply_substance:
+            out = substance_guard(draft, out)
     return out
 
 
 def rewrite_quality_flags(draft: str, rewrite: str) -> dict[str, bool | float]:
-    """Detect no-op / likely-truncated filter output for CLI warnings."""
+    """Detect no-op / likely-truncated / substance-loss filter output."""
     draft = (draft or "").strip()
     rewrite = (rewrite or "").strip()
     unchanged = bool(draft) and draft == rewrite
@@ -275,9 +337,11 @@ def rewrite_quality_flags(draft: str, rewrite: str) -> dict[str, bool | float]:
         or (ratio < 0.55 and not ends_clean)
         or (ratio < 0.40)
     )
+    substance_ok = substance_guard(draft, rewrite) == rewrite if rewrite else False
     return {
         "unchanged": unchanged,
         "likely_truncated": likely_truncated,
+        "substance_loss": bool(draft and rewrite and not unchanged and not substance_ok),
         "length_ratio": round(ratio, 3),
     }
 
