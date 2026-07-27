@@ -44,6 +44,7 @@ from personality_protect.eval_compare import (
     resolve_eval_draft,
     run_compare,
     run_eval,
+    specificity_scorecard,
 )
 from personality_protect.filter import (
     filter_draft,
@@ -156,7 +157,7 @@ def main(
         typer.echo("")
         typer.echo(
             "Commands: init | download | ingest | select | train | filter | "
-            "eval | compare | demo | api | logo | status"
+            "eval | compare | scorecard | demo | api | logo | status"
         )
 
 
@@ -871,6 +872,54 @@ def filter_cmd(
         out.write_text(rewritten + "\n", encoding="utf-8")
         console.print(f"[dim]wrote {out}[/dim]")
     console.print(rewritten)
+
+
+@app.command("scorecard")
+def scorecard_cmd(
+    ctx: typer.Context,
+    text: Optional[str] = typer.Option(None, "--text", help="Draft text to score."),
+    file: Optional[Path] = typer.Option(None, "--file", help="Read draft from file."),
+    synthetic: Optional[str] = typer.Option(
+        None,
+        "--synthetic",
+        help="Packaged synthetic draft stem (see data/evals/).",
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Gate a draft on specificity before voicing (no model call).
+
+    Checks proper nouns / numbers / sentence & line shape / you>I.
+    A voice filter cannot insert named entities or benchmarks — fail here.
+    """
+    _banner_from_ctx(ctx, json_mode=as_json)
+    try:
+        draft, label = resolve_eval_draft(text=text, file=file, synthetic=synthetic)
+    except (ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+
+    card = specificity_scorecard(draft)
+    card["label"] = label
+    if as_json:
+        typer.echo(json.dumps(card, indent=2, ensure_ascii=False))
+        raise typer.Exit(0 if card["pass"] else 1)
+
+    console.print(f"[bold]Scorecard[/bold] label={label} words={card['words']}")
+    console.print(
+        f"proper_nouns/1k={card['proper_nouns_per_1k']} "
+        f"numbers/1k={card['numbers_per_1k']} "
+        f"median_sentence={card['median_sentence_words']} "
+        f"short_line_ratio={card['short_line_ratio']} "
+        f"you={card['you_count']} i={card['i_count']}"
+    )
+    if card["pass"]:
+        console.print("[green]PASS[/green] — draft clears specificity gates.")
+    else:
+        console.print(
+            f"[red]FAIL[/red] — {', '.join(card['failed'])}. "
+            "Do not voice yet; fix the drafter/brief."
+        )
+        raise typer.Exit(1)
 
 
 @app.command("eval")
