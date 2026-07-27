@@ -647,16 +647,23 @@ def test_filter_draft_short_stays_singleshot(tmp_path):
 
 def test_novelty_guard_rejects_invented_vocabulary():
     from personality_protect.filter import (
+        FILTER_CHUNK_THRESHOLD,
         introduced_vocabulary,
         novelty_guard,
         novelty_too_high,
         strip_ai_tells,
     )
 
-    draft = (
-        "Contoso audits punish compressed thinking as low effort.\n\n"
-        "Northwind scores warmth like substance."
+    # Article-shaped draft (over chunk threshold) — subtractive novelty applies.
+    body = "\n\n".join(
+        f"Contoso Labs memo section {i} argues that Northwind must evaluate "
+        f"texture as carefully as substance when reviewing workplace writing."
+        for i in range(12)
     )
+    draft = (
+        "Contoso audits punish compressed thinking as low effort.\n\n" + body
+    )
+    assert len(draft) > FILTER_CHUNK_THRESHOLD
     generative = (
         draft
         + "\n\nWrite with some spine instead of packaging your thoughts in bandages.\n"
@@ -674,6 +681,48 @@ def test_novelty_guard_rejects_invented_vocabulary():
     assert "leverage" not in cleaned.lower()
     assert novelty_too_high(slop, cleaned) is False
     assert introduced_vocabulary(slop, cleaned) == []
+
+
+def test_novelty_guard_skips_slop_and_soulless_voice_rewrites():
+    """Slop→voice / clean→voice must introduce diction; novelty must not revert."""
+    from personality_protect.eval_compare import slop_score
+    from personality_protect.filter import (
+        apply_voice_postprocess,
+        novelty_applies,
+        novelty_guard,
+        novelty_too_high,
+    )
+
+    slop = (
+        "In today's fast-paced digital world, it is important to note that Contoso "
+        "must leverage robust synergies across every channel. Moreover, furthermore, "
+        "unlocking nestled opportunities is a testament to vibrant innovation.\n\n"
+        "Furthermore, leaders should delve into authentic storytelling frameworks."
+    )
+    voice = (
+        "Contoso keeps dressing empty work in familiar padding.\n\n"
+        "The audit rewards the performance.\n\n"
+        "Ship the take or stay quiet."
+    )
+    assert novelty_applies(slop) is False
+    assert novelty_too_high(slop, voice) is False
+    assert novelty_guard(slop, voice) == voice
+    out = apply_voice_postprocess(voice, draft=slop)
+    assert "leverage" not in out.lower()
+    assert "ship the take" in out.lower()
+    assert slop_score(out) < slop_score(slop)
+
+    clean = (
+        "Personal branding is increasingly essential as AI systems appear across "
+        "every channel. Organizations require a distinct perspective."
+    )
+    clean_voice = (
+        "Personal branding is noise when the take is empty.\n\n"
+        "Say something that costs you something."
+    )
+    assert novelty_applies(clean) is False
+    assert novelty_too_high(clean, clean_voice) is False
+    assert novelty_guard(clean, clean_voice) == clean_voice
 
 
 def test_strip_capitalizes_orphan_after_problem_cut():

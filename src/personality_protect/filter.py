@@ -182,6 +182,23 @@ NOVELTY_MAX_NEW_WORDS = 10
 NOVELTY_MAX_NEW_FRAC = 0.03
 
 
+def novelty_applies(draft: str) -> bool:
+    """Novelty kill-switch is for subtractive polish of real prose only.
+
+    Article-length drafts always apply (generative trash / whoeres-in-the-fog).
+    Short slop→voice and clean→voice must introduce diction — skip there
+    (otherwise compare lora=10: real rewrite reverted to Contoso mush).
+    """
+    draft = (draft or "").strip()
+    if not draft:
+        return False
+    if len(draft) > FILTER_CHUNK_THRESHOLD:
+        return True
+    if draft_looks_sloppy(draft) or draft_looks_soulless(draft):
+        return False
+    return True
+
+
 def novelty_too_high(
     draft: str,
     rewrite: str,
@@ -189,10 +206,12 @@ def novelty_too_high(
     max_new_words: int = NOVELTY_MAX_NEW_WORDS,
     max_new_frac: float = NOVELTY_MAX_NEW_FRAC,
 ) -> bool:
-    """True when rewrite introduces too many words absent from the draft."""
+    """True when rewrite invents too much on a draft that should stay subtractive."""
     draft = (draft or "").strip()
     rewrite = (rewrite or "").strip()
     if not draft or not rewrite or draft == rewrite:
+        return False
+    if not novelty_applies(draft):
         return False
     new_n = len(introduced_vocabulary(draft, rewrite))
     if new_n > int(max_new_words):
