@@ -89,12 +89,14 @@ def _word_set(text: str) -> set[str]:
 
 
 # Draft specificity gates (pre-voice). A filter cannot insert named entities or
-# benchmarks — fail cheap at draft time. Thresholds match operator scorecards
-# on real longform (not cadence taste).
-SCORECARD_MIN_PROPER_PER_1K = 80.0
-SCORECARD_MIN_NUMBERS_PER_1K = 15.0
-SCORECARD_MAX_MEDIAN_SENTENCE = 8.0
-SCORECARD_MIN_SHORT_LINE_RATIO = 0.45
+# benchmarks — fail cheap at draft time.
+#
+# Hard FAIL floors are calibrated to the floor of a real 12-article corpus
+# (proper 50.3–167.6 /1k, numbers 6.6–86.1 /1k). Mean-based gates rejected the
+# author's own work. Median sentence / short-line / you>I vary by piece and are
+# advisory only — never FAIL.
+SCORECARD_MIN_PROPER_PER_1K = 48.0
+SCORECARD_MIN_NUMBERS_PER_1K = 5.0
 
 _COMMON_CAPS = frozenset(
     {
@@ -243,13 +245,12 @@ def specificity_scorecard(
     *,
     min_proper_per_1k: float = SCORECARD_MIN_PROPER_PER_1K,
     min_numbers_per_1k: float = SCORECARD_MIN_NUMBERS_PER_1K,
-    max_median_sentence: float = SCORECARD_MAX_MEDIAN_SENTENCE,
-    min_short_line_ratio: float = SCORECARD_MIN_SHORT_LINE_RATIO,
 ) -> dict[str, Any]:
     """Deterministic draft gate: specificity before any voice filter.
 
-    Pass when proper nouns, numbers, sentence/line shape, and you>I clear
-    thresholds. A voice filter cannot insert Travelport or a benchmark table.
+    Hard FAIL: proper nouns /1k and numbers /1k at corpus floors.
+    Advisory only (never FAIL): median sentence, short-line ratio, you vs I.
+    A voice filter cannot insert named entities or a benchmark table.
     """
     body = (text or "").strip()
     words = _word_tokens(body)
@@ -279,31 +280,35 @@ def specificity_scorecard(
     checks = {
         "proper_nouns_per_1k": proper_1k >= float(min_proper_per_1k),
         "numbers_per_1k": numbers_1k >= float(min_numbers_per_1k),
-        "median_sentence": median_sent <= float(max_median_sentence) and median_sent > 0,
-        "short_line_ratio": short_line_ratio >= float(min_short_line_ratio),
-        "you_gt_i": you_n > i_n,
     }
     failed = [k for k, ok in checks.items() if not ok]
-    return {
-        "words": len(words),
-        "proper_nouns": proper,
-        "numbers": numbers,
-        "proper_nouns_per_1k": round(proper_1k, 2),
-        "numbers_per_1k": round(numbers_1k, 2),
+    advisory = {
         "median_sentence_words": round(median_sent, 2),
         "short_line_ratio": round(short_line_ratio, 4),
         "you_count": you_n,
         "i_count": i_n,
         "you_per_1k": round(you_1k, 2),
         "i_per_1k": round(i_1k, 2),
+        "you_gt_i": you_n > i_n,
+    }
+    return {
+        "words": len(words),
+        "proper_nouns": proper,
+        "numbers": numbers,
+        "proper_nouns_per_1k": round(proper_1k, 2),
+        "numbers_per_1k": round(numbers_1k, 2),
+        "median_sentence_words": advisory["median_sentence_words"],
+        "short_line_ratio": advisory["short_line_ratio"],
+        "you_count": you_n,
+        "i_count": i_n,
+        "you_per_1k": advisory["you_per_1k"],
+        "i_per_1k": advisory["i_per_1k"],
         "thresholds": {
             "min_proper_per_1k": min_proper_per_1k,
             "min_numbers_per_1k": min_numbers_per_1k,
-            "max_median_sentence": max_median_sentence,
-            "min_short_line_ratio": min_short_line_ratio,
-            "you_gt_i": True,
         },
         "checks": checks,
+        "advisory": advisory,
         "failed": failed,
         "pass": len(failed) == 0,
     }
