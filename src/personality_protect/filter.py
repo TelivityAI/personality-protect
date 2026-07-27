@@ -96,6 +96,37 @@ FILTER_USER_TEMPLATE_FORCE = (
 
 # Round-2-like trim energy without chaotic deletes.
 FILTER_TEMPERATURE_FORCE = 0.6
+# Chunked longform: stronger rewrite pressure + reject near-copy windows.
+FILTER_CHUNK_MAX_ATTEMPTS = 4
+FILTER_TEMPERATURE_CHUNK = 0.55
+FILTER_TEMPERATURE_CHUNK_RETRY = 0.8
+
+# Chunk windows: demand a real diction/cadence rewrite (not light-force near-copy).
+FILTER_SYSTEM_PROMPT_CHUNK = (
+    "Personal voice rewriter. Match cadence: short punches, rhetorical bite, "
+    "contractions, paragraph rhythm — not generic clean prose. Keep meaning. "
+    "Preserve paragraph breaks; never flatten multi-paragraph drafts. "
+    "You MUST change diction and cadence for this window — a near-copy or "
+    "blank-line-only reparagraph is a failure. "
+    "Polished frontier prose is NOT automatically your voice. "
+    "Strip AI tells (leverage, synergies, delve, robust, In today's fast-paced world, "
+    "It is important to note, Moreover, Furthermore, unlock, nestled, testament, "
+    "vibrant). No invented facts, hashtags, or emoji unless the voice uses them. "
+    "Never truncate: rewrite the full window through the final sentence."
+)
+
+FILTER_USER_TEMPLATE_CHUNK = (
+    "Rewrite this window in my voice. Change diction and cadence — do not return "
+    "a near-copy or blank-line reparagraph. Preserve paragraph breaks and section "
+    "headers. Keep meaning and facts; drop AI filler. Cover the whole window.\n\n"
+    "### Draft\n{draft}\n\n"
+    "### Rewritten"
+)
+
+FILTER_CHUNK_RETRY_NUDGE = (
+    "Previous output was a near-copy or blank-line reparagraph. "
+    "Rewrite again with different diction and cadence. Same meaning; not a copy."
+)
 
 # Deterministic scaffolding cuts (not LLM judgment).
 # Empty-promise throat-clearing only ("Here's what X looked like:").
@@ -273,17 +304,85 @@ def should_chunk_filter(
     return len((draft or "").strip()) > int(threshold)
 
 
-def filter_system_prompt(*, force: bool = False) -> str:
+def rewrite_is_near_noop(draft: str, rewrite: str) -> bool:
+    """True when rewrite is near-copy or blank-line-only vs draft.
+
+    Same gates as ``longform_metrics`` — used to reject per-chunk copy-through.
+    """
+    draft = (draft or "").strip()
+    rewrite = (rewrite or "").strip()
+    if not draft:
+        return False
+    if not rewrite:
+        return True
+    d_len = max(1, len(draft))
+    ratio = len(rewrite) / d_len
+    dw = set(re.findall(r"[a-z0-9']+", draft.lower()))
+    rw = set(re.findall(r"[a-z0-9']+", rewrite.lower()))
+    overlap = len(dw & rw) / max(1, len(dw))
+    near_copy = 0.92 <= ratio <= 1.08 and overlap >= 0.92
+    draft_flat = re.sub(r"\s+", " ", draft)
+    re_flat = re.sub(r"\s+", " ", rewrite)
+
+    def _paras(t: str) -> int:
+        return len([p for p in re.split(r"\n\s*\n", t) if p.strip()])
+
+    blank_line_only = draft_flat == re_flat or (
+        overlap >= 0.97
+        and _paras(rewrite) > _paras(draft)
+        and abs(ratio - 1.0) < 0.05
+    )
+    return bool(near_copy or blank_line_only)
+
+
+def accept_chunk_rewrite(
+    window: str,
+    generate,
+    *,
+    max_attempts: int = FILTER_CHUNK_MAX_ATTEMPTS,
+) -> str:
+    """Generate a chunk rewrite; reject near-noop outputs and retry (bounded).
+
+    ``generate(window, attempt)`` returns raw model text for attempt 0..N-1.
+    """
+    window = (window or "").strip()
+    if not window:
+        return ""
+    best = ""
+    attempts = max(1, int(max_attempts))
+    for attempt in range(attempts):
+        raw = generate(window, attempt)
+        piece = finalize_rewrite(str(raw or ""), draft=window, apply_guard=False)
+        piece = (piece or "").strip() or window
+        best = piece
+        if not rewrite_is_near_noop(window, piece):
+            return piece
+    return best
+
+
+def filter_system_prompt(*, force: bool = False, chunk: bool = False) -> str:
+    if chunk:
+        return FILTER_SYSTEM_PROMPT_CHUNK
     return FILTER_SYSTEM_PROMPT_FORCE if force else FILTER_SYSTEM_PROMPT
 
 
 def build_filter_user_content(
-    draft: str, *, reference: str | None = None, force: bool = False
+    draft: str,
+    *,
+    reference: str | None = None,
+    force: bool = False,
+    chunk: bool = False,
+    chunk_retry: int = 0,
 ) -> str:
     """User turn matching SFT shape so LoRA completes a rewrite, not a template loop."""
     draft = draft.strip()
     if reference and reference.strip():
         return USER_TEMPLATE.format(draft=draft, reference=reference.strip())
+    if chunk:
+        user = FILTER_USER_TEMPLATE_CHUNK.format(draft=draft)
+        if chunk_retry > 0:
+            user = FILTER_CHUNK_RETRY_NUDGE + "\n\n" + user
+        return user
     if force:
         return FILTER_USER_TEMPLATE_FORCE.format(draft=draft)
     return FILTER_USER_TEMPLATE_INFER.format(draft=draft)
@@ -295,14 +394,22 @@ def build_filter_messages(
     reference: str | None = None,
     few_shot: str | None = None,
     force: bool = False,
+    chunk: bool = False,
+    chunk_retry: int = 0,
 ) -> list[dict[str, str]]:
     """Chat messages aligned with SFT training (system + user)."""
-    user = build_filter_user_content(draft, reference=reference, force=force)
+    user = build_filter_user_content(
+        draft,
+        reference=reference,
+        force=force,
+        chunk=chunk,
+        chunk_retry=chunk_retry,
+    )
     if few_shot and few_shot.strip() and not (reference and reference.strip()):
         # Receipts / baseline: inject few-shot above the draft block.
         user = few_shot.strip() + "\n\n" + user
     return [
-        {"role": "system", "content": filter_system_prompt(force=force)},
+        {"role": "system", "content": filter_system_prompt(force=force, chunk=chunk)},
         {"role": "user", "content": user},
     ]
 
@@ -313,10 +420,17 @@ def build_filter_prompt(
     few_shot: str | None = None,
     reference: str | None = None,
     force: bool = False,
+    chunk: bool = False,
+    chunk_retry: int = 0,
 ) -> str:
     """Flat prompt for backends without chat templates (and compare receipts)."""
     messages = build_filter_messages(
-        draft, reference=reference, few_shot=few_shot, force=force
+        draft,
+        reference=reference,
+        few_shot=few_shot,
+        force=force,
+        chunk=chunk,
+        chunk_retry=chunk_retry,
     )
     parts = [messages[0]["content"], "", messages[1]["content"]]
     # Ensure trailing newline after ### Rewritten so generation continues cleanly.
@@ -864,8 +978,8 @@ def filter_draft(
     use_chunk = should_chunk_filter(draft) if chunk is None else bool(chunk)
     windows = paragraph_windows(draft) if use_chunk else [draft]
     if use_chunk and len(windows) > 1:
-        # Longform: strong rewrite prompts per window; never leave-alone freeze.
-        # (force prompts are too light and yield blank-line near-copies.)
+        # Longform: force rewrite per window; reject near-copy with bounded retries.
+        # (Short-draft light-force prompts stay off this path — they near-copy.)
         rewritten = _filter_draft_chunked(
             draft,
             windows,
@@ -874,7 +988,6 @@ def filter_draft(
             config=config,
             chosen=chosen,
             gguf=gguf,
-            force=False,
             max_tokens=max_tokens,
         )
         return rewritten, chosen
@@ -934,21 +1047,19 @@ def _filter_draft_chunked(
     config,
     chosen: str,
     gguf: Path | None,
-    force: bool,
     max_tokens: int | None,
 ) -> str:
     """Filter paragraph windows and stitch; scaffolding/substance on full text.
 
-    Chunked longform always skips per-window similarity leave-alone (polished
-    Claude windows would otherwise freeze). Prompts stay on the strong rewrite
-    path (``force=False``) so we do not get blank-line-only near-copies.
+    Each window is force-rewritten with chunk prompts. Near-copy / blank-line-only
+    outputs are rejected and retried (bounded). Short-draft light-force prompts
+    are not used here — they encourage near-noop reparagraphs.
     """
     # Per-chunk budget from window size (not full article).
     piece_budget = suggest_max_tokens("x" * FILTER_CHUNK_MAX_CHARS)
     if max_tokens is not None:
         # Honor explicit smaller caps; ignore huge full-article budgets.
         piece_budget = min(piece_budget, max(64, int(max_tokens)))
-    attempts = 3 if chosen != "mock" else 1
     rewrites: list[str]
 
     if chosen == "mlx":
@@ -959,15 +1070,23 @@ def _filter_draft_chunked(
             model_id,
             piece_budget,
             paths=paths,
-            force=force,
+            force=False,
+            chunk=True,
             apply_guard=False,
-            attempts=attempts,
+            reject_near_copy=True,
+            attempts=FILTER_CHUNK_MAX_ATTEMPTS,
         )
     else:
         rewrites = []
         for window in windows:
+            window = (window or "").strip()
+            if not window:
+                continue
             if chosen == "mock":
-                piece = _filter_mock(window, adapter_dir)
+                piece = accept_chunk_rewrite(
+                    window,
+                    lambda w, _attempt: _filter_mock(w, adapter_dir),
+                )
             elif chosen == "llama":
                 gguf_path = resolve_gguf_path(
                     paths, filename=config.gguf_file, explicit=gguf
@@ -982,22 +1101,24 @@ def _filter_draft_chunked(
                     gguf_path,
                     adapter_dir,
                     piece_budget,
-                    force=force,
-                    attempts=attempts,
+                    force=False,
+                    chunk=True,
+                    apply_guard=False,
+                    reject_near_copy=True,
+                    attempts=FILTER_CHUNK_MAX_ATTEMPTS,
                 )
-                # llama finalize used apply_guard=not force; force=False would
-                # leave-alone freeze — re-run finalize without guard.
-                piece = finalize_rewrite(piece, draft=window, apply_guard=False)
             elif chosen == "transformers":
                 piece = _filter_transformers(
                     window,
                     adapter_dir,
                     config.base_model,
                     piece_budget,
-                    force=force,
-                    attempts=attempts,
+                    force=False,
+                    chunk=True,
+                    apply_guard=False,
+                    reject_near_copy=True,
+                    attempts=FILTER_CHUNK_MAX_ATTEMPTS,
                 )
-                piece = finalize_rewrite(piece, draft=window, apply_guard=False)
             else:
                 raise RuntimeError(f"Unknown filter backend: {chosen}")
             rewrites.append(piece.strip() or window)
@@ -1057,6 +1178,9 @@ def _filter_llama(
     max_tokens: int,
     *,
     force: bool = False,
+    chunk: bool = False,
+    apply_guard: bool | None = None,
+    reject_near_copy: bool = False,
     attempts: int = 1,
 ) -> str:
     try:
@@ -1068,8 +1192,6 @@ def _filter_llama(
             "or use --backend mlx|mock"
         ) from exc
 
-    # Prefer chat-aligned user content; paths not available here — no reference.
-    prompt = build_filter_prompt(draft, force=force)
     # Optional GGUF LoRA if present next to adapter
     lora_path = None
     for name in ("adapter.gguf", "lora.gguf"):
@@ -1086,21 +1208,39 @@ def _filter_llama(
     if lora_path:
         kwargs["lora_path"] = lora_path
 
-    temp = FILTER_TEMPERATURE_FORCE if force else FILTER_TEMPERATURE
+    if chunk:
+        temp = FILTER_TEMPERATURE_CHUNK
+    elif force:
+        temp = FILTER_TEMPERATURE_FORCE
+    else:
+        temp = FILTER_TEMPERATURE
+    guard = (not force) if apply_guard is None else bool(apply_guard)
     llm = Llama(**kwargs)
     draft_s = draft.strip()
     best = ""
-    for _ in range(max(1, attempts)):
+    for attempt in range(max(1, attempts)):
+        prompt = build_filter_prompt(
+            draft, force=force, chunk=chunk, chunk_retry=attempt if reject_near_copy else 0
+        )
+        use_temp = (
+            FILTER_TEMPERATURE_CHUNK_RETRY
+            if (reject_near_copy and attempt > 0)
+            else temp
+        )
         out = llm(
             prompt,
             max_tokens=max_tokens,
-            temperature=temp,
+            temperature=use_temp,
             top_p=FILTER_TOP_P,
             repeat_penalty=FILTER_REPEAT_PENALTY,
             stop=list(FILTER_STOP),
         )
         text = out["choices"][0]["text"] if out.get("choices") else str(out)
-        best = finalize_rewrite(str(text), draft=draft, apply_guard=not force)
+        best = finalize_rewrite(str(text), draft=draft, apply_guard=guard)
+        if reject_near_copy:
+            if best.strip() and not rewrite_is_near_noop(draft_s, best):
+                break
+            continue
         if not force or (best.strip() and best.strip() != draft_s):
             break
     return best
@@ -1142,7 +1282,9 @@ def _filter_mlx_chunks(
     use_adapter: bool = True,
     few_shot: str | None = None,
     force: bool = False,
+    chunk: bool = False,
     apply_guard: bool | None = None,
+    reject_near_copy: bool = False,
     attempts: int = 1,
 ) -> list[str]:
     """Rewrite one or more draft windows with a single MLX model load."""
@@ -1150,7 +1292,8 @@ def _filter_mlx_chunks(
     # Python on a 48GB Mac. Cap BEFORE importing/loading. Default ≤16 GB.
     from personality_protect.mlx_runtime import ensure_mlx_wired_cap, release_mlx_memory
 
-    ensure_mlx_wired_cap(memory_gb=16.0)
+    # None → honor PP_MLX_MEMORY_GB / default 16GB cap (never sandbox MLX).
+    ensure_mlx_wired_cap(memory_gb=None)
     guard = (not force) if apply_guard is None else bool(apply_guard)
 
     try:
@@ -1174,37 +1317,56 @@ def _filter_mlx_chunks(
             except Exception:
                 pass
 
-        temp = FILTER_TEMPERATURE_FORCE if force else FILTER_TEMPERATURE
+        if chunk:
+            base_temp = FILTER_TEMPERATURE_CHUNK
+        elif force:
+            base_temp = FILTER_TEMPERATURE_FORCE
+        else:
+            base_temp = FILTER_TEMPERATURE
         out_chunks: list[str] = []
         for draft in drafts:
             draft = (draft or "").strip()
             if not draft:
                 out_chunks.append("")
                 continue
-            # Do NOT paste a long SFT assistant snippet as "### My voice (reference)":
-            # weak adapters regurgitate that corpus block instead of rewriting the draft.
-            messages = build_filter_messages(
-                draft, reference=None, few_shot=few_shot, force=force
-            )
-            if getattr(tokenizer, "has_chat_template", False) or getattr(
-                tokenizer, "chat_template", None
-            ):
-                # Qwen3 defaults enable_thinking=True; that burns tokens on meta
-                # "Thinking Process" and never returns a clean rewrite.
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
-            else:
-                prompt = build_filter_prompt(
-                    draft, reference=None, few_shot=few_shot, force=force
-                )
 
             draft_s = draft
             best = ""
-            for _ in range(max(1, attempts)):
+            for attempt in range(max(1, attempts)):
+                messages = build_filter_messages(
+                    draft,
+                    reference=None,
+                    few_shot=few_shot,
+                    force=force,
+                    chunk=chunk,
+                    chunk_retry=attempt if reject_near_copy else 0,
+                )
+                if getattr(tokenizer, "has_chat_template", False) or getattr(
+                    tokenizer, "chat_template", None
+                ):
+                    # Qwen3 defaults enable_thinking=True; that burns tokens on meta
+                    # "Thinking Process" and never returns a clean rewrite.
+                    prompt = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                else:
+                    prompt = build_filter_prompt(
+                        draft,
+                        reference=None,
+                        few_shot=few_shot,
+                        force=force,
+                        chunk=chunk,
+                        chunk_retry=attempt if reject_near_copy else 0,
+                    )
+
+                use_temp = (
+                    FILTER_TEMPERATURE_CHUNK_RETRY
+                    if (reject_near_copy and attempt > 0)
+                    else base_temp
+                )
                 gen_kwargs: dict = {
                     "max_tokens": max(64, min(MAX_MAX_TOKENS, int(max_tokens))),
                     "verbose": False,
@@ -1212,11 +1374,17 @@ def _filter_mlx_chunks(
                 try:
                     from mlx_lm.sample_utils import make_sampler
 
-                    gen_kwargs["sampler"] = make_sampler(temp=temp, top_p=FILTER_TOP_P)
+                    gen_kwargs["sampler"] = make_sampler(
+                        temp=use_temp, top_p=FILTER_TOP_P
+                    )
                 except Exception:
                     pass
                 out = generate(model, tokenizer, prompt=prompt, **gen_kwargs)
                 best = finalize_rewrite(str(out), draft=draft, apply_guard=guard)
+                if reject_near_copy:
+                    if best.strip() and not rewrite_is_near_noop(draft_s, best):
+                        break
+                    continue
                 if best.strip() and best.strip() != draft_s:
                     # Prefer a real rewrite over copy-through when retrying.
                     break
@@ -1251,6 +1419,7 @@ def mlx_prompt_baseline(
         few_shot=few_shot,
     )
 
+
 def _filter_transformers(
     draft: str,
     adapter_dir: Path,
@@ -1258,6 +1427,9 @@ def _filter_transformers(
     max_tokens: int,
     *,
     force: bool = False,
+    chunk: bool = False,
+    apply_guard: bool | None = None,
+    reject_near_copy: bool = False,
     attempts: int = 1,
 ) -> str:
     try:
@@ -1291,26 +1463,43 @@ def _filter_transformers(
         model = PeftModel.from_pretrained(model, str(adapter_dir))
     model.eval()
 
-    prompt = build_filter_prompt(draft, force=force)
-    temp = FILTER_TEMPERATURE_FORCE if force else FILTER_TEMPERATURE
-    inputs = tokenizer(prompt, return_tensors="pt")
-    if torch.cuda.is_available():
-        inputs = {k: v.cuda() for k, v in inputs.items()}
+    if chunk:
+        temp = FILTER_TEMPERATURE_CHUNK
+    elif force:
+        temp = FILTER_TEMPERATURE_FORCE
+    else:
+        temp = FILTER_TEMPERATURE
+    guard = (not force) if apply_guard is None else bool(apply_guard)
     draft_s = draft.strip()
     best = ""
-    for _ in range(max(1, attempts)):
+    for attempt in range(max(1, attempts)):
+        prompt = build_filter_prompt(
+            draft, force=force, chunk=chunk, chunk_retry=attempt if reject_near_copy else 0
+        )
+        use_temp = (
+            FILTER_TEMPERATURE_CHUNK_RETRY
+            if (reject_near_copy and attempt > 0)
+            else temp
+        )
+        inputs = tokenizer(prompt, return_tensors="pt")
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
         with torch.no_grad():
             output = model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
                 do_sample=True,
-                temperature=temp,
+                temperature=use_temp,
                 top_p=FILTER_TOP_P,
             )
         text = tokenizer.decode(output[0], skip_special_tokens=True)
         if "### Rewritten" in text:
             text = text.split("### Rewritten", 1)[1].strip()
-        best = finalize_rewrite(text, draft=draft, apply_guard=not force)
+        best = finalize_rewrite(text, draft=draft, apply_guard=guard)
+        if reject_near_copy:
+            if best.strip() and not rewrite_is_near_noop(draft_s, best):
+                break
+            continue
         if not force or (best.strip() and best.strip() != draft_s):
             break
     return best

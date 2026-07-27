@@ -686,3 +686,120 @@ def test_filter_draft_long_auto_chunks_and_rewrites(tmp_path):
     assert metrics["blank_line_only_noop"] is False
     assert "Cut the fog" in out
     assert "\n\n" in out
+
+
+def test_rewrite_is_near_noop_matches_longform_gates():
+    from personality_protect.eval_compare import longform_metrics
+    from personality_protect.filter import rewrite_is_near_noop
+
+    draft = (
+        "Contoso Labs audits punish compressed thinking as low effort.\n\n"
+        "Northwind scores warmth like substance and trains polished indecision."
+    )
+    # Exact / whitespace-only → noop
+    assert rewrite_is_near_noop(draft, draft) is True
+    assert rewrite_is_near_noop(draft, draft.replace("\n\n", "\n\n\n")) is True
+    # Real diction rewrite → accept
+    rewritten = (
+        "Contoso's audit treats short thinking as laziness.\n\n"
+        "Northwind grades tone instead of substance, then rewards fog."
+    )
+    assert rewrite_is_near_noop(draft, rewritten) is False
+    m = longform_metrics(draft, rewritten)
+    assert m["near_copy"] is False
+    assert m["blank_line_only_noop"] is False
+
+
+def test_filter_draft_chunk_rejects_near_copy_and_retries(tmp_path):
+    """Per-window near-copy outputs are rejected; bounded retries until a real rewrite."""
+    from personality_protect.config import get_paths
+    from personality_protect.demo import run_demo
+    from personality_protect.eval_compare import longform_metrics
+    from personality_protect.filter import filter_draft
+
+    run_demo(home=tmp_path)
+    paths = get_paths("demo", home=tmp_path)
+
+    body = []
+    for i in range(12):
+        body.append(
+            f"Contoso Labs memo section {i} argues that Northwind must evaluate "
+            f"texture as carefully as substance when reviewing workplace writing."
+        )
+    draft = (
+        "Here's the problem: Contoso audits punish compressed thinking.\n\n"
+        + "\n\n".join(body)
+        + "\n\nHere's the part that should genuinely bother anyone running these audits.\n\n"
+        "Northwind will keep publishing polished indecision at greater volume."
+    )
+    assert len(draft) > 1600
+
+    # Per window: first two attempts near-copy (reparagraph), then real rewrite.
+    attempts_by_window: dict[str, int] = {}
+
+    def fake_mock(d: str, _adapter_dir):
+        key = d.strip()
+        n = attempts_by_window.get(key, 0) + 1
+        attempts_by_window[key] = n
+        if n < 3:
+            # Near-copy: same words, extra blank line only.
+            return key.replace("\n\n", "\n\n\n") if "\n\n" in key else key + "\n"
+        return (
+            key.replace("argues that", "says")
+            .replace("must evaluate", "should judge")
+            .replace("Here's the problem:", "")
+            .replace(
+                "Here's the part that should genuinely bother anyone running these audits.",
+                "",
+            )
+            .strip()
+            + " Cut the fog."
+        )
+
+    with patch("personality_protect.filter._filter_mock", side_effect=fake_mock):
+        out, used = filter_draft(draft, paths, backend="mock", force=True)
+
+    assert used == "mock"
+    assert attempts_by_window
+    # Non-scaffolding windows need 3 attempts; scaffolding windows may accept
+    # early once strip_voice_scaffolding creates a real delta.
+    assert max(attempts_by_window.values()) == 3
+    assert sum(attempts_by_window.values()) > len(attempts_by_window)
+    assert "Here's the problem" not in out
+    assert "Here's the part that should genuinely bother" not in out
+    metrics = longform_metrics(draft, out)
+    assert metrics["near_copy"] is False
+    assert metrics["blank_line_only_noop"] is False
+    assert metrics["pipeline_pass"] is True
+    assert "Cut the fog" in out
+
+
+def test_filter_draft_short_leave_alone_still_single_shot(tmp_path):
+    """Short already-voice drafts stay leave-alone; chunk reject/retry must not fire."""
+    from personality_protect.config import get_paths
+    from personality_protect.demo import run_demo
+    from personality_protect.filter import filter_draft
+
+    run_demo(home=tmp_path)
+    paths = get_paths("demo", home=tmp_path)
+    draft = (
+        "These questions keep popping up every time Contoso ships another take.\n\n"
+        "How much of the lab revenue is the first pass?\n\n"
+        "How much is the next forty prompts cleaning up what that first pass produced?\n\n"
+        "Who owns the mess when the demo looks clean and the codebase does not?\n\n"
+        "What happens when the manager wants polish and the engineer wants signal?\n\n"
+        "Where does the bill land when everyone calls it productivity?\n\n"
+        "And why does the write-up always sound finished before the thinking does?"
+    )
+    calls: list[str] = []
+
+    def fake_mock(d: str, _adapter_dir):
+        calls.append(d)
+        return d + "\n\n(should not run)"
+
+    with patch("personality_protect.filter._filter_mock", side_effect=fake_mock):
+        out, used = filter_draft(draft, paths, backend="mock")
+
+    assert used == "mock"
+    assert calls == []  # leave-alone before model
+    assert out.strip() == draft.strip()
