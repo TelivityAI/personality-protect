@@ -126,6 +126,8 @@ def strip_voice_scaffolding(text: str) -> str:
     body = _COLON_DIDNT_SEE_LINE_RE.sub("", body)
     body = _THAT_PART_WORTH_RE.sub("", body)
     body = _THAT_PART_PEOPLE_RE.sub("That's what people", body)
+    # Mid-sentence cuts can glue the next sentence onto the previous period.
+    body = re.sub(r"([.!?])([A-Za-z])", r"\1 \2", body)
     body = re.sub(r"\n{3,}", "\n\n", body)
     body = re.sub(r"[^\S\n]{2,}", " ", body)
     body = re.sub(r"[ \t]+\n", "\n", body)

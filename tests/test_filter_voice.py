@@ -134,6 +134,7 @@ def test_strip_voice_scaffolding_cuts_known_patterns():
         "Here's what those 6 weeks actually looked like:\n\n"
         "Eight people in every session.\n\n"
         "Nobody was aligning on quality. That's the part worth being honest about.\n\n"
+        "The loop existed to protect two things.\n\n"
         "That's the part people miss about disagree and commit."
     )
     out = strip_voice_scaffolding(text)
@@ -141,6 +142,9 @@ def test_strip_voice_scaffolding_cuts_known_patterns():
     assert "worth being honest" not in out
     assert "That's what people miss" in out
     assert "Eight people in every session." in out
+    # Must not glue the next sentence onto the prior period.
+    assert "quality.The" not in out
+    assert "quality. The loop" in out
 
 
 def test_strip_voice_scaffolding_cuts_soft_didnt_see_leftover():
