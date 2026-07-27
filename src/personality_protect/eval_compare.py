@@ -38,6 +38,14 @@ _SLOP_PATTERNS = (
     r"\btestament to\b",
 )
 
+# Deterministic scaffolding leftovers (no LLM judgment).
+_SCAFFOLDING_PATTERNS = (
+    r"(?i)here's the problem:",
+    r"(?i)here's the part that should genuinely bother",
+    r"(?i)here's what\b[^\n]{0,160}\blooked like:",
+    r"(?i)that's the part worth\b",
+)
+
 
 def evals_data_dir() -> Path:
     """Return path to packaged synthetic eval drafts."""
@@ -64,6 +72,60 @@ def slop_score(text: str) -> int:
     """Count AI-tell pattern hits (higher = more generic slop)."""
     lower = text.lower()
     return sum(1 for pat in _SLOP_PATTERNS if re.search(pat, lower, flags=re.I))
+
+
+def scaffolding_count(text: str) -> int:
+    """Count known throat-clearing scaffolding leftovers."""
+    body = text or ""
+    return sum(1 for pat in _SCAFFOLDING_PATTERNS if re.search(pat, body))
+
+
+def _para_count(text: str) -> int:
+    return len([p for p in re.split(r"\n\s*\n", (text or "").strip()) if p.strip()])
+
+
+def _word_set(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9']+", (text or "").lower()))
+
+
+def longform_metrics(draft: str, rewritten: str) -> dict[str, Any]:
+    """Deterministic longform gate metrics (no LLM grader).
+
+    Pipeline pass signal: scaffolding_after==0 and not near_copy and not
+    blank_line_only_noop. Voice quality remains a human grade.
+    """
+    draft = (draft or "").strip()
+    rewritten = (rewritten or "").strip()
+    d_len = max(1, len(draft))
+    r_len = len(rewritten)
+    ratio = r_len / d_len
+    dw, rw = _word_set(draft), _word_set(rewritten)
+    overlap = len(dw & rw) / max(1, len(dw))
+    # Near-copy: almost same length and high lexical overlap.
+    near_copy = 0.92 <= ratio <= 1.08 and overlap >= 0.92
+    # Blank-line-only: same words, more blank lines, no real rewrite.
+    draft_flat = re.sub(r"\s+", " ", draft)
+    re_flat = re.sub(r"\s+", " ", rewritten)
+    blank_line_only = (
+        draft_flat == re_flat
+        or (overlap >= 0.97 and _para_count(rewritten) > _para_count(draft) and abs(ratio - 1.0) < 0.05)
+    )
+    scaff_after = scaffolding_count(rewritten)
+    return {
+        "scaffolding_before": scaffolding_count(draft),
+        "scaffolding_after": scaff_after,
+        "length_ratio": round(ratio, 4),
+        "near_copy": near_copy,
+        "blank_line_only_noop": blank_line_only,
+        "paras_before": _para_count(draft),
+        "paras_after": _para_count(rewritten),
+        "slop_before": slop_score(draft),
+        "slop_after": slop_score(rewritten),
+        "lexical_overlap": round(overlap, 4),
+        "pipeline_pass": bool(
+            scaff_after == 0 and not near_copy and not blank_line_only and rewritten
+        ),
+    }
 
 
 def _load_voice_anchors(paths: ProfilePaths, limit: int = 3) -> list[str]:
@@ -181,6 +243,7 @@ def run_eval(
         "label": label,
         "slop_before": slop_score(draft),
         "slop_after": slop_score(rewritten),
+        "longform": longform_metrics(draft, rewritten),
         "system_prompt": filter_system_prompt(),
         "dir": str(out_dir),
     }
@@ -229,6 +292,10 @@ def run_compare(
             "raw": slop_score(draft),
             "prompt_baseline": slop_score(baseline),
             "lora": slop_score(lora_text),
+        },
+        "longform": {
+            "prompt_baseline": longform_metrics(draft, baseline),
+            "lora": longform_metrics(draft, lora_text),
         },
         "system_prompt": filter_system_prompt(),
         "dir": str(out_dir),

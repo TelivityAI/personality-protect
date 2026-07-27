@@ -1,0 +1,13 @@
+Contoso Labs has published another guidance memo on workplace communication quality. The document argues that organizations must evaluate not only the substance of internal writing, but also the texture of the prose itself. Leaders at Contoso suggest that compressed thinking is frequently misread as low-effort output, and that Northwind Analytics should adopt a similar review framework before shipping customer-facing narratives.
+
+Here's the problem: the people most likely to fail a Contoso style audit are not the people producing low-effort work. They are often the people who cut through ambiguity fastest, who refuse to pad a paragraph with ornamental certainty, and who treat a blank line as a decision rather than decoration. Contoso's framework still treats those habits as risk signals.
+
+Across twelve pilot teams, Contoso asked reviewers to score memos on clarity, warmth, and brand alignment. The scores looked objective. The disagreements were not. Reviewers who preferred longer transitions marked short punches as incomplete. Reviewers who preferred dense argument marked the longer transitions as fog. Contoso's summary presented the average as a standard.
+
+Northwind Analytics repeated the exercise on customer emails. The same pattern appeared. Messages that named the tradeoff early were flagged as abrupt. Messages that delayed the point in order to sound collaborative were praised as executive-ready. Nobody audited whether the customer left with a decision.
+
+Here's the part that should genuinely bother anyone running these audits.
+
+If Contoso and Northwind keep scoring texture as if it were substance, they will systematically punish the writers who make the call and reward the writers who postpone it. The organization then trains itself to sound careful while remaining undecided. That is not a communication upgrade. It is a governance habit wearing a style guide.
+
+The Contoso memo closes with a recommendation to expand the audit to contractor deliverables, partner briefings, and public posts. It does not ask whether the audit can distinguish a sharp paragraph from an empty one after the scaffolding has been removed. Until that distinction is operational, Contoso will keep mistaking polish for progress, and Northwind will keep publishing the same polished indecision at greater volume.

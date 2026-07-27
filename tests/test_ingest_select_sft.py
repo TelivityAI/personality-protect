@@ -177,6 +177,78 @@ def test_normalize_corpus_text_strips_embedded_html_css():
     assert "8.4/10" in clean
 
 
+def test_piece_to_examples_chunks_long_multipara():
+    """Long multipara corpus must emit budget-fit chunk pairs, not one truncated row."""
+    from personality_protect.models import Piece
+    from personality_protect.sft import (
+        MAX_SFT_DRAFT_CHARS,
+        MAX_SFT_TARGET_CHARS,
+        _paragraph_chunks,
+        piece_to_examples,
+    )
+
+    paras = [
+        f"Punch {i}. Contoso ships the take and keeps the spine of the argument."
+        for i in range(12)
+    ]
+    text = "\n\n".join(paras)
+    assert len(text) > MAX_SFT_TARGET_CHARS * 2
+    chunks = _paragraph_chunks(text, MAX_SFT_TARGET_CHARS)
+    assert len(chunks) >= 2
+    examples = piece_to_examples(
+        Piece(id="long-mp", source="linkedin_post", text=text, year=2026, word_count=200)
+    )
+    kinds = {ex["meta"]["pair_kind"] for ex in examples}
+    assert "clean_chunk" in kinds
+    assert "slop_chunk" in kinds
+    clean_chunks = [ex for ex in examples if ex["meta"]["pair_kind"] == "clean_chunk"]
+    # linkedin_post oversamples clean ~3× per chunk window
+    assert len(clean_chunks) >= len(chunks) * 3
+    for ex in examples:
+        target = ex["messages"][-1]["content"]
+        assert len(target) <= MAX_SFT_TARGET_CHARS + 5
+        user = ex["messages"][1]["content"]
+        draft = user.split("### Draft\n", 1)[1].split("\n\n### Rewritten", 1)[0]
+        assert len(draft) <= MAX_SFT_DRAFT_CHARS + 5
+
+
+def test_piece_to_examples_flat_long_no_leave_alone():
+    """Artificially flat long prose must not mint leave_alone pass-through."""
+    from personality_protect.models import Piece
+    from personality_protect.sft import piece_to_examples
+
+    flat = (
+        "Personal branding matters more than ever. AI tools flood every channel. "
+        "Companies need a clear point of view, not another template post. "
+    ) * 20
+    examples = piece_to_examples(
+        Piece(id="flat-long", source="note", text=flat, year=2026, word_count=400)
+    )
+    assert examples
+    assert "leave_alone" not in {ex["meta"]["pair_kind"] for ex in examples}
+
+
+def test_article_source_oversamples_more_than_comment():
+    from personality_protect.models import Piece
+    from personality_protect.sft import piece_to_examples
+
+    text = (
+        "Let's be real.\n\n"
+        "Contoso Labs has zero knowledge about the vertical.\n\n"
+        "Northwind? Keep the spine."
+    )
+    post = piece_to_examples(
+        Piece(id="p", source="linkedin_post", text=text, year=2026, word_count=40)
+    )
+    comment = piece_to_examples(
+        Piece(id="c", source="linkedin_comment", text=text, year=2026, word_count=40)
+    )
+    post_clean = sum(1 for ex in post if ex["meta"]["pair_kind"] == "clean")
+    comment_clean = sum(1 for ex in comment if ex["meta"]["pair_kind"] == "clean")
+    assert post_clean > comment_clean
+    assert post_clean >= comment_clean * 3
+
+
 def test_sft_truncates_long_targets_for_masked_seq_budget():
     """512-token mask_prompt trains NaN when prompt+target overflow the window."""
     from personality_protect.models import Piece
