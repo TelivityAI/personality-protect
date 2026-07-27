@@ -473,7 +473,13 @@ def filter_draft(
         raise RuntimeError(f"Unknown filter backend: {chosen}")
 
     if force:
-        return rewritten.strip(), chosen
+        out = rewritten.strip()
+        # Never ship empty: stop tokens / extract_rewrite can wipe a bad sample.
+        # Caller still sees likely_truncated via quality flags if they compare lengths
+        # after a failed attempt — but empty file overwrites are worse.
+        if not out:
+            return draft, chosen
+        return out, chosen
     # Near-identity → keep original (paragraphs + opener intact).
     return similarity_guard(draft, rewritten), chosen
 

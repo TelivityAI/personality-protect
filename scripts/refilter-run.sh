@@ -33,38 +33,65 @@ which personality-protect
 # Don't let status|head SIGPIPE abort the script under pipefail.
 personality-protect status | head -20 || true
 
-for f in "${files[@]}"; do
+filter_one() {
+  local f="$1"
+  local base chars budget attempt out json
   base=$(basename "$f" -claude.md)
   chars=$(wc -c <"$f" | tr -d ' ')
   # ~3 chars/token + margin; articles need far more than the old 480 hard cap.
   budget=$(( chars / 3 + 256 ))
   if [ "$budget" -lt 512 ]; then budget=512; fi
   if [ "$budget" -gt 4096 ]; then budget=4096; fi
-  echo "→ filter $base (chars=$chars max_tokens=$budget --force)"
-  personality-protect filter \
-    --file "$f" \
-    --out "$RUN/${base}-voiced.md" \
-    --backend auto \
-    --max-tokens "$budget" \
-    --force \
-    --json | tee "$RUN/${base}-filter.json" | head -c 400 || true
-  echo
-  python3 - <<PY
-import json
+  out="$RUN/${base}-voiced.md"
+  json="$RUN/${base}-filter.json"
+  for attempt in 1 2; do
+    echo "→ filter $base (chars=$chars max_tokens=$budget --force attempt=$attempt)"
+    personality-protect filter \
+      --file "$f" \
+      --out "$out" \
+      --backend auto \
+      --max-tokens "$budget" \
+      --force \
+      --json >"$json" || true
+    python3 - <<PY
+import json, sys
 from pathlib import Path
-meta = json.loads(Path("$RUN/${base}-filter.json").read_text())
+meta = json.loads(Path("$json").read_text())
 draft = Path("$f").read_text().strip()
-voiced = Path("$RUN/${base}-voiced.md").read_text().strip()
+voiced = Path("$out").read_text().strip() if Path("$out").is_file() else ""
+# JSON text is authoritative when --out was wiped empty by a bad sample.
+text = (meta.get("text") or "").strip()
+if text and not voiced:
+    Path("$out").write_text(text + "\n", encoding="utf-8")
+    voiced = text
 print(
     f"  backend={meta.get('backend')} max_tokens={meta.get('max_tokens')} "
     f"force={meta.get('force')} unchanged={meta.get('unchanged')} "
     f"truncated={meta.get('likely_truncated')} len={len(draft)}→{len(voiced)}"
 )
+ok = bool(voiced) and len(voiced) >= len(draft) * 0.55
 if meta.get("unchanged") or draft == voiced:
     print("  WARN: still leave-alone even with --force (adapter may be copy-biased)")
-if meta.get("likely_truncated") or (draft and len(voiced) < len(draft) * 0.55):
-    print("  WARN: likely truncated — raise --max-tokens")
+if not ok:
+    print("  WARN: empty/truncated rewrite")
+    sys.exit(2)
+sys.exit(0)
 PY
+    if [ $? -eq 0 ]; then
+      return 0
+    fi
+    echo "  retrying $base…"
+  done
+  echo "  FAIL: $base still empty/truncated after retry"
+  return 1
+}
+
+fail=0
+for f in "${files[@]}"; do
+  filter_one "$f" || fail=1
 done
+if [ "$fail" -ne 0 ]; then
+  echo "Some filters failed — re-run or raise --max-tokens for those pieces."
+fi
 echo "Done. Voiced files in $RUN"
 ls -la "$RUN"/*-voiced.md
