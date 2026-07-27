@@ -10,8 +10,11 @@ from typer.testing import CliRunner
 from personality_protect.cli import app
 from personality_protect.demo import run_demo
 from personality_protect.eval_compare import (
+    SCORECARD_MIN_PROPER_PER_1K_ARTICLE,
+    SCORECARD_MIN_PROPER_PER_1K_POST,
     list_synthetic_drafts,
     longform_metrics,
+    resolve_proper_floor,
     run_compare,
     run_eval,
     scaffolding_count,
@@ -47,11 +50,21 @@ def test_slop_score_detects_tells():
     assert slop_score(clean) == 0
 
 
+def test_resolve_proper_floor_channel_p10s():
+    assert resolve_proper_floor("linkedin") == SCORECARD_MIN_PROPER_PER_1K_POST
+    assert resolve_proper_floor("post") == 20.0
+    assert resolve_proper_floor("article") == SCORECARD_MIN_PROPER_PER_1K_ARTICLE
+    assert resolve_proper_floor("article") == 42.0
+    assert resolve_proper_floor(None, words=180) == 20.0
+    assert resolve_proper_floor(None, words=1100) == 42.0
+
+
 def test_specificity_scorecard_gates_parable_vs_named():
     parable = next(p for p in list_synthetic_drafts() if p.stem == "clean_article")
-    card = specificity_scorecard(parable.read_text(encoding="utf-8"))
+    card = specificity_scorecard(parable.read_text(encoding="utf-8"), channel="article")
     assert card["pass"] is False
     assert "numbers_per_1k" in card["failed"]
+    assert card["thresholds"]["min_proper_per_1k"] == 42.0
     # Formatting / you>I are advisory — never hard-fail.
     assert "median_sentence" not in card["failed"]
     assert "short_line_ratio" not in card["failed"]
@@ -63,8 +76,9 @@ def test_specificity_scorecard_gates_parable_vs_named():
         "I asked Contoso in 2024. I got 12 answers. Northwind and Fabrikam "
         "showed up in the PNR. GDS. NDC. API. I still ship the take."
     )
-    fp = specificity_scorecard(first_person)
+    fp = specificity_scorecard(first_person, channel="linkedin")
     assert fp["pass"] is True
+    assert fp["thresholds"]["min_proper_per_1k"] == 20.0
     assert fp["i_count"] >= fp["you_count"]
 
     dense = (
@@ -74,10 +88,19 @@ def test_specificity_scorecard_gates_parable_vs_named():
         "Contoso Labs cut 12 pilots. Northwind kept GPT out of the PNR.\n\n"
         "You. Not the deck.\n"
     )
-    good = specificity_scorecard(dense)
+    good = specificity_scorecard(dense, channel="linkedin")
     assert good["pass"] is True
-    assert good["proper_nouns_per_1k"] >= 48
+    assert good["proper_nouns_per_1k"] >= 20
     assert good["numbers_per_1k"] >= 5
+
+    # Thin soft post fails the post floor (not only the old 48 gate).
+    thin = (
+        "Meetings and decks aren't neutral overhead. They're how companies "
+        "avoid committing. You screen for culture fit and filter out operators."
+    )
+    thin_card = specificity_scorecard(thin, channel="linkedin")
+    assert thin_card["pass"] is False
+    assert "proper_nouns_per_1k" in thin_card["failed"]
 
 
 def test_cli_scorecard_fails_parable(tmp_path: Path):

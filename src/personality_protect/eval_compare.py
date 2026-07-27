@@ -91,12 +91,31 @@ def _word_set(text: str) -> set[str]:
 # Draft specificity gates (pre-voice). A filter cannot insert named entities or
 # benchmarks — fail cheap at draft time.
 #
-# Hard FAIL floors are calibrated to the floor of a real 12-article corpus
-# (proper 50.3–167.6 /1k, numbers 6.6–86.1 /1k). Mean-based gates rejected the
-# author's own work. Median sentence / short-line / you>I vary by piece and are
-# advisory only — never FAIL.
-SCORECARD_MIN_PROPER_PER_1K = 48.0
+# Proper-noun floors are channel p10s on the author's real corpus under
+# ``count_proper_nouns`` (excludes sentence-initial capitals). A single 48/1k
+# gate rejected ~34% of posts and ~17% of articles. Numbers floor stays at the
+# article corpus floor. Median sentence / short-line / you>I are advisory only.
+SCORECARD_MIN_PROPER_PER_1K_POST = 20.0
+SCORECARD_MIN_PROPER_PER_1K_ARTICLE = 42.0
+# Back-compat alias → article floor (stricter default when channel omitted).
+SCORECARD_MIN_PROPER_PER_1K = SCORECARD_MIN_PROPER_PER_1K_ARTICLE
 SCORECARD_MIN_NUMBERS_PER_1K = 5.0
+
+
+def resolve_proper_floor(
+    channel: str | None = None,
+    *,
+    words: int | None = None,
+) -> float:
+    """Pick proper-noun /1k floor from channel (or word-count heuristic)."""
+    ch = (channel or "").strip().lower()
+    if ch in {"linkedin", "post", "posts", "li", "short"}:
+        return SCORECARD_MIN_PROPER_PER_1K_POST
+    if ch in {"article", "articles", "longform", "long"}:
+        return SCORECARD_MIN_PROPER_PER_1K_ARTICLE
+    if words is not None and int(words) < 500:
+        return SCORECARD_MIN_PROPER_PER_1K_POST
+    return SCORECARD_MIN_PROPER_PER_1K_ARTICLE
 
 _COMMON_CAPS = frozenset(
     {
@@ -243,18 +262,23 @@ def count_numbers(text: str) -> int:
 def specificity_scorecard(
     text: str,
     *,
-    min_proper_per_1k: float = SCORECARD_MIN_PROPER_PER_1K,
+    channel: str | None = None,
+    min_proper_per_1k: float | None = None,
     min_numbers_per_1k: float = SCORECARD_MIN_NUMBERS_PER_1K,
 ) -> dict[str, Any]:
     """Deterministic draft gate: specificity before any voice filter.
 
     Hard FAIL: proper nouns /1k and numbers /1k at corpus floors.
+    Proper-noun floor is channel-aware (posts ~20, articles ~42) unless
+    ``min_proper_per_1k`` is passed explicitly.
     Advisory only (never FAIL): median sentence, short-line ratio, you vs I.
     A voice filter cannot insert named entities or a benchmark table.
     """
     body = (text or "").strip()
     words = _word_tokens(body)
     n_words = max(1, len(words))
+    if min_proper_per_1k is None:
+        min_proper_per_1k = resolve_proper_floor(channel, words=len(words))
     proper = count_proper_nouns(body)
     numbers = count_numbers(body)
     sent_counts = _sentence_word_counts(body)
@@ -291,6 +315,9 @@ def specificity_scorecard(
         "i_per_1k": round(i_1k, 2),
         "you_gt_i": you_n > i_n,
     }
+    ch_norm = (channel or "").strip().lower() or (
+        "linkedin" if len(words) < 500 else "article"
+    )
     return {
         "words": len(words),
         "proper_nouns": proper,
@@ -303,6 +330,7 @@ def specificity_scorecard(
         "i_count": i_n,
         "you_per_1k": advisory["you_per_1k"],
         "i_per_1k": advisory["i_per_1k"],
+        "channel": ch_norm,
         "thresholds": {
             "min_proper_per_1k": min_proper_per_1k,
             "min_numbers_per_1k": min_numbers_per_1k,

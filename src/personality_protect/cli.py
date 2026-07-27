@@ -884,11 +884,17 @@ def scorecard_cmd(
         "--synthetic",
         help="Packaged synthetic draft stem (see data/evals/).",
     ),
+    channel: Optional[str] = typer.Option(
+        None,
+        "--channel",
+        help="linkedin|article — proper-noun floor (20 vs 42). "
+        "Default: infer from word count (<500 → linkedin).",
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Gate a draft on specificity before voicing (no model call).
 
-    Hard FAIL: proper nouns /1k and numbers /1k (corpus floors).
+    Hard FAIL: proper nouns /1k (channel p10) and numbers /1k.
     Advisory only: median sentence, short-line ratio, you vs I.
     """
     _banner_from_ctx(ctx, json_mode=as_json)
@@ -898,7 +904,7 @@ def scorecard_cmd(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(2) from exc
 
-    card = specificity_scorecard(draft)
+    card = specificity_scorecard(draft, channel=channel)
     card["label"] = label
     if as_json:
         typer.echo(json.dumps(card, indent=2, ensure_ascii=False))
