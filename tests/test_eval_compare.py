@@ -74,28 +74,28 @@ def test_resolve_numbers_floor_posts_advisory():
 
 def test_count_numbers_evidence_not_labels_or_timeline():
     labels = (
-        "Category 15 and Category 35 via Contoso fare rules. Cat 15/35. "
+        "Category 12 and Category 21 via Contoso Ledger rules. Cat 12/21. "
         "Version 21 schema."
     )
     assert count_numbers(labels) == 0
-    timeline = "T+0. T+5 to T+15. T+15 to T+30. T+30 to T+45. T+45 to T+60."
+    timeline = "T+0. T+2 to T+5. T+5 to T+10. T+10 to T+20."
     assert count_numbers(timeline) == 0
     # Queue color without a unit noun — not evidence.
-    assert count_numbers("Waiting at position 340, then position 1,100.") == 0
+    assert count_numbers("Waiting at position 12, then position 1,100.") == 0
     evidence = (
-        "75% of participants. 93.1% vs 91.1%. After 18 years. "
-        "3,000 seats in 2024. $2.5m at risk."
+        "75% of participants. 93.1% vs 91.1%. After 12 years. "
+        "3,000 invoices in 2024. $2.5m at risk."
     )
     assert count_numbers(evidence) >= 6
     # Identifiers mixed with one real claim — only the claim counts.
-    mixed = "A Category 35 rule broke settlement for 180 seats."
+    mixed = "A Contoso Category 12 rule broke settlement for 180 cases."
     assert count_numbers(mixed) == 1
     # Timeline scaffolding + real claims → only the claims.
     anatomy = (
-        "T+0 incident start. 81% utilization. 3,000+ seats. "
-        "T+15 to T+30. position 340. T+45 to T+60. 18 years in the role."
+        "T+0 incident start. 64% utilization. 3,000+ invoices. "
+        "T+2 to T+5. position 12. T+5 to T+10. 12 years in the role."
     )
-    assert count_numbers(anatomy) == 3  # 81%, 3,000+ seats, 18 years
+    assert count_numbers(anatomy) == 3  # 64%, 3,000+ invoices, 12 years
 
 
 def test_specificity_scorecard_gates_parable_vs_named():
@@ -113,7 +113,7 @@ def test_specificity_scorecard_gates_parable_vs_named():
 
     # Named LinkedIn post with zero numbers still passes (numbers advisory).
     named_no_nums = (
-        "PNR state, ATPCO filings, and GDS settlement make air's curve years. "
+        "Contoso Ledger, Northwind Billing, and Fabrikam Settlement make the curve years. "
         "Hotel platforms do not have this machinery. You staff for it or you don't."
     )
     nn = specificity_scorecard(named_no_nums, channel="linkedin")
@@ -126,7 +126,7 @@ def test_specificity_scorecard_gates_parable_vs_named():
     # First-person heavy piece still passes if names clear the post floor.
     first_person = (
         "I asked Contoso in 2024. I got 12 answers. Northwind and Fabrikam "
-        "showed up in the PNR. GDS. NDC. API. I still ship the take."
+        "showed up in Contoso Ledger. API. SDK. I still ship the take."
     )
     fp = specificity_scorecard(first_person, channel="linkedin")
     assert fp["pass"] is True
@@ -134,10 +134,10 @@ def test_specificity_scorecard_gates_parable_vs_named():
     assert fp["i_count"] >= fp["you_count"]
 
     dense = (
-        "GDS. NDC. API.\n\n"
+        "SDK. API. CLI.\n\n"
         "Contoso said no in 2024. Northwind said wait. Fabrikam took 75%.\n\n"
         "You own the call. You ship the risk.\n\n"
-        "Contoso Labs cut 12 pilots. Northwind kept GPT out of the PNR.\n\n"
+        "Contoso Labs cut 12 pilots. Northwind kept GPT out of Contoso Ledger.\n\n"
         "You. Not the deck.\n"
     )
     good = specificity_scorecard(dense, channel="linkedin")

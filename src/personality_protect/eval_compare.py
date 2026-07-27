@@ -278,8 +278,9 @@ def count_proper_nouns(text: str) -> int:
 
 
 # Evidence figures only — not labels or narrative clocks.
-# - category/version ids (e.g. Category 15/35)
+# - category/version ids (e.g. Category 12 / Cat 12/21)
 # - T+N timeline markers (structure, not falsifiable claims)
+# - bare queue ``position N`` (unverifiable color)
 _NON_EVIDENCE_NUMBER_CONTEXT = re.compile(
     r"(?i)\b(?:categor(?:y|ies)|cat\.?)\s*\d+(?:\s*/\s*\d+)?"
     r"|\b(?:categor(?:y|ies)|cat\.?)\s*\d+\s*(?:and|&|/)\s*\d+"
@@ -287,26 +288,29 @@ _NON_EVIDENCE_NUMBER_CONTEXT = re.compile(
     r"|\bT\+\d+(?:\s*(?:to|/|-)\s*T\+\d+)?\b"
     r"|\bposition\s+\d{1,3}(?:,\d{3})*(?:\.\d+)?\b"
 )
+_EVIDENCE_UNIT = (
+    r"(?:years?|yrs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?"
+    r"|passengers?|pax|flights?|seconds?|tickets?|bookings?"
+    r"|seats?|cases?|invoices?|accounts?|records?|exceptions?)\b"
+)
 _EVIDENCE_NUMBER = re.compile(
     r"(?i)"
     r"(?:€|\$|£)\s?\d+(?:[.,]\d+)?(?:\s*(?:m|bn|k|million|billion))?"
     r"|\b\d+(?:[.,]\d+)?%"
     r"|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\+?\s*-?\s*"
-    r"(?:years?|yrs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?"
-    r"|passengers?|pax|flights?|seconds?|tickets?|bookings?)\b"
-    r"|\b\d+(?:[.,]\d+)?\+?\s*-?\s*"
-    r"(?:years?|yrs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?"
-    r"|passengers?|pax|flights?|seconds?|tickets?|bookings?)\b"
-    r"|\b(?:19|20)\d{2}\b"
+    + _EVIDENCE_UNIT
+    + r"|\b\d+(?:[.,]\d+)?\+?\s*-?\s*"
+    + _EVIDENCE_UNIT
+    + r"|\b(?:19|20)\d{2}\b"
 )
 
 
 def count_numbers(text: str) -> int:
     """Evidence figures: %, money, N+unit (incl. thousands with a unit), years.
 
-    Do **not** count: ``Category 15/35`` labels, ``T+15`` timeline markers, or
-    bare/queue ``position 1,100`` style digits without a unit noun. Those are
-    structure or unverifiable color — not ``75% of participants``.
+    Do **not** count: Category/version labels, ``T+N`` / ``T+a to T+b`` timelines,
+    or bare/queue ``position N`` without a unit noun. Thousands count only with a
+    unit (``3,000 invoices``), never bare ``1,100``.
     """
     masked = _NON_EVIDENCE_NUMBER_CONTEXT.sub(" ", text or "")
     return len(_EVIDENCE_NUMBER.findall(masked))
