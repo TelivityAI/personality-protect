@@ -74,6 +74,12 @@ _SLOP_HINT_RE = re.compile(
     r"it is important to note)\b"
 )
 
+_VOICE_MARK_RE = re.compile(
+    r"(?i)(?:here's the thing|let's be real|let me be clear|let's be honest|"
+    r"\bwth\b|who'?s saying|ship the take|cut the fog|keep the spine|"
+    r"say something|make it count|or don'?t post|or stay quiet)"
+)
+
 
 def draft_looks_sloppy(draft: str) -> bool:
     """True when the draft carries common AI-slop scaffolding."""
@@ -81,16 +87,62 @@ def draft_looks_sloppy(draft: str) -> bool:
     return hits >= 2
 
 
-def prefer_multipara_on_slop(draft: str, rewrite: str) -> str:
-    """Prefer blank-line paragraph punches when the input was sloppy AI mush.
+def draft_already_in_voice(draft: str) -> bool:
+    """True when the draft already has multi-para rhetorical / punch cadence.
 
-    Leave-alone for already-good drafts is owned by similarity_guard. This only
-    repairs flat / single-block outputs after slop stripping so cadence compare
-    isn't stuck on thesaurus one-liners.
+    Leave-alone applies here. Flat clean professional prose does *not* qualify
+    even when it uses mildly punchy vocabulary.
+    """
+    draft = (draft or "").strip()
+    if not draft:
+        return False
+    paras = [p for p in re.split(r"\n\s*\n", draft) if p.strip()]
+    structured = len(paras) >= 2 or draft.count("\n") >= 2
+    if not structured:
+        return False
+    marks = 0
+    if "?" in draft:
+        marks += 2
+    if _VOICE_MARK_RE.search(draft):
+        marks += 2
+    if paras:
+        avg = sum(len(p) for p in paras) / len(paras)
+        if avg <= 140 and len(paras) >= 3:
+            marks += 1
+    if re.search(r"\b(?:I'm|I've|I'd|don't|doesn't|isn't|won't|can't)\b", draft):
+        marks += 1
+    if len(re.findall(r"\bI\b", draft)) >= 2:
+        marks += 1
+    return marks >= 2
+
+
+def draft_looks_soulless(draft: str) -> bool:
+    """Clean professional prose without AI-slop and without voice cadence.
+
+    These drafts must be restyled (clean→voice), never leave-alone frozen.
+    """
+    draft = (draft or "").strip()
+    if not draft:
+        return False
+    if draft_looks_sloppy(draft):
+        return False
+    if draft_already_in_voice(draft):
+        return False
+    return True
+
+
+def prefer_multipara_on_slop(draft: str, rewrite: str) -> str:
+    """Prefer blank-line paragraph punches when the input was sloppy or soulless.
+
+    Leave-alone for already-good voice drafts is owned by similarity_guard. This
+    only repairs flat / single-block outputs after slop stripping or clean-flat
+    restyle so cadence compare isn't stuck on thesaurus one-liners.
     """
     draft = (draft or "").strip()
     rewrite = (rewrite or "").strip()
-    if not rewrite or not draft_looks_sloppy(draft):
+    if not rewrite:
+        return rewrite
+    if not (draft_looks_sloppy(draft) or draft_looks_soulless(draft)):
         return rewrite
     if "\n\n" in rewrite:
         return rewrite
@@ -118,6 +170,45 @@ def _paragraphize_punches(text: str) -> str:
     if len(paras) < 2:
         return text
     return "\n\n".join(paras)
+
+
+def _dedupe_repetition_collapse(text: str) -> str:
+    """Cut mode-collapse loops ('AI will never say…' / repeating punches) down."""
+    text = (text or "").strip()
+    if not text:
+        return text
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if len(paras) < 6:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if len(lines) < 8:
+            return text
+        paras = lines
+    # Detect repeating block of 2–4 paragraphs.
+    for block in (2, 3, 4):
+        if len(paras) < block * 3:
+            continue
+        head = paras[:block]
+        keys = [re.sub(r"\s+", " ", p.lower())[:72] for p in head]
+        repeats = 0
+        for i in range(block, len(paras) - block + 1, block):
+            nxt = [re.sub(r"\s+", " ", p.lower())[:72] for p in paras[i : i + block]]
+            if nxt == keys:
+                repeats += 1
+        if repeats >= 2:
+            return "\n\n".join(head)
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for p in paras:
+        key = re.sub(r"\s+", " ", p.lower())[:72]
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+        if len(uniq) >= 6:
+            break
+    if len(uniq) >= 2 and len(uniq) < len(paras) * 0.5:
+        return "\n\n".join(uniq)
+    return text
 
 
 def strip_ai_tells(text: str) -> str:
@@ -213,6 +304,8 @@ def similarity_guard(
     that lowers SequenceMatcher ratio while keeping nearly the same tokens.
     Flat single-block drafts still get a real rewrite (clean→voice / slop→voice).
     Never freezes AI-slop drafts — multi-para mush must still be rewritten.
+    Never freezes clean-but-soulless drafts — bland professional prose must be
+    restyled, not blank-line-only frozen.
     """
     import difflib
 
@@ -227,7 +320,10 @@ def similarity_guard(
     # Never leave AI-slop alone — even multi-paragraph Contoso mush.
     if draft_looks_sloppy(draft):
         return rewrite
-    # Only guard structured posts; don't freeze flat clean/slop one-liners.
+    # Never freeze bland clean professional prose (clean→voice path).
+    if draft_looks_soulless(draft):
+        return rewrite
+    # Only guard structured voice-shaped posts; don't freeze flats.
     draft_paras = [p for p in re.split(r"\n\s*\n", draft) if p.strip()]
     if len(draft_paras) < 2 and draft.count("\n") < 2:
         return rewrite
@@ -246,6 +342,7 @@ def similarity_guard(
 def finalize_rewrite(text: str, *, draft: str | None = None) -> str:
     """Template-echo cut + AI-tell cleanup (+ optional near-identity keep-draft)."""
     out = strip_ai_tells(extract_rewrite(text))
+    out = _dedupe_repetition_collapse(out)
     if draft is not None:
         out = prefer_multipara_on_slop(draft, out)
         out = similarity_guard(draft, out)

@@ -333,6 +333,38 @@ def test_synthetic_multipara_cadence_examples_are_multipara_both_sides():
         assert "contoso" in blob or "northwind" in blob
 
 
+def test_synthetic_clean_flat_voice_examples_restyle_bland_prose():
+    from personality_protect.sft import _synthetic_clean_flat_voice_examples
+
+    rows = _synthetic_clean_flat_voice_examples()
+    assert len(rows) >= 18
+    kinds = {r["meta"]["pair_kind"] for r in rows}
+    assert "clean" in kinds
+    assert "clean_flat" in kinds
+    flats = [r for r in rows if r["meta"]["pair_kind"] == "clean_flat"]
+    assert len(flats) >= 8
+    for r in flats[:6]:
+        user = r["messages"][1]["content"]
+        draft = user.split("### Draft\n", 1)[1].split("\n\n### Rewritten", 1)[0]
+        target = r["messages"][-1]["content"]
+        assert "\n\n" not in draft.strip(), "clean-flat draft must be single-block bland"
+        assert "\n\n" in target
+        assert draft.strip() != target.strip()
+        # Must be a real restyle, not blank-line-only of the same sentences.
+        import re
+
+        a = re.sub(r"\s+", " ", draft.lower())
+        b = re.sub(r"\s+", " ", target.lower())
+        assert a != b
+        assert "leverage" not in draft.lower()
+        assert "fast-paced" not in draft.lower()
+        blob = (draft + "\n" + target).lower()
+        assert "travelport" not in blob
+        assert "life vest" not in blob
+        assert "linkedin.com" not in blob
+        assert "contoso" in blob or "northwind" in blob or "personal branding" in blob
+
+
 def test_clean_generic_draft_forces_rewrite_even_on_flat_prose():
     """Already-clean drafts must NOT be near-identity — that teaches LoRA pass-through."""
     from personality_protect.sft import _clean_generic_draft, normalize_corpus_text
