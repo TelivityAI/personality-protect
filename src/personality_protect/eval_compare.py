@@ -16,9 +16,9 @@ from typing import Any
 from personality_protect.config import ProfilePaths, load_config
 from personality_protect.filter import (
     FILTER_TEMPERATURE,
-    filter_system_prompt,
     build_filter_prompt,
     filter_draft,
+    filter_system_prompt,
     mlx_prompt_baseline,
     read_draft_input,
     strip_ai_tells,

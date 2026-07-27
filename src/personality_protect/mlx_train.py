@@ -21,7 +21,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 # Digests that finish without melting a 48 GB unified-memory Mac.
 DEFAULT_CHUNK_STEPS = 50
