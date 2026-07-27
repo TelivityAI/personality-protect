@@ -277,31 +277,38 @@ def count_proper_nouns(text: str) -> int:
     return hits
 
 
-# Evidence figures only — not ATPCO Category 15/35 style labels.
-_CATEGORY_OR_VERSION_LABEL = re.compile(
+# Evidence figures only — not labels or narrative clocks.
+# - ATPCO Category 15/35 / version ids
+# - T+N IRROPS timeline markers (concrete prose, not falsifiable claims)
+_NON_EVIDENCE_NUMBER_CONTEXT = re.compile(
     r"(?i)\b(?:categor(?:y|ies)|cat\.?)\s*\d+(?:\s*/\s*\d+)?"
     r"|\b(?:categor(?:y|ies)|cat\.?)\s*\d+\s*(?:and|&|/)\s*\d+"
     r"|\b(?:rule|version|schema|v\.?)\s*[-/]?\s*\d+\b"
+    r"|\bT\+\d+(?:\s*(?:to|/|-)\s*T\+\d+)?\b"
+    r"|\bposition\s+\d{1,3}(?:,\d{3})*(?:\.\d+)?\b"
 )
 _EVIDENCE_NUMBER = re.compile(
     r"(?i)"
     r"(?:€|\$|£)\s?\d+(?:[.,]\d+)?(?:\s*(?:m|bn|k|million|billion))?"
     r"|\b\d+(?:[.,]\d+)?%"
-    r"|\b\d+(?:[.,]\d+)?\s*-?\s*"
+    r"|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\+?\s*-?\s*"
     r"(?:years?|yrs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?"
     r"|passengers?|pax|flights?|seconds?|tickets?|bookings?)\b"
-    r"|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b"
+    r"|\b\d+(?:[.,]\d+)?\+?\s*-?\s*"
+    r"(?:years?|yrs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?"
+    r"|passengers?|pax|flights?|seconds?|tickets?|bookings?)\b"
     r"|\b(?:19|20)\d{2}\b"
 )
 
 
 def count_numbers(text: str) -> int:
-    """Evidence figures: %, money, N+unit, thousands, years.
+    """Evidence figures: %, money, N+unit (incl. thousands with a unit), years.
 
-    Bare digits in ``Category 15/35`` / version labels do **not** count — those
-    are identifiers, not claims like ``75% of participants``.
+    Do **not** count: ``Category 15/35`` labels, ``T+15`` timeline markers, or
+    bare/queue ``position 1,100`` style digits without a unit noun. Those are
+    structure or unverifiable color — not ``75% of participants``.
     """
-    masked = _CATEGORY_OR_VERSION_LABEL.sub(" ", text or "")
+    masked = _NON_EVIDENCE_NUMBER_CONTEXT.sub(" ", text or "")
     return len(_EVIDENCE_NUMBER.findall(masked))
 
 
