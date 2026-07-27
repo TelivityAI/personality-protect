@@ -277,9 +277,32 @@ def count_proper_nouns(text: str) -> int:
     return hits
 
 
+# Evidence figures only — not ATPCO Category 15/35 style labels.
+_CATEGORY_OR_VERSION_LABEL = re.compile(
+    r"(?i)\b(?:categor(?:y|ies)|cat\.?)\s*\d+(?:\s*/\s*\d+)?"
+    r"|\b(?:categor(?:y|ies)|cat\.?)\s*\d+\s*(?:and|&|/)\s*\d+"
+    r"|\b(?:rule|version|schema|v\.?)\s*[-/]?\s*\d+\b"
+)
+_EVIDENCE_NUMBER = re.compile(
+    r"(?i)"
+    r"(?:€|\$|£)\s?\d+(?:[.,]\d+)?(?:\s*(?:m|bn|k|million|billion))?"
+    r"|\b\d+(?:[.,]\d+)?%"
+    r"|\b\d+(?:[.,]\d+)?\s*-?\s*"
+    r"(?:years?|yrs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?"
+    r"|passengers?|pax|flights?|seconds?|tickets?|bookings?)\b"
+    r"|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b"
+    r"|\b(?:19|20)\d{2}\b"
+)
+
+
 def count_numbers(text: str) -> int:
-    """Digits / percents / years — signal of falsifiable writing."""
-    return len(re.findall(r"\b\d+(?:[.,]\d+)?%?\b", text or ""))
+    """Evidence figures: %, money, N+unit, thousands, years.
+
+    Bare digits in ``Category 15/35`` / version labels do **not** count — those
+    are identifiers, not claims like ``75% of participants``.
+    """
+    masked = _CATEGORY_OR_VERSION_LABEL.sub(" ", text or "")
+    return len(_EVIDENCE_NUMBER.findall(masked))
 
 
 def specificity_scorecard(
