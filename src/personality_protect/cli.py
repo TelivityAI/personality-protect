@@ -47,8 +47,10 @@ from personality_protect.eval_compare import (
 )
 from personality_protect.filter import (
     filter_draft,
+    paragraph_windows,
     read_draft_input,
     rewrite_quality_flags,
+    should_chunk_filter,
     suggest_max_tokens,
 )
 from personality_protect.ingest import run_ingest
@@ -760,6 +762,11 @@ def filter_cmd(
         "--force",
         help="Always rewrite (skip leave-alone); for polished frontier drafts.",
     ),
+    chunk: Optional[bool] = typer.Option(
+        None,
+        "--chunk/--no-chunk",
+        help="Chunk article-length drafts (default: auto when draft > 1600 chars).",
+    ),
     gguf: Optional[Path] = typer.Option(
         None,
         "--gguf",
@@ -782,6 +789,8 @@ def filter_cmd(
         raise typer.Exit(2) from exc
 
     budget = suggest_max_tokens(draft, override=max_tokens)
+    auto_chunk = should_chunk_filter(draft) if chunk is None else bool(chunk)
+    n_windows = len(paragraph_windows(draft)) if auto_chunk else 1
     try:
         rewritten, used = filter_draft(
             draft,
@@ -790,6 +799,7 @@ def filter_cmd(
             max_tokens=budget,
             gguf=gguf,
             force=force,
+            chunk=chunk,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         console.print(f"[red]{exc}[/red]")
@@ -807,6 +817,8 @@ def filter_cmd(
                     "text": rewritten,
                     "max_tokens": budget,
                     "force": force,
+                    "chunked": bool(auto_chunk and n_windows > 1),
+                    "chunk_windows": n_windows if auto_chunk else 1,
                     **flags,
                 },
                 indent=2,
@@ -814,7 +826,14 @@ def filter_cmd(
             )
         )
         return
-    console.print(f"[dim]backend={used} max_tokens={budget} force={force}[/dim]")
+    chunk_note = (
+        f" chunked={n_windows}windows"
+        if auto_chunk and n_windows > 1
+        else ""
+    )
+    console.print(
+        f"[dim]backend={used} max_tokens={budget} force={force}{chunk_note}[/dim]"
+    )
     if flags["unchanged"]:
         console.print(
             "[yellow]Filter left draft unchanged "
