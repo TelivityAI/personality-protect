@@ -810,6 +810,8 @@ def filter_cmd(
     # --force means "must rewrite". Byte-identical output is a hard failure —
     # do not write a fake *-voiced.md that is just the Claude draft.
     force_echo = bool(force and flags.get("unchanged"))
+    # Inverse of echo: generative invention that slipped past novelty_guard.
+    force_novelty = bool(force and flags.get("novelty_high"))
 
     if as_json:
         typer.echo(
@@ -822,13 +824,14 @@ def filter_cmd(
                     "chunked": chunked,
                     "chunk_windows": n_windows if auto_chunk else 1,
                     "force_echo_reject": force_echo,
+                    "force_novelty_reject": force_novelty,
                     **flags,
                 },
                 indent=2,
                 ensure_ascii=False,
             )
         )
-        if force_echo:
+        if force_echo or force_novelty:
             raise typer.Exit(1)
         if out:
             out.write_text(rewritten + "\n", encoding="utf-8")
@@ -842,6 +845,13 @@ def filter_cmd(
         console.print(
             "[red]--force produced byte-identical output (echo). "
             "Not writing voiced file — filter did not rewrite.[/red]"
+        )
+        raise typer.Exit(1)
+    if force_novelty:
+        console.print(
+            "[red]Rewrite invented too much new vocabulary "
+            f"({flags.get('new_word_count')} new words). "
+            "Not writing voiced file — voice filter must stay subtractive.[/red]"
         )
         raise typer.Exit(1)
     if flags["unchanged"]:

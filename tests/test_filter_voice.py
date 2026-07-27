@@ -456,14 +456,22 @@ def test_filter_draft_leave_alone_skips_model_for_vibe(tmp_path):
     assert used == "mock"
     assert calls == []
     assert out == draft.strip()
-    # --force still rewrites
+    # --force still runs the model, but invented vocabulary is rejected.
     with patch(
         "personality_protect.filter._filter_mock",
         side_effect=lambda d, *_a, **_k: "Cut the fog.\n\nKeep the spine.",
     ):
         forced, _ = filter_draft(draft, paths, backend="mock", force=True)
-    assert forced != draft
-    assert "Cut the fog" in forced
+    assert "Cut the fog" not in forced
+    assert "spine" not in forced
+    # Subtractive force rewrite (no new vocabulary) is kept.
+    with patch(
+        "personality_protect.filter._filter_mock",
+        side_effect=lambda d, *_a, **_k: d.replace("Maybe we are too hard", "We are hard"),
+    ):
+        forced2, _ = filter_draft(draft, paths, backend="mock", force=True)
+    assert "Maybe we are too hard" not in forced2
+    assert "We are hard on vibe coders" in forced2
 
 
 def test_draft_already_in_voice_rejects_polished_long_claude():
@@ -620,18 +628,68 @@ def test_filter_draft_short_stays_singleshot(tmp_path):
 
     def fake_mock(d: str, _adapter_dir):
         calls.append(d)
-        return "Cut the fog.\n\nContoso's problem is sounding like every other post."
+        # Subtractive only — no invented vocabulary.
+        return (
+            d.replace("In today's fast-paced digital world, ", "")
+            .replace("leverage ", "")
+            .replace("Furthermore, ", "")
+            .replace("delve into ", "")
+        )
 
     with patch("personality_protect.filter._filter_mock", side_effect=fake_mock):
         out, used = filter_draft(draft, paths, backend="mock")
     assert used == "mock"
     assert len(calls) == 1
     assert calls[0] == draft.strip()
-    assert "Cut the fog" in out
+    assert "leverage" not in out.lower()
+    assert "delve" not in out.lower()
 
 
-def test_filter_draft_long_auto_chunks_and_rewrites(tmp_path):
-    """Article-length drafts auto-chunk; stitched output is a real rewrite delta."""
+def test_novelty_guard_rejects_invented_vocabulary():
+    from personality_protect.filter import (
+        introduced_vocabulary,
+        novelty_guard,
+        novelty_too_high,
+        strip_ai_tells,
+    )
+
+    draft = (
+        "Contoso audits punish compressed thinking as low effort.\n\n"
+        "Northwind scores warmth like substance."
+    )
+    generative = (
+        draft
+        + "\n\nWrite with some spine instead of packaging your thoughts in bandages.\n"
+        "Whoeres in the fog climb ladders toward the chatbot mirror."
+    )
+    new = introduced_vocabulary(draft, generative)
+    assert "bandages" in new
+    assert "whoeres" in new
+    assert novelty_too_high(draft, generative) is True
+    assert novelty_guard(draft, generative) == draft.strip()
+
+    # Deterministic AI-tell synonym swaps are subtractive cleanup, not generation.
+    slop = "In today's fast-paced world we must leverage synergies."
+    cleaned = strip_ai_tells(slop)
+    assert "leverage" not in cleaned.lower()
+    assert novelty_too_high(slop, cleaned) is False
+    assert introduced_vocabulary(slop, cleaned) == []
+
+
+def test_strip_capitalizes_orphan_after_problem_cut():
+    from personality_protect.filter import strip_voice_scaffolding
+
+    text = (
+        "Here's the problem: the people most likely to fail are not low-effort.\n\n"
+        "Northwind keeps the rest."
+    )
+    out = strip_voice_scaffolding(text)
+    assert "Here's the problem:" not in out
+    assert out.startswith("The people most likely")
+
+
+def test_filter_draft_long_auto_chunks_strips_scaffolding(tmp_path):
+    """Article-length drafts auto-chunk; generative novelty falls back to strip-only."""
     from personality_protect.config import get_paths
     from personality_protect.demo import run_demo
     from personality_protect.eval_compare import longform_metrics
@@ -640,7 +698,6 @@ def test_filter_draft_long_auto_chunks_and_rewrites(tmp_path):
     run_demo(home=tmp_path)
     paths = get_paths("demo", home=tmp_path)
 
-    # Contoso longform with scaffolding — above auto-chunk threshold.
     body = []
     for i in range(12):
         body.append(
@@ -659,18 +716,8 @@ def test_filter_draft_long_auto_chunks_and_rewrites(tmp_path):
 
     def fake_mock(d: str, _adapter_dir):
         calls.append(d)
-        # Distinct rewrite per chunk (not near-copy).
-        return (
-            d.replace("argues that", "says")
-            .replace("must evaluate", "should judge")
-            .replace("Here's the problem:", "")
-            .replace(
-                "Here's the part that should genuinely bother anyone running these audits.",
-                "",
-            )
-            .strip()
-            + " Cut the fog."
-        )
+        # Invented vocabulary — must be rejected by novelty_guard.
+        return d + "\n\nCut the fog with bandages and chatbots."
 
     with patch("personality_protect.filter._filter_mock", side_effect=fake_mock):
         out, used = filter_draft(draft, paths, backend="mock", force=True)
@@ -680,98 +727,12 @@ def test_filter_draft_long_auto_chunks_and_rewrites(tmp_path):
     assert all(len(c) <= FILTER_CHUNK_MAX_CHARS + 40 for c in calls)
     assert "Here's the problem" not in out
     assert "Here's the part that should genuinely bother" not in out
+    assert "bandages" not in out
+    assert "chatbots" not in out
+    assert out.startswith("Contoso audits") or "Contoso audits" in out
     metrics = longform_metrics(draft, out)
     assert metrics["scaffolding_after"] == 0
-    assert metrics["near_copy"] is False
-    assert metrics["blank_line_only_noop"] is False
-    assert "Cut the fog" in out
     assert "\n\n" in out
-
-
-def test_rewrite_is_near_noop_matches_longform_gates():
-    from personality_protect.eval_compare import longform_metrics
-    from personality_protect.filter import rewrite_is_near_noop
-
-    draft = (
-        "Contoso Labs audits punish compressed thinking as low effort.\n\n"
-        "Northwind scores warmth like substance and trains polished indecision."
-    )
-    # Exact / whitespace-only → noop
-    assert rewrite_is_near_noop(draft, draft) is True
-    assert rewrite_is_near_noop(draft, draft.replace("\n\n", "\n\n\n")) is True
-    # Real diction rewrite → accept
-    rewritten = (
-        "Contoso's audit treats short thinking as laziness.\n\n"
-        "Northwind grades tone instead of substance, then rewards fog."
-    )
-    assert rewrite_is_near_noop(draft, rewritten) is False
-    m = longform_metrics(draft, rewritten)
-    assert m["near_copy"] is False
-    assert m["blank_line_only_noop"] is False
-
-
-def test_filter_draft_chunk_rejects_near_copy_and_retries(tmp_path):
-    """Per-window near-copy outputs are rejected; bounded retries until a real rewrite."""
-    from personality_protect.config import get_paths
-    from personality_protect.demo import run_demo
-    from personality_protect.eval_compare import longform_metrics
-    from personality_protect.filter import filter_draft
-
-    run_demo(home=tmp_path)
-    paths = get_paths("demo", home=tmp_path)
-
-    body = []
-    for i in range(12):
-        body.append(
-            f"Contoso Labs memo section {i} argues that Northwind must evaluate "
-            f"texture as carefully as substance when reviewing workplace writing."
-        )
-    draft = (
-        "Here's the problem: Contoso audits punish compressed thinking.\n\n"
-        + "\n\n".join(body)
-        + "\n\nHere's the part that should genuinely bother anyone running these audits.\n\n"
-        "Northwind will keep publishing polished indecision at greater volume."
-    )
-    assert len(draft) > 1600
-
-    # Per window: first two attempts near-copy (reparagraph), then real rewrite.
-    attempts_by_window: dict[str, int] = {}
-
-    def fake_mock(d: str, _adapter_dir):
-        key = d.strip()
-        n = attempts_by_window.get(key, 0) + 1
-        attempts_by_window[key] = n
-        if n < 3:
-            # Near-copy: same words, extra blank line only.
-            return key.replace("\n\n", "\n\n\n") if "\n\n" in key else key + "\n"
-        return (
-            key.replace("argues that", "says")
-            .replace("must evaluate", "should judge")
-            .replace("Here's the problem:", "")
-            .replace(
-                "Here's the part that should genuinely bother anyone running these audits.",
-                "",
-            )
-            .strip()
-            + " Cut the fog."
-        )
-
-    with patch("personality_protect.filter._filter_mock", side_effect=fake_mock):
-        out, used = filter_draft(draft, paths, backend="mock", force=True)
-
-    assert used == "mock"
-    assert attempts_by_window
-    # Non-scaffolding windows need 3 attempts; scaffolding windows may accept
-    # early once strip_voice_scaffolding creates a real delta.
-    assert max(attempts_by_window.values()) == 3
-    assert sum(attempts_by_window.values()) > len(attempts_by_window)
-    assert "Here's the problem" not in out
-    assert "Here's the part that should genuinely bother" not in out
-    metrics = longform_metrics(draft, out)
-    assert metrics["near_copy"] is False
-    assert metrics["blank_line_only_noop"] is False
-    assert metrics["pipeline_pass"] is True
-    assert "Cut the fog" in out
 
 
 def test_filter_draft_short_leave_alone_still_single_shot(tmp_path):
