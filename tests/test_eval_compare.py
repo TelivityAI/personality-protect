@@ -10,10 +10,13 @@ from typer.testing import CliRunner
 from personality_protect.cli import app
 from personality_protect.demo import run_demo
 from personality_protect.eval_compare import (
+    SCORECARD_MIN_NUMBERS_PER_1K_ARTICLE,
+    SCORECARD_MIN_NUMBERS_PER_1K_POST,
     SCORECARD_MIN_PROPER_PER_1K_ARTICLE,
     SCORECARD_MIN_PROPER_PER_1K_POST,
     list_synthetic_drafts,
     longform_metrics,
+    resolve_numbers_floor,
     resolve_proper_floor,
     run_compare,
     run_eval,
@@ -59,19 +62,41 @@ def test_resolve_proper_floor_channel_p10s():
     assert resolve_proper_floor(None, words=1100) == 42.0
 
 
+def test_resolve_numbers_floor_posts_advisory():
+    assert resolve_numbers_floor("linkedin") == SCORECARD_MIN_NUMBERS_PER_1K_POST
+    assert resolve_numbers_floor("linkedin") == 0.0
+    assert resolve_numbers_floor("article") == SCORECARD_MIN_NUMBERS_PER_1K_ARTICLE
+    assert resolve_numbers_floor("article") == 6.6
+    assert resolve_numbers_floor(None, words=180) == 0.0
+    assert resolve_numbers_floor(None, words=1100) == 6.6
+
+
 def test_specificity_scorecard_gates_parable_vs_named():
     parable = next(p for p in list_synthetic_drafts() if p.stem == "clean_article")
     card = specificity_scorecard(parable.read_text(encoding="utf-8"), channel="article")
     assert card["pass"] is False
     assert "numbers_per_1k" in card["failed"]
     assert card["thresholds"]["min_proper_per_1k"] == 42.0
+    assert card["thresholds"]["min_numbers_per_1k"] == 6.6
     # Formatting / you>I are advisory — never hard-fail.
     assert "median_sentence" not in card["failed"]
     assert "short_line_ratio" not in card["failed"]
     assert "you_gt_i" not in card["failed"]
     assert "advisory" in card
 
-    # First-person heavy piece still passes if names + numbers clear floors.
+    # Named LinkedIn post with zero numbers still passes (numbers advisory).
+    named_no_nums = (
+        "PNR state, ATPCO filings, and GDS settlement make air's curve years. "
+        "Hotel platforms do not have this machinery. You staff for it or you don't."
+    )
+    nn = specificity_scorecard(named_no_nums, channel="linkedin")
+    assert nn["numbers"] == 0
+    assert nn["thresholds"]["min_numbers_per_1k"] == 0.0
+    assert "numbers_per_1k" not in nn["checks"]
+    assert nn["pass"] is True
+    assert nn["proper_nouns_per_1k"] >= 20
+
+    # First-person heavy piece still passes if names clear the post floor.
     first_person = (
         "I asked Contoso in 2024. I got 12 answers. Northwind and Fabrikam "
         "showed up in the PNR. GDS. NDC. API. I still ship the take."
@@ -91,7 +116,6 @@ def test_specificity_scorecard_gates_parable_vs_named():
     good = specificity_scorecard(dense, channel="linkedin")
     assert good["pass"] is True
     assert good["proper_nouns_per_1k"] >= 20
-    assert good["numbers_per_1k"] >= 5
 
     # Thin soft post fails the post floor (not only the old 48 gate).
     thin = (
@@ -101,18 +125,29 @@ def test_specificity_scorecard_gates_parable_vs_named():
     thin_card = specificity_scorecard(thin, channel="linkedin")
     assert thin_card["pass"] is False
     assert "proper_nouns_per_1k" in thin_card["failed"]
+    assert "numbers_per_1k" not in thin_card["failed"]
 
 
 def test_cli_scorecard_fails_parable(tmp_path: Path):
     article = next(p for p in list_synthetic_drafts() if p.stem == "clean_article")
     res = runner.invoke(
         app,
-        ["--logo", "off", "scorecard", "--file", str(article), "--json"],
+        [
+            "--logo",
+            "off",
+            "scorecard",
+            "--file",
+            str(article),
+            "--channel",
+            "article",
+            "--json",
+        ],
     )
     assert res.exit_code == 1, res.output
     data = json.loads(res.output)
     assert data["pass"] is False
     assert set(data["failed"]) <= {"proper_nouns_per_1k", "numbers_per_1k"}
+    assert data["thresholds"]["min_numbers_per_1k"] == 6.6
 
 
 def test_longform_metrics_flags_near_copy_and_scaffolding():

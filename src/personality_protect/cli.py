@@ -887,15 +887,15 @@ def scorecard_cmd(
     channel: Optional[str] = typer.Option(
         None,
         "--channel",
-        help="linkedin|article — proper-noun floor (20 vs 42). "
-        "Default: infer from word count (<500 → linkedin).",
+        help="linkedin|article — floors: proper 20 vs 42; numbers "
+        "advisory(0) vs 6.6. Default: infer from word count (<500 → linkedin).",
     ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Gate a draft on specificity before voicing (no model call).
 
-    Hard FAIL: proper nouns /1k (channel p10) and numbers /1k.
-    Advisory only: median sentence, short-line ratio, you vs I.
+    Hard FAIL: proper nouns /1k (channel p10); numbers /1k on articles only.
+    Advisory: post numbers, median sentence, short-line ratio, you vs I.
     """
     _banner_from_ctx(ctx, json_mode=as_json)
     try:
@@ -911,11 +911,16 @@ def scorecard_cmd(
         raise typer.Exit(0 if card["pass"] else 1)
 
     console.print(f"[bold]Scorecard[/bold] label={label} words={card['words']}")
+    num_need = card["thresholds"]["min_numbers_per_1k"]
+    num_note = (
+        f"(need ≥{num_need})"
+        if float(num_need) > 0
+        else "(advisory — no hard gate on posts)"
+    )
     console.print(
         f"proper_nouns/1k={card['proper_nouns_per_1k']} "
         f"(need ≥{card['thresholds']['min_proper_per_1k']}) "
-        f"numbers/1k={card['numbers_per_1k']} "
-        f"(need ≥{card['thresholds']['min_numbers_per_1k']})"
+        f"numbers/1k={card['numbers_per_1k']} {num_note}"
     )
     console.print(
         f"[dim]advisory median_sentence={card['median_sentence_words']} "
