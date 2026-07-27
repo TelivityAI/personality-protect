@@ -18,6 +18,9 @@ venv/
 .personality-protect/
 ~/.personality-protect/
 profiles/
+
+# Private voice studio (local only — never publish)
+private/
 adapters/
 lora/
 sft/
