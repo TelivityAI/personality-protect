@@ -30,7 +30,8 @@ if [ ${#files[@]} -eq 0 ]; then
 fi
 
 which personality-protect
-personality-protect status | head -20
+# Don't let status|head SIGPIPE abort the script under pipefail.
+personality-protect status | head -20 || true
 
 for f in "${files[@]}"; do
   base=$(basename "$f" -claude.md)
