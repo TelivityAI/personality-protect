@@ -269,8 +269,8 @@ def test_piece_to_examples_includes_clean_draft_voice_pair():
 
 def test_ensure_voice_paragraphs_splits_flat_sentence_blocks():
     """Flat multi-sentence voice must become multi-para rewrite targets."""
-    from personality_protect.sft import _ensure_voice_paragraphs, piece_to_examples
     from personality_protect.models import Piece
+    from personality_protect.sft import _ensure_voice_paragraphs, piece_to_examples
 
     flat = (
         "Personal branding matters more than ever. AI tools flood every channel. "

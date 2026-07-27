@@ -20,7 +20,6 @@ from rich.progress import (
 from rich.table import Table
 
 from personality_protect import __version__
-from personality_protect.mlx_train import DEFAULT_CHUNK_STEPS, PROOF_MAX_STEPS
 from personality_protect.api import DEFAULT_HOST, DEFAULT_PORT
 from personality_protect.api import serve as serve_api
 from personality_protect.config import (
@@ -60,6 +59,7 @@ from personality_protect.logo import (
     print_logo,
     should_show_logo,
 )
+from personality_protect.mlx_train import DEFAULT_CHUNK_STEPS, PROOF_MAX_STEPS
 from personality_protect.models import load_index, summarize_by_source_year
 from personality_protect.select import run_select
 from personality_protect.train import (
