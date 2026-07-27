@@ -94,22 +94,26 @@ FILTER_USER_TEMPLATE_FORCE = (
 FILTER_TEMPERATURE_FORCE = 0.6
 
 # Deterministic scaffolding cuts (not LLM judgment).
-_HERE_WHAT_LINE_RE = re.compile(
-    r"(?m)^(?:Here's|Here is) what\b[^:\n]{0,160}:\s*\n?",
+# Empty-promise throat-clearing only ("Here's what X looked like:").
+# Do NOT cut load-bearing hinges like "Here's what the commenter didn't see:".
+_HERE_WHAT_LOOKED_LIKE_RE = re.compile(
+    r"(?m)^(?:Here's|Here is) what\b[^:\n]{0,160}\blooked like:\s*\n?",
     re.IGNORECASE,
 )
-# Soft leftovers like "The commenter didn't see:" after a partial model edit.
-_COLON_DIDNT_SEE_LINE_RE = re.compile(
-    r"(?m)^[^\n]{0,80}\bdidn't see:\s*\n?",
-    re.IGNORECASE,
-)
+# Cut the clause only — keep following paragraph breaks (admission ≠ analysis).
 _THAT_PART_WORTH_RE = re.compile(
-    r"[ \t]*That's the part worth\b[^.!?\n]*[.!?]?\s*",
+    r"[ \t]*That's the part worth\b[^.!?\n]*[.!]?",
     re.IGNORECASE,
 )
 _THAT_PART_PEOPLE_RE = re.compile(
     r"\bThat's the part people\b",
     re.IGNORECASE,
+)
+_LEADING_QUOTE_PARA_RE = re.compile(
+    r'\A\s*("[^"\n]+"|“[^”\n]+”)\s*(?:\n+|$)',
+)
+_DIDNT_SEE_HINGE_RE = re.compile(
+    r"(?im)^((?:Here's|Here is) what\b[^\n]*\bdidn't see:|The commenter didn't see:)\s*$",
 )
 
 
@@ -122,8 +126,7 @@ def strip_voice_scaffolding(text: str) -> str:
     body = (text or "").strip()
     if not body:
         return ""
-    body = _HERE_WHAT_LINE_RE.sub("", body)
-    body = _COLON_DIDNT_SEE_LINE_RE.sub("", body)
+    body = _HERE_WHAT_LOOKED_LIKE_RE.sub("", body)
     body = _THAT_PART_WORTH_RE.sub("", body)
     body = _THAT_PART_PEOPLE_RE.sub("That's what people", body)
     # Mid-sentence cuts can glue the next sentence onto the previous period.
@@ -132,6 +135,47 @@ def strip_voice_scaffolding(text: str) -> str:
     body = re.sub(r"[^\S\n]{2,}", " ", body)
     body = re.sub(r"[ \t]+\n", "\n", body)
     return body.strip()
+
+
+def restore_structural_openers(draft: str, rewrite: str) -> str:
+    """Put back load-bearing openers the model dropped (quote premise / didn't-see hinge)."""
+    draft = (draft or "").strip()
+    out = (rewrite or "").strip()
+    if not draft or not out:
+        return out
+
+    qm = _LEADING_QUOTE_PARA_RE.match(draft)
+    if qm:
+        quote = qm.group(1).strip()
+        core = quote.strip('"“”')
+        if core and core not in out:
+            out = f"{quote}\n\n{out}"
+
+    hm = _DIDNT_SEE_HINGE_RE.search(draft)
+    if hm:
+        hinge = hm.group(1).strip()
+        if hinge and not re.search(re.escape(hinge), out, re.IGNORECASE):
+            after = draft[hm.end() :].lstrip()
+            follow = after.split("\n\n", 1)[0].strip() if after else ""
+            if follow and follow in out:
+                idx = out.find(follow)
+                out = out[:idx] + hinge + "\n\n" + out[idx:]
+            else:
+                qm2 = _LEADING_QUOTE_PARA_RE.match(out)
+                if qm2:
+                    rest = out[qm2.end() :].lstrip()
+                    out = f"{qm2.group(1).strip()}\n\n{hinge}\n\n{rest}"
+                else:
+                    out = hinge + "\n\n" + out
+    return out.strip()
+
+
+def apply_voice_postprocess(text: str, *, draft: str | None = None) -> str:
+    """Scaffolding strip, then restore structural openers from the draft."""
+    out = strip_voice_scaffolding(text)
+    if draft is not None:
+        out = restore_structural_openers(draft, out)
+    return out
 
 
 def suggest_max_tokens(draft: str, *, override: int | None = None) -> int:
@@ -524,8 +568,8 @@ def finalize_rewrite(
             out = similarity_guard(draft, out)
         if apply_substance:
             out = substance_guard(draft, out)
-    # Always last: deterministic cuts must not be reverted by similarity_guard.
-    return strip_voice_scaffolding(out)
+    # Always last: deterministic cuts + restore load-bearing openers from draft.
+    return apply_voice_postprocess(out, draft=draft)
 
 
 def rewrite_quality_flags(draft: str, rewrite: str) -> dict[str, bool | float]:
@@ -753,11 +797,11 @@ def filter_draft(
         raise RuntimeError(f"Unknown filter backend: {chosen}")
 
     if force:
-        # Never ship empty; scaffolding strip still runs if the model copied.
-        return strip_voice_scaffolding(rewritten.strip() or draft), chosen
-    # Sloppy/soulless → prefer punches; then leave-alone guard; then scaffolding.
+        # Never ship empty; postprocess still runs if the model copied.
+        return apply_voice_postprocess(rewritten.strip() or draft, draft=draft), chosen
+    # Sloppy/soulless → prefer punches; then leave-alone guard; then postprocess.
     out = prefer_multipara_on_slop(draft, rewritten)
-    return strip_voice_scaffolding(similarity_guard(draft, out)), chosen
+    return apply_voice_postprocess(similarity_guard(draft, out), draft=draft), chosen
 
 
 def _has_llama_cpp() -> bool:
