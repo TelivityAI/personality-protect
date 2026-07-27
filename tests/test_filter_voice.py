@@ -648,7 +648,9 @@ def test_filter_draft_short_stays_singleshot(tmp_path):
 def test_novelty_guard_rejects_invented_vocabulary():
     from personality_protect.filter import (
         draft_already_in_voice,
+        draft_looks_sloppy,
         introduced_vocabulary,
+        novelty_applies,
         novelty_guard,
         novelty_too_high,
         strip_ai_tells,
@@ -686,6 +688,22 @@ def test_novelty_guard_rejects_invented_vocabulary():
         "Contoso needs real connections, not synergies."
     )
     assert novelty_guard(slop, voicey) == voicey.strip()
+
+    # Specific short draft (soulless, not slop): voice rewrite may add diction.
+    # novelty_too_high must agree with novelty_guard so --force does not false-reject.
+    edifact = (
+        "Modern NDC booking flows look great until a wheelchair request.\n\n"
+        "The flow drops into EDIFACT. PNR state takes over. The GDS carries it home.\n\n"
+        "You've built a demo that works until the first SSR."
+    )
+    voiced = (
+        edifact
+        + "\n\nCut the fog on the happy path. The fallback is the product."
+    )
+    assert draft_looks_sloppy(edifact) is False
+    assert novelty_applies(edifact) is False
+    assert novelty_too_high(edifact, voiced) is False
+    assert novelty_guard(edifact, voiced) == voiced.strip()
 
 
 def test_strip_capitalizes_orphan_after_problem_cut():

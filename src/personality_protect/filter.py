@@ -182,6 +182,25 @@ NOVELTY_MAX_NEW_WORDS = 10
 NOVELTY_MAX_NEW_FRAC = 0.03
 
 
+def novelty_applies(draft: str) -> bool:
+    """When the subtractive novelty kill-switch should run.
+
+    Article-length: always (whoeres/bandages failure mode).
+    Short slop / short soulless: never — voice rewrite must invent diction.
+    Short already-voice: yes — block additive invention on leave-alone shapes.
+
+    Must match ``novelty_guard`` and ``force_novelty_reject`` (same predicate).
+    """
+    d = (draft or "").strip()
+    if not d:
+        return False
+    if len(d) > FILTER_CHUNK_THRESHOLD:
+        return True
+    if draft_looks_sloppy(d) or draft_looks_soulless(d):
+        return False
+    return True
+
+
 def novelty_too_high(
     draft: str,
     rewrite: str,
@@ -189,10 +208,12 @@ def novelty_too_high(
     max_new_words: int = NOVELTY_MAX_NEW_WORDS,
     max_new_frac: float = NOVELTY_MAX_NEW_FRAC,
 ) -> bool:
-    """True when rewrite introduces too many words absent from the draft."""
+    """True when rewrite invents too much on a draft that should stay subtractive."""
     draft = (draft or "").strip()
     rewrite = (rewrite or "").strip()
     if not draft or not rewrite or draft == rewrite:
+        return False
+    if not novelty_applies(draft):
         return False
     new_n = len(introduced_vocabulary(draft, rewrite))
     if new_n > int(max_new_words):
@@ -207,17 +228,11 @@ def novelty_too_high(
 def novelty_guard(draft: str, rewrite: str) -> str:
     """Keep draft when rewrite looks like generative invention, not a trim.
 
-    Short slop / soulless clean drafts need cadence rewrites that introduce
-    voice vocabulary by design — do not freeze those. Novelty still blocks
-    additive invention on already-voice shorts and on article-length drafts
-    (the #13 bandages/whoeres failure mode).
+    Exemptions live in ``novelty_applies`` so CLI ``force_novelty_reject`` and
+    the guard cannot disagree (post-03 EDIFACT false reject).
     """
     d = (draft or "").strip()
     r = (rewrite or "").strip()
-    if draft_looks_sloppy(d):
-        return r
-    if len(d) <= 1600 and draft_looks_soulless(d):
-        return r
     if novelty_too_high(d, r):
         return d
     return r
