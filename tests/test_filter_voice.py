@@ -116,7 +116,7 @@ def test_force_prompt_keeps_substance_over_delete():
 
     sys_l = FILTER_SYSTEM_PROMPT_FORCE.lower()
     assert "never delete" in sys_l or "worse than" in sys_l
-    assert "here's what" in sys_l
+    assert "deterministic" in sys_l
     assert "parallel" in sys_l or "blank lines" in sys_l
     user_l = FILTER_USER_TEMPLATE_FORCE.lower()
     assert "load-bearing" in user_l or "argument" in user_l
@@ -125,7 +125,37 @@ def test_force_prompt_keeps_substance_over_delete():
     assert "Clean polished draft." in msgs[1]["content"]
 
 
-def test_substance_guard_rejects_dropped_arguments():
+def test_strip_voice_scaffolding_cuts_known_patterns():
+    from personality_protect.filter import strip_voice_scaffolding
+
+    text = (
+        "14 meetings. 6 weeks. 0 decisions.\n\n"
+        "Here's what those 6 weeks actually looked like:\n\n"
+        "Eight people in every session.\n\n"
+        "Nobody was aligning on quality. That's the part worth being honest about.\n\n"
+        "That's the part people miss about disagree and commit."
+    )
+    out = strip_voice_scaffolding(text)
+    assert "Here's what" not in out
+    assert "worth being honest" not in out
+    assert "That's what people miss" in out
+    assert "Eight people in every session." in out
+
+
+def test_strip_voice_scaffolding_cuts_soft_didnt_see_leftover():
+    from personality_protect.filter import strip_voice_scaffolding
+
+    text = (
+        '"This is clearly ChatGPT slop."\n\n'
+        "The commenter didn't see:\n\n"
+        "The hours of circling the problem."
+    )
+    out = strip_voice_scaffolding(text)
+    assert "didn't see:" not in out
+    assert "hours of circling" in out
+
+
+def test_substance_guard_rejects_catastrophic_drops_only():
     from personality_protect.filter import substance_guard
 
     draft = (
@@ -133,34 +163,16 @@ def test_substance_guard_rejects_dropped_arguments():
         "What got audited was the texture of the prose.\n\n"
         "In a previous piece, I argued that compressed thinking gets misread as slop."
     )
-    # Drops load-bearing sentences + only keeps the middle beat.
     skinny = "What got audited was the texture of the prose."
     assert substance_guard(draft, skinny) == draft
-    # Keeps claims, light trim — allowed.
-    kept = (
-        "Nothing about the analysis was wrong. Nothing was even questioned.\n\n"
-        "What got audited was the texture of the prose.\n\n"
-        "In a previous piece, I argued that compressed thinking gets misread as slop."
-    )
-    assert substance_guard(draft, kept) == kept
-
-
-def test_substance_guard_rejects_blank_line_inflation():
-    from personality_protect.filter import substance_guard
-
-    draft = (
-        "Empty prose says little in many words. Dense prose says a lot in few.\n\n"
-        "That parallelism is the point."
-    )
+    # Reparagraphing alone must not revert (overcorrection).
     split = (
-        "Empty prose says little in many words.\n\n"
-        "Dense prose says a lot in few.\n\n"
-        "That\n\n"
-        "parallelism\n\n"
-        "is\n\n"
-        "the point."
+        "Nothing about the analysis was wrong. Nothing about it was even questioned.\n\n"
+        "What got audited was the texture of the prose.\n\n"
+        "In a previous piece, I argued that compressed thinking gets misread as slop.\n\n"
+        "Extra beat."
     )
-    assert substance_guard(draft, split) == draft
+    assert substance_guard(draft, split) == split
 
 
 def test_suggest_max_tokens_scales_for_articles():

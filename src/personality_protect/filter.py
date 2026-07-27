@@ -67,15 +67,14 @@ FILTER_USER_TEMPLATE_INFER = (
 # Force mode: never leave-alone. Adapter was trained to copy "already voice"
 # drafts; polished frontier prose often triggers that path. Force requires a rewrite.
 FILTER_SYSTEM_PROMPT_FORCE = (
-    "Personal voice rewriter. Prefer a real rewrite over a copy — but NEVER delete "
+    "Personal voice rewriter. Prefer a light rewrite over a copy — but NEVER delete "
     "arguments, claims, evidence, or context callbacks (e.g. 'In a previous piece'). "
     "A pass that removes substance is worse than leaving the draft unchanged. "
-    "Only cut throat-clearing setups and AI filler. Every 'Here's what X…:' line "
-    "must become a short verdict (same rule every time — no skipping). "
+    "Throat-clearing lines ('Here's what X…:') are stripped by a separate deterministic "
+    "pass — do not invent replacements for them; focus on diction/cadence only. "
     "Keep meaning and facts. Preserve section headers. "
     "Do NOT split matched parallel sentences into separate paragraphs just to add "
     "blank lines — keep intentional pairs/triads together. "
-    "Light diction/cadence trims are enough; do not pad with whitespace. "
     "Strip AI tells (leverage, synergies, delve, robust, In today's fast-paced world, "
     "It is important to note, Moreover, Furthermore, unlock, nestled, testament, "
     "vibrant). No invented facts, hashtags, or emoji unless the voice uses them. "
@@ -83,16 +82,54 @@ FILTER_SYSTEM_PROMPT_FORCE = (
 )
 
 FILTER_USER_TEMPLATE_FORCE = (
-    "Rewrite in my voice. Cut throat-clearing and AI filler only — keep every "
-    "argument and context beat. Do not drop load-bearing sentences. Do not "
-    "reparagraph just to insert blank lines; keep parallel lines together. "
-    "Tighten 'Here's what X…:' into a verdict every time. Same meaning; full draft.\n\n"
+    "Light rewrite in my voice. Keep every argument and context beat. Do not drop "
+    "load-bearing sentences. Do not reparagraph just to insert blank lines. "
+    "Same meaning; full draft. (Scaffolding like 'Here's what X…:' is removed "
+    "elsewhere — do not rewrite those lines into weaker fragments.)\n\n"
     "### Draft\n{draft}\n\n"
     "### Rewritten"
 )
 
-# Lower than creative chat: force should trim, not invent or delete.
-FILTER_TEMPERATURE_FORCE = 0.55
+# Round-2-like trim energy without chaotic deletes.
+FILTER_TEMPERATURE_FORCE = 0.6
+
+# Deterministic scaffolding cuts (not LLM judgment).
+_HERE_WHAT_LINE_RE = re.compile(
+    r"(?m)^(?:Here's|Here is) what\b[^:\n]{0,160}:\s*\n?",
+    re.IGNORECASE,
+)
+# Soft leftovers like "The commenter didn't see:" after a partial model edit.
+_COLON_DIDNT_SEE_LINE_RE = re.compile(
+    r"(?m)^[^\n]{0,80}\bdidn't see:\s*\n?",
+    re.IGNORECASE,
+)
+_THAT_PART_WORTH_RE = re.compile(
+    r"[ \t]*That's the part worth\b[^.!?\n]*[.!?]?\s*",
+    re.IGNORECASE,
+)
+_THAT_PART_PEOPLE_RE = re.compile(
+    r"\bThat's the part people\b",
+    re.IGNORECASE,
+)
+
+
+def strip_voice_scaffolding(text: str) -> str:
+    """Cut known throat-clearing constructions deterministically.
+
+    These patterns fail nondeterministically when left to the model — match and
+    remove them every time, then let the model handle judgment-only edits.
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    body = _HERE_WHAT_LINE_RE.sub("", body)
+    body = _COLON_DIDNT_SEE_LINE_RE.sub("", body)
+    body = _THAT_PART_WORTH_RE.sub("", body)
+    body = _THAT_PART_PEOPLE_RE.sub("That's what people", body)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    body = re.sub(r"[^\S\n]{2,}", " ", body)
+    body = re.sub(r"[ \t]+\n", "\n", body)
+    return body.strip()
 
 
 def suggest_max_tokens(draft: str, *, override: int | None = None) -> int:
@@ -263,13 +300,12 @@ def substance_guard(
     draft: str,
     rewrite: str,
     *,
-    min_token_keep: float = 0.78,
-    max_extra_breaks: int = 3,
+    min_token_keep: float = 0.50,
 ) -> str:
-    """Reject rewrites that drop arguments or mostly insert blank lines.
+    """Reject only catastrophic substance loss (keep draft).
 
-    Force/leave-alone similarity guards are separate. This one exists because a
-    voicing pass that deletes load-bearing sentences is worse than a no-op.
+    Blank-line inflation is not rejected here — that overcorrected useful trims.
+    Known scaffolding is handled by ``strip_voice_scaffolding`` instead.
     """
     draft = (draft or "").strip()
     rewrite = (rewrite or "").strip()
@@ -281,7 +317,6 @@ def substance_guard(
         return draft
 
     def _tokens(s: str) -> set[str]:
-        # Skip tiny function words so keep-rate tracks content, not "the/a/of".
         return {
             t
             for t in re.findall(r"[a-z0-9']+", s.lower())
@@ -294,17 +329,6 @@ def substance_guard(
         keep = len(dt & rt) / len(dt)
         if keep < min_token_keep:
             return draft
-
-    draft_words = len(re.findall(r"\b\w+\b", draft))
-    rewrite_words = len(re.findall(r"\b\w+\b", rewrite))
-    draft_breaks = draft.count("\n\n")
-    rewrite_breaks = rewrite.count("\n\n")
-    # Blank-line tic: more paragraph breaks while losing words → keep draft.
-    if (
-        rewrite_breaks > draft_breaks + max_extra_breaks
-        and rewrite_words <= draft_words
-    ):
-        return draft
     return rewrite
 
 
@@ -315,14 +339,15 @@ def finalize_rewrite(
     apply_guard: bool = True,
     apply_substance: bool = True,
 ) -> str:
-    """Template-echo cut + AI-tell cleanup (+ optional near-identity / substance)."""
+    """Template-echo cut + AI-tell cleanup (+ guards) + deterministic scaffolding."""
     out = strip_ai_tells(extract_rewrite(text))
     if draft is not None:
         if apply_guard:
             out = similarity_guard(draft, out)
         if apply_substance:
             out = substance_guard(draft, out)
-    return out
+    # Always last: deterministic cuts must not be reverted by similarity_guard.
+    return strip_voice_scaffolding(out)
 
 
 def rewrite_quality_flags(draft: str, rewrite: str) -> dict[str, bool | float]:
@@ -550,10 +575,10 @@ def filter_draft(
         raise RuntimeError(f"Unknown filter backend: {chosen}")
 
     if force:
-        # Never ship empty; identical copy after retries is an honest leave-alone.
-        return (rewritten.strip() or draft), chosen
-    # Near-identity → keep original (paragraphs + opener intact).
-    return similarity_guard(draft, rewritten), chosen
+        # Never ship empty; scaffolding strip still runs if the model copied.
+        return strip_voice_scaffolding(rewritten.strip() or draft), chosen
+    # Near-identity → keep original, then still cut known scaffolding.
+    return strip_voice_scaffolding(similarity_guard(draft, rewritten)), chosen
 
 
 def _has_llama_cpp() -> bool:
