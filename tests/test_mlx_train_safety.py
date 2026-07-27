@@ -184,7 +184,20 @@ def test_run_train_mlx_uses_chunks_and_progress(tmp_path: Path):
     def on_progress(info: dict) -> None:
         progress_events.append(info)
 
-    with patch("personality_protect.mlx_train.run_mlx_chunk_subprocess") as mock_chunk:
+    import importlib.util
+
+    real_find_spec = importlib.util.find_spec
+
+    def _find_spec(name: str, package: str | None = None):
+        if name == "mlx_lm":
+            return MagicMock()  # present
+        return real_find_spec(name, package)
+
+    with (
+        patch("personality_protect.train._has_mlx", return_value=True),
+        patch("importlib.util.find_spec", side_effect=_find_spec),
+        patch("personality_protect.mlx_train.run_mlx_chunk_subprocess") as mock_chunk,
+    ):
 
         def _side_effect(**kwargs):
             (kwargs["adapter_dir"] / "adapters.safetensors").write_bytes(b"fake")

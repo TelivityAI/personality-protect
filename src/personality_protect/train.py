@@ -28,6 +28,7 @@ from personality_protect.mlx_train import (
     ProgressCallback,
     run_chunked_mlx_train,
 )
+from personality_protect.select import selected_pieces
 from personality_protect.sft import build_sft_from_profile
 
 BackendName = Literal["auto", "mlx", "cuda", "cpu", "mock"]
@@ -69,28 +70,30 @@ def auto_max_steps(n_examples: int, *, smoke: bool = False, max_steps: int | Non
     return max(MIN_AUTO_STEPS, min(MAX_AUTO_STEPS, n * DEFAULT_EPOCHS))
 
 
-def check_corpus_size(n_examples: int, *, force: bool = False, smoke: bool = False) -> str | None:
-    """Warn below CORPUS_WARN_BELOW; block below CORPUS_BLOCK_BELOW unless force/smoke.
+def check_corpus_size(n_selected: int, *, force: bool = False, smoke: bool = False) -> str | None:
+    """Warn/block on selected *pieces* (not SFT row count).
 
-    Returns a warning string (or None). Raises RuntimeError when blocked.
+    Synthetic Contoso pairs are always appended to SFT JSONL and must not pad
+    a tiny real corpus past the gate. Returns a warning string (or None).
+    Raises RuntimeError when blocked.
     """
     if smoke or force:
-        if n_examples < CORPUS_WARN_BELOW:
+        if n_selected < CORPUS_WARN_BELOW:
             return (
-                f"Corpus has {n_examples} examples "
+                f"Corpus has {n_selected} selected pieces "
                 f"(warn threshold {CORPUS_WARN_BELOW}); proceeding due to "
                 f"{'smoke' if smoke else 'force'}."
             )
         return None
-    if n_examples < CORPUS_BLOCK_BELOW:
+    if n_selected < CORPUS_BLOCK_BELOW:
         raise RuntimeError(
-            f"Corpus too small for full train: {n_examples} selected examples "
+            f"Corpus too small for full train: {n_selected} selected pieces "
             f"(need at least {CORPUS_BLOCK_BELOW}). "
             "Ingest more writing, or pass --force / --smoke for a deliberate override."
         )
-    if n_examples < CORPUS_WARN_BELOW:
+    if n_selected < CORPUS_WARN_BELOW:
         return (
-            f"Warning: only {n_examples} selected examples "
+            f"Warning: only {n_selected} selected pieces "
             f"(recommend >={CORPUS_WARN_BELOW} for a credible voice adapter)."
         )
     return None
@@ -234,13 +237,16 @@ def run_train(
     progress_callback: ProgressCallback | None = None,
 ) -> TrainResult:
     config = load_config(paths)
+    n_selected = len(selected_pieces(paths))
+    corpus_note = check_corpus_size(
+        n_selected, force=force or sft_only, smoke=smoke or mock
+    )
+
     if force_rebuild_sft or not paths.sft_jsonl.is_file():
         sft_path, n = build_sft_from_profile(paths)
     else:
         sft_path = paths.sft_jsonl
         n = sum(1 for _ in sft_path.open(encoding="utf-8") if _.strip())
-
-    corpus_note = check_corpus_size(n, force=force or sft_only, smoke=smoke or mock)
     # --proof: real weights, bounded steps for receipts (not a silent mock).
     if proof and max_steps is None and not smoke and not mock:
         max_steps = PROOF_MAX_STEPS

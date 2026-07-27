@@ -18,6 +18,9 @@ venv/
 .personality-protect/
 ~/.personality-protect/
 profiles/
+
+# Local-only directory (never publish)
+private/
 adapters/
 lora/
 sft/

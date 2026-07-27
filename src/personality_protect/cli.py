@@ -20,7 +20,6 @@ from rich.progress import (
 from rich.table import Table
 
 from personality_protect import __version__
-from personality_protect.mlx_train import DEFAULT_CHUNK_STEPS, PROOF_MAX_STEPS
 from personality_protect.api import DEFAULT_HOST, DEFAULT_PORT
 from personality_protect.api import serve as serve_api
 from personality_protect.config import (
@@ -46,7 +45,12 @@ from personality_protect.eval_compare import (
     run_compare,
     run_eval,
 )
-from personality_protect.filter import filter_draft, read_draft_input
+from personality_protect.filter import (
+    filter_draft,
+    read_draft_input,
+    rewrite_quality_flags,
+    suggest_max_tokens,
+)
 from personality_protect.ingest import run_ingest
 from personality_protect.logo import (
     ColorMode,
@@ -55,6 +59,7 @@ from personality_protect.logo import (
     print_logo,
     should_show_logo,
 )
+from personality_protect.mlx_train import DEFAULT_CHUNK_STEPS, PROOF_MAX_STEPS
 from personality_protect.models import load_index, summarize_by_source_year
 from personality_protect.select import run_select
 from personality_protect.train import (
@@ -745,6 +750,16 @@ def filter_cmd(
         "--backend",
         help="auto | llama | gguf | mlx | transformers | mock",
     ),
+    max_tokens: Optional[int] = typer.Option(
+        None,
+        "--max-tokens",
+        help="Generation budget (default: scales with draft length, up to 4096).",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Always rewrite (skip leave-alone); for polished frontier drafts.",
+    ),
     gguf: Optional[Path] = typer.Option(
         None,
         "--gguf",
@@ -766,21 +781,53 @@ def filter_cmd(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(2) from exc
 
+    budget = suggest_max_tokens(draft, override=max_tokens)
     try:
         rewritten, used = filter_draft(
-            draft, paths, backend=backend, gguf=gguf  # type: ignore[arg-type]
+            draft,
+            paths,
+            backend=backend,  # type: ignore[arg-type]
+            max_tokens=budget,
+            gguf=gguf,
+            force=force,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
 
+    flags = rewrite_quality_flags(draft, rewritten)
     if out:
         out.write_text(rewritten + "\n", encoding="utf-8")
 
     if as_json:
-        typer.echo(json.dumps({"backend": used, "text": rewritten}, indent=2, ensure_ascii=False))
+        typer.echo(
+            json.dumps(
+                {
+                    "backend": used,
+                    "text": rewritten,
+                    "max_tokens": budget,
+                    "force": force,
+                    **flags,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
         return
-    console.print(f"[dim]backend={used}[/dim]")
+    console.print(f"[dim]backend={used} max_tokens={budget} force={force}[/dim]")
+    if flags["unchanged"]:
+        console.print(
+            "[yellow]Filter left draft unchanged "
+            "(leave-alone / similarity / substance guard — try --force).[/yellow]"
+        )
+    if flags.get("substance_loss"):
+        console.print(
+            "[red]Rewrite dropped too much substance — kept draft.[/red]"
+        )
+    if flags["likely_truncated"]:
+        console.print(
+            "[red]Rewrite looks truncated — raise --max-tokens and re-run.[/red]"
+        )
     console.print(rewritten)
     if out:
         console.print(f"[dim]wrote {out}[/dim]")

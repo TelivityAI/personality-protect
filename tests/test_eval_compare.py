@@ -50,7 +50,9 @@ def test_filter_prompt_stable():
     prompt = build_filter_prompt("We must leverage synergies.")
     assert "### Draft" in prompt
     assert "### Rewritten" in prompt
-    assert filter_system_prompt() == SYSTEM_PROMPT
+    # Inference prompt is stronger than train leave-alone; still shares voice goals.
+    assert filter_system_prompt() != SYSTEM_PROMPT
+    assert "paragraph" in filter_system_prompt().lower()
     assert FILTER_TEMPERATURE <= 0.5
 
 

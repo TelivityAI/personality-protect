@@ -11,7 +11,9 @@ while IFS= read -r line; do
   FILES+=("$line")
 done < <(git ls-files \
   '*.py' '*.md' '*.yml' '*.yaml' '*.toml' '*.sh' '*.txt' '*.json' '*.jsonl' \
-  | grep -v '^LICENSE$' || true)
+  | grep -v '^LICENSE$' \
+  | grep -v '^scripts/sanitize_check\.sh$' \
+  || true)
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
   echo "No files to sanitize."
@@ -42,6 +44,11 @@ check_pattern "discussion-leak" '(?i)\b(thread discussion|offline discussion|bea
 
 # Accidental secret filenames committed
 check_pattern "secret-files" '(^|/)\.env($|\.)|credentials\.json|huggingface_token|HF_TOKEN'
+
+# Local-only / unpublished workflow paths must not appear in the public tree
+check_pattern "private-dir-path" 'private/(studio|seeds|runs|prompts|\.env)'
+check_pattern "private-voice-studio" '(?i)private voice studio|voice studio directory'
+check_pattern "orchestration-leak" '(?i)Kimi\s*→\s*Claude|Kimi->Claude|private/studio\.py'
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "Sanitize check failed. Remove private paths and discussion language from tracked files."
