@@ -158,9 +158,22 @@ def _content_words(text: str) -> set[str]:
     return {t for t in re.findall(r"[a-z0-9']+", (text or "").lower()) if len(t) > 2}
 
 
+def _allowed_vocabulary(draft: str) -> set[str]:
+    """Draft words plus vocabulary from deterministic subtractive cleanup.
+
+    Synonym swaps in ``strip_ai_tells`` / scaffolding repairs must not count as
+    generation — only words the model invents beyond that baseline.
+    """
+    d = (draft or "").strip()
+    if not d:
+        return set()
+    cleaned = strip_voice_scaffolding(strip_ai_tells(d))
+    return _content_words(d) | _content_words(cleaned)
+
+
 def introduced_vocabulary(draft: str, rewrite: str) -> list[str]:
-    """Words in rewrite that never appear in draft (generation signal)."""
-    return sorted(_content_words(rewrite) - _content_words(draft))
+    """Words in rewrite absent from draft and from deterministic cleanup of draft."""
+    return sorted(_content_words(rewrite) - _allowed_vocabulary(draft))
 
 
 # Voice filter is subtractive (cut scaffolding / light diction). Additive generation
@@ -185,6 +198,7 @@ def novelty_too_high(
     if new_n > int(max_new_words):
         return True
     base = _content_words(draft)
+    # Allowed-vocab baseline already excludes deterministic synonym/scaffold repairs.
     if base and (new_n / len(base)) > float(max_new_frac):
         return True
     return False
@@ -230,10 +244,19 @@ def restore_structural_openers(draft: str, rewrite: str) -> str:
     return out.strip()
 
 
-def apply_voice_postprocess(text: str, *, draft: str | None = None) -> str:
-    """Reject generative novelty, strip scaffolding, restore structural openers."""
+def apply_voice_postprocess(
+    text: str,
+    *,
+    draft: str | None = None,
+    enforce_novelty: bool = True,
+) -> str:
+    """Reject generative novelty, strip scaffolding, restore structural openers.
+
+    Novelty ignores vocabulary introduced by deterministic ``strip_ai_tells`` /
+    scaffolding cleanup. ``enforce_novelty=False`` is for tests only.
+    """
     out = (text or "").strip()
-    if draft is not None:
+    if draft is not None and enforce_novelty:
         # Additive invention is out of scope for a voice filter — keep draft.
         out = novelty_guard(draft, out)
     out = strip_voice_scaffolding(out)
@@ -1082,24 +1105,14 @@ def _filter_mock(draft: str, adapter_dir: Path) -> str:
             openers.append(first)
 
     body = draft
-    # Soften generic AI tells
+    # Soften generic AI tells — subtractive only (no invented footer vocabulary).
     body = strip_ai_tells(body)
-    if openers:
-        # Blend: keep meaning of draft, tip cadence toward user's first lines
-        cue = openers[0]
-        # If draft already starts strongly, just return cleaned body with a voice tag line
-        if len(body) < 40:
+    if openers and len(body) < 40:
+        cue = openers[0].strip()
+        # Only prepend an anchor if it doesn't invent words absent from the draft.
+        if not novelty_too_high(draft, f"{cue}\n\n{body}"):
             return f"{cue}\n\n{body}".strip()
-        return (
-            f"{body}\n\n"
-            f"— rewritten locally with your voice anchors "
-            f"({len(anchors)} samples; mock adapter)"
-        ).strip()
-
-    return (
-        f"{body}\n\n"
-        "— rewritten locally (mock adapter; train a real LoRA for full voice match)"
-    ).strip()
+    return body.strip()
 
 
 def _filter_llama(

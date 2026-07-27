@@ -650,6 +650,7 @@ def test_novelty_guard_rejects_invented_vocabulary():
         introduced_vocabulary,
         novelty_guard,
         novelty_too_high,
+        strip_ai_tells,
     )
 
     draft = (
@@ -666,6 +667,13 @@ def test_novelty_guard_rejects_invented_vocabulary():
     assert "whoeres" in new
     assert novelty_too_high(draft, generative) is True
     assert novelty_guard(draft, generative) == draft.strip()
+
+    # Deterministic AI-tell synonym swaps are subtractive cleanup, not generation.
+    slop = "In today's fast-paced world we must leverage synergies."
+    cleaned = strip_ai_tells(slop)
+    assert "leverage" not in cleaned.lower()
+    assert novelty_too_high(slop, cleaned) is False
+    assert introduced_vocabulary(slop, cleaned) == []
 
 
 def test_strip_capitalizes_orphan_after_problem_cut():
