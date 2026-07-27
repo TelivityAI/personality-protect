@@ -14,6 +14,7 @@ from personality_protect.eval_compare import (
     SCORECARD_MIN_NUMBERS_PER_1K_POST,
     SCORECARD_MIN_PROPER_PER_1K_ARTICLE,
     SCORECARD_MIN_PROPER_PER_1K_POST,
+    count_numbers,
     list_synthetic_drafts,
     longform_metrics,
     resolve_numbers_floor,
@@ -69,6 +70,22 @@ def test_resolve_numbers_floor_posts_advisory():
     assert resolve_numbers_floor("article") == 6.6
     assert resolve_numbers_floor(None, words=180) == 0.0
     assert resolve_numbers_floor(None, words=1100) == 6.6
+
+
+def test_count_numbers_evidence_not_category_labels():
+    labels = (
+        "Category 15 and Category 35 via ATPCO. Cat 15/35. "
+        "GDS. NDC. EDIFACT. Version 21 schema."
+    )
+    assert count_numbers(labels) == 0
+    evidence = (
+        "75% of participants. 93.1% vs 91.1%. After 18 years. "
+        "3,000 passengers in 2024. $2.5m at risk."
+    )
+    assert count_numbers(evidence) >= 6
+    # Identifiers mixed with one real claim — only the claim counts.
+    mixed = "A Category 35 filing broke settlement for 180 passengers."
+    assert count_numbers(mixed) == 1
 
 
 def test_specificity_scorecard_gates_parable_vs_named():
