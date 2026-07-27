@@ -147,6 +147,23 @@ def test_strip_voice_scaffolding_cuts_known_patterns():
     assert "quality.\n\nThe loop" in out
 
 
+def test_strip_voice_scaffolding_cuts_article_throat_clearers():
+    from personality_protect.filter import strip_voice_scaffolding
+
+    text = (
+        "Contoso audits prose texture.\n\n"
+        "Here's the problem: the people most likely to fail are not low-effort.\n\n"
+        "Northwind keeps shipping.\n\n"
+        "Here's the part that should genuinely bother anyone running these audits.\n\n"
+        "The hours of circling the problem."
+    )
+    out = strip_voice_scaffolding(text)
+    assert "Here's the problem:" not in out
+    assert "Here's the part that should genuinely bother" not in out
+    assert "people most likely to fail" in out
+    assert "hours of circling" in out
+
+
 def test_strip_keeps_load_bearing_didnt_see_hinge():
     from personality_protect.filter import strip_voice_scaffolding
 
@@ -370,6 +387,21 @@ def test_draft_already_in_voice_detects_vibe_shaped():
     )
     assert draft_already_in_voice(vibe)
     assert not draft_looks_soulless(vibe)
+
+
+def test_draft_already_in_voice_rejects_polished_long_claude():
+    from personality_protect.filter import draft_already_in_voice
+
+    # Long multipara with ?, contractions, and I — not user cadence by itself.
+    paras = []
+    for i in range(20):
+        paras.append(
+            f"I'm noticing that Contoso's audit {i} doesn't capture substance. "
+            f"Why does Northwind still treat texture as the verdict?"
+        )
+    long_polished = "\n\n".join(paras)
+    assert len(long_polished) > 1600
+    assert not draft_already_in_voice(long_polished)
 
 
 def test_dedupe_repetition_collapse_cuts_loops():

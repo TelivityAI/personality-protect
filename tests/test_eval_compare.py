@@ -11,8 +11,10 @@ from personality_protect.cli import app
 from personality_protect.demo import run_demo
 from personality_protect.eval_compare import (
     list_synthetic_drafts,
+    longform_metrics,
     run_compare,
     run_eval,
+    scaffolding_count,
     slop_score,
 )
 from personality_protect.filter import FILTER_TEMPERATURE, build_filter_prompt, filter_system_prompt
@@ -28,6 +30,13 @@ def test_synthetic_evals_packaged():
     stems = {p.stem for p in drafts}
     assert "slop_branding" in stems
     assert "clean_neutral" in stems
+    assert "clean_article" in stems
+    article = next(p for p in drafts if p.stem == "clean_article").read_text(encoding="utf-8")
+    assert 1500 <= len(article) <= 6000
+    assert "Here's the problem:" in article
+    assert "Here's the part that should genuinely bother" in article
+    assert "contoso" in article.lower()
+    assert "travelport" not in article.lower()
 
 
 def test_slop_score_detects_tells():
@@ -35,6 +44,33 @@ def test_slop_score_detects_tells():
     clean = "I cut the fog and keep the spine of the argument."
     assert slop_score(dirty) >= 3
     assert slop_score(clean) == 0
+
+
+def test_longform_metrics_flags_near_copy_and_scaffolding():
+    draft = (
+        "Contoso Labs published guidance.\n\n"
+        "Here's the problem: reviewers punish short punches.\n\n"
+        "Here's the part that should genuinely bother anyone running these audits.\n\n"
+        "Northwind keeps shipping polished indecision."
+    )
+    near = draft  # noop
+    metrics = longform_metrics(draft, near)
+    assert metrics["scaffolding_before"] >= 2
+    assert metrics["scaffolding_after"] >= 2
+    assert metrics["near_copy"] is True
+    assert metrics["pipeline_pass"] is False
+
+    stripped = (
+        "Contoso Labs published guidance.\n\n"
+        "Reviewers punish short punches.\n\n"
+        "Northwind keeps shipping polished indecision.\n\n"
+        "Say the tradeoff early or stay quiet."
+    )
+    good = longform_metrics(draft, stripped)
+    assert good["scaffolding_after"] == 0
+    assert good["near_copy"] is False
+    assert scaffolding_count(stripped) == 0
+    assert good["pipeline_pass"] is True
 
 
 def test_sft_templates_stronger():

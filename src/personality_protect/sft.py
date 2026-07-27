@@ -286,60 +286,114 @@ def _example_row(
     }
 
 
+# Posts/articles are scarce vs comments — oversample their clean/chunk pairs.
+_SOURCE_CHUNK_OVERSAMPLE = {
+    "linkedin_article": 5,
+    "linkedin_post": 3,
+}
+
+
+def _paragraph_chunks(text: str, max_chars: int = MAX_SFT_TARGET_CHARS) -> list[str]:
+    """Pack corpus paragraphs into windows that fit the MLX masked seq budget."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not paras:
+        return [_truncate_for_seq_budget(text, max_chars)]
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for para in paras:
+        if len(para) > max_chars:
+            if cur:
+                chunks.append("\n\n".join(cur))
+                cur, cur_len = [], 0
+            chunks.append(_truncate_for_seq_budget(para, max_chars))
+            continue
+        add = len(para) + (2 if cur else 0)
+        if cur and cur_len + add > max_chars:
+            chunks.append("\n\n".join(cur))
+            cur, cur_len = [para], len(para)
+        else:
+            cur.append(para)
+            cur_len += add
+    if cur:
+        chunks.append("\n\n".join(cur))
+    return chunks
+
+
+def _chunk_oversample(source: str) -> int:
+    return _SOURCE_CHUNK_OVERSAMPLE.get((source or "").strip().lower(), 1)
+
+
 def piece_to_examples(piece: Piece) -> list[dict]:
     """Map one corpus piece to supervised rewrite pairs.
 
     Pair kinds:
-    - slop→voice: AI-tell draft → authentic text (strip + restore cadence)
-    - clean→voice: flat professional draft → authentic text with real paragraphs
+    - slop→voice / clean→voice: AI-tell or flat draft → authentic text
+    - slop_chunk / clean_chunk: same for paragraph windows of long pieces
     - leave_alone: already-voice draft → identical assistant (do not fidget)
+
+    Long pieces are split into paragraph chunks so article rewrites train under
+    the MLX 512-token budget. Assistant targets are always authentic corpus text.
     """
-    raw_target = _truncate_voice_target(normalize_corpus_text(piece.text))
-    if not raw_target.strip():
+    full = normalize_corpus_text(piece.text)
+    if not full.strip():
         return []
-    # Rewrite pairs: multi-paragraph voice targets (cadence restore).
-    voice_target = _truncate_voice_target(_ensure_voice_paragraphs(raw_target))
+    chunks = _paragraph_chunks(full, MAX_SFT_TARGET_CHARS)
+    if not chunks:
+        return []
+    multi = len(chunks) > 1
+    oversample = _chunk_oversample(piece.source)
     out: list[dict] = []
-    for kind, draft_fn in (("slop", _neutral_draft), ("clean", _clean_generic_draft)):
-        # Draft from the paragraphized target so meaning aligns; flatten still
-        # collapses to a single block for the user turn.
-        draft = _truncate_for_seq_budget(draft_fn(voice_target), MAX_SFT_DRAFT_CHARS)
-        if not draft.strip() or draft.strip() == voice_target.strip():
+
+    for raw_chunk in chunks:
+        raw_target = _truncate_voice_target(raw_chunk)
+        if not raw_target.strip():
             continue
-        row = _example_row(
-            draft=draft, target=voice_target, piece=piece, pair_kind=kind
-        )
-        if row is not None:
-            out.append(row)
-        # Extra short multi-para pairs: reinforce branding-length cadence restore
-        # (eval drafts are ~1–2 sentences of mush/flat).
-        if (
-            "\n\n" in voice_target
-            and len(voice_target) <= 280
-            and voice_target.count("\n\n") >= 1
-        ):
+        voice_target = _truncate_voice_target(_ensure_voice_paragraphs(raw_target))
+        for kind, draft_fn in (("slop", _neutral_draft), ("clean", _clean_generic_draft)):
+            draft = _truncate_for_seq_budget(draft_fn(voice_target), MAX_SFT_DRAFT_CHARS)
+            if not draft.strip() or draft.strip() == voice_target.strip():
+                continue
+            pair_kind = f"{kind}_chunk" if multi else kind
+            # Posts/articles oversample clean (and clean_chunk); comments stay 1×.
+            repeats = oversample if kind == "clean" else 1
+            for _ in range(repeats):
+                row = _example_row(
+                    draft=draft, target=voice_target, piece=piece, pair_kind=pair_kind
+                )
+                if row is not None:
+                    out.append(row)
+            # Short multi-para cadence oversample (branding-length evals).
+            if (
+                not multi
+                and "\n\n" in voice_target
+                and len(voice_target) <= 280
+                and voice_target.count("\n\n") >= 1
+            ):
+                row = _example_row(
+                    draft=draft,
+                    target=voice_target,
+                    piece=piece,
+                    pair_kind=f"{kind}_cadence",
+                )
+                if row is not None:
+                    out.append(row)
+
+        # Leave-alone only for *original* multi-paragraph voice chunks — never
+        # from artificially paragraphized flats.
+        leave_draft = _truncate_for_seq_budget(raw_target, MAX_SFT_DRAFT_CHARS)
+        if leave_draft.strip() and "\n\n" in leave_draft:
             row = _example_row(
-                draft=draft,
-                target=voice_target,
+                draft=leave_draft,
+                target=leave_draft,
                 piece=piece,
-                pair_kind=f"{kind}_cadence",
+                pair_kind="leave_alone",
             )
             if row is not None:
                 out.append(row)
-
-    # Leave-alone only for *original* multi-paragraph voice pieces — teaches
-    # "don't flatten / don't fidget". Do not mint leave-alone from artificially
-    # paragraphized flats (that would dilute clean/slop → voice rewrite signal).
-    leave_draft = _truncate_for_seq_budget(raw_target, MAX_SFT_DRAFT_CHARS)
-    if leave_draft.strip() and "\n\n" in leave_draft:
-        row = _example_row(
-            draft=leave_draft,
-            target=leave_draft,
-            piece=piece,
-            pair_kind="leave_alone",
-        )
-        if row is not None:
-            out.append(row)
     return out
 
 

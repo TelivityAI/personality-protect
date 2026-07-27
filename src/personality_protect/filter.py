@@ -109,6 +109,15 @@ _THAT_PART_PEOPLE_RE = re.compile(
     r"\bThat's the part people\b",
     re.IGNORECASE,
 )
+# Article throat-clearers that survived post strip (verified on private run).
+_HERE_THE_PROBLEM_RE = re.compile(
+    r"(?m)^(?:Here's|Here is) the problem:\s*",
+    re.IGNORECASE,
+)
+_HERE_THE_PART_BOTHER_RE = re.compile(
+    r"(?m)^(?:Here's|Here is) the part that should genuinely bother[^\n]*\n?",
+    re.IGNORECASE,
+)
 _LEADING_QUOTE_PARA_RE = re.compile(
     r'\A\s*("[^"\n]+"|“[^”\n]+”)\s*(?:\n+|$)',
 )
@@ -127,6 +136,8 @@ def strip_voice_scaffolding(text: str) -> str:
     if not body:
         return ""
     body = _HERE_WHAT_LOOKED_LIKE_RE.sub("", body)
+    body = _HERE_THE_PROBLEM_RE.sub("", body)
+    body = _HERE_THE_PART_BOTHER_RE.sub("", body)
     body = _THAT_PART_WORTH_RE.sub("", body)
     body = _THAT_PART_PEOPLE_RE.sub("That's what people", body)
     # Mid-sentence cuts can glue the next sentence onto the previous period.
@@ -266,29 +277,37 @@ def draft_already_in_voice(draft: str) -> bool:
     """True when the draft already has multi-para rhetorical / punch cadence.
 
     Leave-alone applies here. Flat clean professional prose does *not* qualify
-    even when it uses mildly punchy vocabulary.
+    even when it uses mildly punchy vocabulary. Long polished frontier prose
+    (article-length) never qualifies via weak marks — questions / contractions /
+    first person alone are not the user's voice.
     """
     draft = (draft or "").strip()
     if not draft:
+        return False
+    # Article-length polished Claude falsely trips weak heuristics.
+    if len(draft) > 1600:
         return False
     paras = [p for p in re.split(r"\n\s*\n", draft) if p.strip()]
     structured = len(paras) >= 2 or draft.count("\n") >= 2
     if not structured:
         return False
-    marks = 0
-    if "?" in draft:
-        marks += 2
-    if _VOICE_MARK_RE.search(draft):
-        marks += 2
+    punchy = False
     if paras:
         avg = sum(len(p) for p in paras) / len(paras)
-        if avg <= 140 and len(paras) >= 3:
-            marks += 1
+        punchy = avg <= 140 and len(paras) >= 3
+    marks = 0
+    if _VOICE_MARK_RE.search(draft):
+        marks += 2
+    # Rhetorical ? only counts with short-punch structure (not alone).
+    if "?" in draft and punchy:
+        marks += 2
+    if punchy:
+        marks += 1
     if re.search(r"\b(?:I'm|I've|I'd|don't|doesn't|isn't|won't|can't)\b", draft):
         marks += 1
     if len(re.findall(r"\bI\b", draft)) >= 2:
         marks += 1
-    return marks >= 2
+    return marks >= 3
 
 
 def draft_looks_soulless(draft: str) -> bool:
