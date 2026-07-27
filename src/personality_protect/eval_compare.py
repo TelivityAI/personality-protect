@@ -278,8 +278,8 @@ def count_proper_nouns(text: str) -> int:
 
 
 # Evidence figures only — not labels or narrative clocks.
-# - ATPCO Category 15/35 / version ids
-# - T+N IRROPS timeline markers (concrete prose, not falsifiable claims)
+# - category/version ids (e.g. Category 15/35)
+# - T+N timeline markers (structure, not falsifiable claims)
 _NON_EVIDENCE_NUMBER_CONTEXT = re.compile(
     r"(?i)\b(?:categor(?:y|ies)|cat\.?)\s*\d+(?:\s*/\s*\d+)?"
     r"|\b(?:categor(?:y|ies)|cat\.?)\s*\d+\s*(?:and|&|/)\s*\d+"
