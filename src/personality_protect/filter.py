@@ -64,6 +64,30 @@ FILTER_USER_TEMPLATE_INFER = (
     "### Rewritten"
 )
 
+# Studio / Claude→voice: never leave-alone. Adapter was trained to copy "already voice"
+# drafts; frontier Claude often triggers that path. Force requires a real rewrite.
+FILTER_SYSTEM_PROMPT_FORCE = (
+    "Personal voice rewriter. ALWAYS rewrite — never return the draft unchanged. "
+    "Match cadence: short punches, rhetorical bite, contractions, paragraph rhythm. "
+    "Keep meaning and facts. Preserve paragraph breaks and section headers. "
+    "Tighten throat-clearing setups ('Here's what X actually looked like:') into "
+    "verdicts. Cut soft transitions. Prefer your diction over polished-generic clarity. "
+    "Strip AI tells (leverage, synergies, delve, robust, In today's fast-paced world, "
+    "It is important to note, Moreover, Furthermore, unlock, nestled, testament, "
+    "vibrant). No invented facts, hashtags, or emoji unless the voice uses them. "
+    "Never truncate: rewrite the full draft through the final sentence."
+)
+
+FILTER_USER_TEMPLATE_FORCE = (
+    "ALWAYS rewrite this in my voice — do not copy the draft. Change cadence and "
+    "diction. Preserve paragraph breaks and section headers. Keep meaning; drop "
+    "throat-clearing and AI filler. Cover the whole draft — do not stop mid-piece.\n\n"
+    "### Draft\n{draft}\n\n"
+    "### Rewritten"
+)
+
+FILTER_TEMPERATURE_FORCE = 0.7
+
 
 def suggest_max_tokens(draft: str, *, override: int | None = None) -> int:
     """Token budget large enough to finish a full rewrite of ``draft``.
@@ -77,37 +101,51 @@ def suggest_max_tokens(draft: str, *, override: int | None = None) -> int:
     return min(MAX_MAX_TOKENS, max(DEFAULT_MAX_TOKENS, approx + 256))
 
 
-def filter_system_prompt() -> str:
-    return FILTER_SYSTEM_PROMPT
+def filter_system_prompt(*, force: bool = False) -> str:
+    return FILTER_SYSTEM_PROMPT_FORCE if force else FILTER_SYSTEM_PROMPT
 
 
-def build_filter_user_content(draft: str, *, reference: str | None = None) -> str:
+def build_filter_user_content(
+    draft: str, *, reference: str | None = None, force: bool = False
+) -> str:
     """User turn matching SFT shape so LoRA completes a rewrite, not a template loop."""
     draft = draft.strip()
     if reference and reference.strip():
         return USER_TEMPLATE.format(draft=draft, reference=reference.strip())
+    if force:
+        return FILTER_USER_TEMPLATE_FORCE.format(draft=draft)
     return FILTER_USER_TEMPLATE_INFER.format(draft=draft)
 
 
 def build_filter_messages(
-    draft: str, *, reference: str | None = None, few_shot: str | None = None
+    draft: str,
+    *,
+    reference: str | None = None,
+    few_shot: str | None = None,
+    force: bool = False,
 ) -> list[dict[str, str]]:
     """Chat messages aligned with SFT training (system + user)."""
-    user = build_filter_user_content(draft, reference=reference)
+    user = build_filter_user_content(draft, reference=reference, force=force)
     if few_shot and few_shot.strip() and not (reference and reference.strip()):
         # Receipts / baseline: inject few-shot above the draft block.
         user = few_shot.strip() + "\n\n" + user
     return [
-        {"role": "system", "content": filter_system_prompt()},
+        {"role": "system", "content": filter_system_prompt(force=force)},
         {"role": "user", "content": user},
     ]
 
 
 def build_filter_prompt(
-    draft: str, *, few_shot: str | None = None, reference: str | None = None
+    draft: str,
+    *,
+    few_shot: str | None = None,
+    reference: str | None = None,
+    force: bool = False,
 ) -> str:
     """Flat prompt for backends without chat templates (and compare receipts)."""
-    messages = build_filter_messages(draft, reference=reference, few_shot=few_shot)
+    messages = build_filter_messages(
+        draft, reference=reference, few_shot=few_shot, force=force
+    )
     parts = [messages[0]["content"], "", messages[1]["content"]]
     # Ensure trailing newline after ### Rewritten so generation continues cleanly.
     text = "\n".join(parts)
@@ -215,10 +253,12 @@ def similarity_guard(
     return rewrite
 
 
-def finalize_rewrite(text: str, *, draft: str | None = None) -> str:
+def finalize_rewrite(
+    text: str, *, draft: str | None = None, apply_guard: bool = True
+) -> str:
     """Template-echo cut + AI-tell cleanup (+ optional near-identity keep-draft)."""
     out = strip_ai_tells(extract_rewrite(text))
-    if draft is not None:
+    if apply_guard and draft is not None:
         out = similarity_guard(draft, out)
     return out
 
@@ -356,6 +396,7 @@ def filter_draft(
     backend: FilterBackend = "auto",
     max_tokens: int | None = None,
     gguf: Path | None = None,
+    force: bool = False,
 ) -> tuple[str, str]:
     """Return (rewritten_text, backend_used).
 
@@ -364,6 +405,8 @@ def filter_draft(
     MLX 4-bit → transformers → mock.
 
     ``max_tokens`` defaults to a draft-length budget (see ``suggest_max_tokens``).
+    ``force`` requires a rewrite (stronger prompt, skip similarity leave-alone guard)
+    — use for polished Claude drafts that otherwise trigger copy-through.
     """
     config = load_config(paths)
     adapter_dir = _latest_adapter(paths)
@@ -414,17 +457,23 @@ def filter_draft(
                 "No local GGUF found. Run: personality-protect download --format gguf\n"
                 f"Expected under {paths.models_dir} (~5–7 GB quantized Qwen3.5-9B)."
             )
-        rewritten = _filter_llama(draft, gguf_path, adapter_dir, budget)
+        rewritten = _filter_llama(
+            draft, gguf_path, adapter_dir, budget, force=force
+        )
     elif chosen == "mlx":
         model_id = config.base_model or DEFAULT_MLX_MODEL
-        rewritten = _filter_mlx(draft, adapter_dir, model_id, budget, paths=paths)
+        rewritten = _filter_mlx(
+            draft, adapter_dir, model_id, budget, paths=paths, force=force
+        )
     elif chosen == "transformers":
         rewritten = _filter_transformers(
-            draft, adapter_dir, config.base_model, budget
+            draft, adapter_dir, config.base_model, budget, force=force
         )
     else:
         raise RuntimeError(f"Unknown filter backend: {chosen}")
 
+    if force:
+        return rewritten.strip(), chosen
     # Near-identity → keep original (paragraphs + opener intact).
     return similarity_guard(draft, rewritten), chosen
 
@@ -472,7 +521,12 @@ def _filter_mock(draft: str, adapter_dir: Path) -> str:
 
 
 def _filter_llama(
-    draft: str, gguf_path: Path, adapter_dir: Path, max_tokens: int
+    draft: str,
+    gguf_path: Path,
+    adapter_dir: Path,
+    max_tokens: int,
+    *,
+    force: bool = False,
 ) -> str:
     try:
         from llama_cpp import Llama
@@ -484,7 +538,7 @@ def _filter_llama(
         ) from exc
 
     # Prefer chat-aligned user content; paths not available here — no reference.
-    prompt = build_filter_prompt(draft)
+    prompt = build_filter_prompt(draft, force=force)
     # Optional GGUF LoRA if present next to adapter
     lora_path = None
     for name in ("adapter.gguf", "lora.gguf"):
@@ -501,17 +555,18 @@ def _filter_llama(
     if lora_path:
         kwargs["lora_path"] = lora_path
 
+    temp = FILTER_TEMPERATURE_FORCE if force else FILTER_TEMPERATURE
     llm = Llama(**kwargs)
     out = llm(
         prompt,
         max_tokens=max_tokens,
-        temperature=FILTER_TEMPERATURE,
+        temperature=temp,
         top_p=FILTER_TOP_P,
         repeat_penalty=FILTER_REPEAT_PENALTY,
         stop=list(FILTER_STOP),
     )
     text = out["choices"][0]["text"] if out.get("choices") else str(out)
-    return finalize_rewrite(str(text), draft=draft)
+    return finalize_rewrite(str(text), draft=draft, apply_guard=not force)
 
 
 def _filter_mlx(
@@ -523,6 +578,7 @@ def _filter_mlx(
     paths: ProfilePaths | None = None,
     use_adapter: bool = True,
     few_shot: str | None = None,
+    force: bool = False,
 ) -> str:
     # CRITICAL: mlx_lm.generate installs wired_limit(~40GB) which jetsam-kills
     # Python on a 48GB Mac. Cap BEFORE importing/loading. Default ≤16 GB.
@@ -544,7 +600,9 @@ def _filter_mlx(
     # Do NOT paste a long SFT assistant snippet as "### My voice (reference)":
     # weak adapters regurgitate that corpus block instead of rewriting the draft.
     # LoRA weights carry voice; few-shot (prompt baseline) may inject anchors above.
-    messages = build_filter_messages(draft, reference=None, few_shot=few_shot)
+    messages = build_filter_messages(
+        draft, reference=None, few_shot=few_shot, force=force
+    )
 
     try:
         model, tokenizer = load(base_model, adapter_path=adapter)
@@ -561,7 +619,9 @@ def _filter_mlx(
                 enable_thinking=False,
             )
         else:
-            prompt = build_filter_prompt(draft, reference=None, few_shot=few_shot)
+            prompt = build_filter_prompt(
+                draft, reference=None, few_shot=few_shot, force=force
+            )
 
         # Stop on template markers so we never loop Draft/Rewritten sections.
         for stop in FILTER_STOP:
@@ -573,6 +633,7 @@ def _filter_mlx(
         # Budget enough tokens for full rewrites (articles need >>512).
         # Stop markers cut Draft/Rewritten template loops; do not hard-cap below
         # the caller budget — that truncated ~1k-word articles mid-sentence.
+        temp = FILTER_TEMPERATURE_FORCE if force else FILTER_TEMPERATURE
         gen_kwargs: dict = {
             "max_tokens": max(64, min(MAX_MAX_TOKENS, int(max_tokens))),
             "verbose": False,
@@ -580,13 +641,11 @@ def _filter_mlx(
         try:
             from mlx_lm.sample_utils import make_sampler
 
-            gen_kwargs["sampler"] = make_sampler(
-                temp=FILTER_TEMPERATURE, top_p=FILTER_TOP_P
-            )
+            gen_kwargs["sampler"] = make_sampler(temp=temp, top_p=FILTER_TOP_P)
         except Exception:
             pass
         out = generate(model, tokenizer, prompt=prompt, **gen_kwargs)
-        return finalize_rewrite(str(out), draft=draft)
+        return finalize_rewrite(str(out), draft=draft, apply_guard=not force)
     finally:
         release_mlx_memory()
 
@@ -614,7 +673,12 @@ def mlx_prompt_baseline(
     )
 
 def _filter_transformers(
-    draft: str, adapter_dir: Path, base_model: str, max_tokens: int
+    draft: str,
+    adapter_dir: Path,
+    base_model: str,
+    max_tokens: int,
+    *,
+    force: bool = False,
 ) -> str:
     try:
         import torch
@@ -647,7 +711,8 @@ def _filter_transformers(
         model = PeftModel.from_pretrained(model, str(adapter_dir))
     model.eval()
 
-    prompt = build_filter_prompt(draft)
+    prompt = build_filter_prompt(draft, force=force)
+    temp = FILTER_TEMPERATURE_FORCE if force else FILTER_TEMPERATURE
     inputs = tokenizer(prompt, return_tensors="pt")
     if torch.cuda.is_available():
         inputs = {k: v.cuda() for k, v in inputs.items()}
@@ -656,13 +721,13 @@ def _filter_transformers(
             **inputs,
             max_new_tokens=max_tokens,
             do_sample=True,
-            temperature=FILTER_TEMPERATURE,
+            temperature=temp,
             top_p=FILTER_TOP_P,
         )
     text = tokenizer.decode(output[0], skip_special_tokens=True)
     if "### Rewritten" in text:
         text = text.split("### Rewritten", 1)[1].strip()
-    return finalize_rewrite(text, draft=draft)
+    return finalize_rewrite(text, draft=draft, apply_guard=not force)
 
 
 def read_draft_input(text: str | None, file: Path | None) -> str:

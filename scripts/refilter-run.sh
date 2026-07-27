@@ -40,13 +40,14 @@ for f in "${files[@]}"; do
   budget=$(( chars / 3 + 256 ))
   if [ "$budget" -lt 512 ]; then budget=512; fi
   if [ "$budget" -gt 4096 ]; then budget=4096; fi
-  echo "→ filter $base (chars=$chars max_tokens=$budget)"
+  echo "→ filter $base (chars=$chars max_tokens=$budget --force)"
   personality-protect filter \
     --file "$f" \
     --out "$RUN/${base}-voiced.md" \
     --backend auto \
     --max-tokens "$budget" \
-    --json | tee "$RUN/${base}-filter.json" | head -c 400
+    --force \
+    --json | tee "$RUN/${base}-filter.json" | head -c 400 || true
   echo
   python3 - <<PY
 import json
@@ -56,11 +57,11 @@ draft = Path("$f").read_text().strip()
 voiced = Path("$RUN/${base}-voiced.md").read_text().strip()
 print(
     f"  backend={meta.get('backend')} max_tokens={meta.get('max_tokens')} "
-    f"unchanged={meta.get('unchanged')} truncated={meta.get('likely_truncated')} "
-    f"len={len(draft)}→{len(voiced)}"
+    f"force={meta.get('force')} unchanged={meta.get('unchanged')} "
+    f"truncated={meta.get('likely_truncated')} len={len(draft)}→{len(voiced)}"
 )
 if meta.get("unchanged") or draft == voiced:
-    print("  WARN: leave-alone / no-op")
+    print("  WARN: still leave-alone even with --force (adapter may be copy-biased)")
 if meta.get("likely_truncated") or (draft and len(voiced) < len(draft) * 0.55):
     print("  WARN: likely truncated — raise --max-tokens")
 PY

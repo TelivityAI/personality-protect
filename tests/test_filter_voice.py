@@ -107,6 +107,21 @@ def test_filter_prompt_pushes_past_polished_generic():
     assert "whole draft" in user_l or "mid-piece" in user_l
 
 
+def test_force_prompt_forbids_leave_alone():
+    from personality_protect.filter import (
+        FILTER_SYSTEM_PROMPT_FORCE,
+        FILTER_USER_TEMPLATE_FORCE,
+        build_filter_messages,
+    )
+
+    assert "always rewrite" in FILTER_SYSTEM_PROMPT_FORCE.lower()
+    assert "do not copy" in FILTER_USER_TEMPLATE_FORCE.lower()
+    msgs = build_filter_messages("Clean Claude draft.", force=True)
+    assert msgs[0]["content"] == FILTER_SYSTEM_PROMPT_FORCE
+    assert "ALWAYS rewrite" in msgs[1]["content"]
+    assert "Clean Claude draft." in msgs[1]["content"]
+
+
 def test_suggest_max_tokens_scales_for_articles():
     short = "Short post.\n\nSecond beat."
     assert suggest_max_tokens(short) == 512

@@ -755,6 +755,11 @@ def filter_cmd(
         "--max-tokens",
         help="Generation budget (default: scales with draft length, up to 4096).",
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Always rewrite (skip leave-alone); for polished Claude drafts.",
+    ),
     gguf: Optional[Path] = typer.Option(
         None,
         "--gguf",
@@ -784,6 +789,7 @@ def filter_cmd(
             backend=backend,  # type: ignore[arg-type]
             max_tokens=budget,
             gguf=gguf,
+            force=force,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         console.print(f"[red]{exc}[/red]")
@@ -800,6 +806,7 @@ def filter_cmd(
                     "backend": used,
                     "text": rewritten,
                     "max_tokens": budget,
+                    "force": force,
                     **flags,
                 },
                 indent=2,
@@ -807,10 +814,11 @@ def filter_cmd(
             )
         )
         return
-    console.print(f"[dim]backend={used} max_tokens={budget}[/dim]")
+    console.print(f"[dim]backend={used} max_tokens={budget} force={force}[/dim]")
     if flags["unchanged"]:
         console.print(
-            "[yellow]Filter left draft unchanged (leave-alone / similarity guard).[/yellow]"
+            "[yellow]Filter left draft unchanged "
+            "(leave-alone / similarity guard — try --force).[/yellow]"
         )
     if flags["likely_truncated"]:
         console.print(
