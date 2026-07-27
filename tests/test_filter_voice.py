@@ -84,16 +84,17 @@ def test_prompts_preserve_paragraphs_and_allow_leave_alone():
     """Training prompt keeps leave-alone; filter prompt still allows it sparingly."""
     sys_l = SYSTEM_PROMPT.lower()
     assert "paragraph" in sys_l
-    assert "unchanged" in sys_l
+    assert "unchanged" in sys_l or "leave alone" in sys_l
     assert "opener" in sys_l or "openings" in sys_l
-    # Flat/slop must be rewritten into multi-para cadence, not a thesaurus line.
     assert "thesaurus" in sys_l or "multi-paragraph" in sys_l or "blank lines" in sys_l
+    assert "soulless" in sys_l or "clean" in sys_l
     user = USER_TEMPLATE_INFER.format(draft="Companies need a clear point of view.")
     user_l = user.lower()
     assert "paragraph" in user_l
     assert "unchanged" in user_l
     assert "opener" in user_l or "openings" in user_l
     assert "multi-paragraph" in user_l or "thesaurus" in user_l or "blank lines" in user_l
+    assert "soulless" in user_l or "clean" in user_l
 
 
 def test_filter_prompt_pushes_past_polished_generic():
@@ -211,7 +212,8 @@ def test_strip_ai_tells_does_not_mint_thesaurus_mush():
     """Phrase-level cleanup — not unlock→open / nestled→in nonsense."""
     text = (
         "We must leverage robust synergies to delve into authentic personal branding.\n\n"
-        "Unlocking nestled opportunities is a testament to vibrant innovation."
+        "Unlocking nestled opportunities is a testament to vibrant innovation.\n\n"
+        "Keep this real beat about the brand."
     )
     out = strip_ai_tells(text)
     assert "\n\n" in out
@@ -220,22 +222,68 @@ def test_strip_ai_tells_does_not_mint_thesaurus_mush():
     assert "leverage" not in out.lower()
     assert "nestled" not in out.lower()
     assert "testament" not in out.lower()
-    assert "branding" in out.lower()
+    assert "branding" in out.lower() or "brand" in out.lower()
+    # Whole mush clause deleted — not "find real opportunities is innovation."
+    assert "is innovation" not in out.lower()
+    assert "Keep this real beat" in out
+
+
+def test_prefer_multipara_on_slop_paragraphizes_flat_rewrite():
+    from personality_protect.filter import prefer_multipara_on_slop
+
+    draft = (
+        "In today's fast-paced world, Contoso must leverage robust synergies. "
+        "Moreover, unlocking nestled opportunities is a testament to vibrant innovation."
+    )
+    flat = (
+        "Contoso doesn't need another synonym parade. Who's saying something real. "
+        "Ship the take."
+    )
+    out = prefer_multipara_on_slop(draft, flat)
+    assert "\n\n" in out
+    assert out.count("\n\n") >= 1
+    # Already-in-voice drafts are left alone (leave-alone path).
+    good = (
+        "These questions keep popping up every time I read another take.\n\n"
+        "How much is the first pass, and how much is cleanup?\n\n"
+        "Maybe we are too hard on vibe coders."
+    )
+    assert prefer_multipara_on_slop(good, flat) == flat
+    soulless = (
+        "Personal branding is increasingly essential as AI systems appear across "
+        "every channel. Organizations require a distinct perspective."
+    )
+    assert "\n\n" in prefer_multipara_on_slop(soulless, flat)
+
+
+def test_similarity_guard_does_not_freeze_multipara_slop():
+    """Multi-para Contoso mush must still be rewritten — never leave-alone."""
+    draft = (
+        "In today's fast-paced world, Contoso must leverage robust synergies.\n\n"
+        "Moreover, unlocking nestled opportunities is a testament to vibrant innovation."
+    )
+    voiced = (
+        "Let's be real.\n\n"
+        "Contoso doesn't need a synonym parade.\n\n"
+        "Ship the take."
+    )
+    assert similarity_guard(draft, voiced) == voiced
 
 
 def test_similarity_guard_returns_draft_when_near_identity():
     draft = (
         "These questions keep popping up every time I read another take.\n\n"
-        "How much is the first pass, and how much is cleanup?"
+        "How much is the first pass, and how much is cleanup?\n\n"
+        "Maybe we are too hard on vibe coders."
     )
     fidget = (
         "These questions keep coming up every time I read another take.\n\n"
-        "How much is the first pass, and how much is cleanup?"
+        "How much is the first pass, and how much is cleanup?\n\n"
+        "Maybe we are too hard on vibe coders."
     )
     assert similarity_guard(draft, fidget) == draft
     different = "I cut the fog and keep the branding honest."
     assert similarity_guard(draft, different) == different
-    # Flat single-block drafts must still be allowed to rewrite (clean→voice).
     flat = "Personal branding matters more than ever as AI tools flood every channel."
     voiced = "Personal branding matters. AI floods every channel — say something real."
     assert similarity_guard(flat, voiced) == voiced
@@ -255,6 +303,69 @@ def test_similarity_guard_keeps_draft_when_only_reparagraphed():
         "Drucker said create a customer."
     )
     assert similarity_guard(draft, fidget) == draft
+
+
+def test_similarity_guard_does_not_freeze_soulless_clean():
+    from personality_protect.filter import (
+        draft_already_in_voice,
+        draft_looks_soulless,
+        similarity_guard,
+    )
+
+    draft = (
+        "Personal branding is increasingly essential as AI systems appear across "
+        "every channel. Organizations require a distinct perspective rather than "
+        "a templated statement regarding genuine positioning."
+    )
+    voiced = (
+        "Personal branding matters more than ever.\n\n"
+        "AI floods every channel.\n\n"
+        "Who's saying something real?"
+    )
+    assert draft_looks_soulless(draft)
+    assert not draft_already_in_voice(draft)
+    assert similarity_guard(draft, voiced) == voiced
+    blank_only = (
+        "Personal branding is increasingly essential as AI systems appear across "
+        "every channel.\n\n"
+        "Organizations require a distinct perspective rather than a templated "
+        "statement regarding genuine positioning."
+    )
+    assert similarity_guard(draft, blank_only) == blank_only
+
+
+def test_draft_already_in_voice_detects_vibe_shaped():
+    from personality_protect.filter import draft_already_in_voice, draft_looks_soulless
+
+    vibe = (
+        "These questions keep popping up every time I read another vibe coding take.\n\n"
+        "How much of the labs' revenue is the first pass, and how much is cleanup?\n\n"
+        "Maybe we are too hard on vibe coders."
+    )
+    assert draft_already_in_voice(vibe)
+    assert not draft_looks_soulless(vibe)
+
+
+def test_dedupe_repetition_collapse_cuts_loops():
+    from personality_protect.filter import _dedupe_repetition_collapse, finalize_rewrite
+
+    spam = "\n\n".join(
+        [f"AI will never say “{w}.”" for w in (
+            "connections", "Fast-paced", "Nested", "real", "Testament",
+            "Dynamic", "Multifaceted", "Catalyst", "Confluence", "Disruption",
+        )]
+        + ["AI will never say"] * 20
+    )
+    out = _dedupe_repetition_collapse(spam)
+    assert out.count("AI will never") <= 6
+    block = (
+        "So why settle for hype when the AI floods the channel?\n\n"
+        "The point is authenticity.\n\n"
+        "When everyone sounds the same, authenticity cuts through.\n\n"
+    )
+    collapsed = _dedupe_repetition_collapse(block * 6)
+    assert collapsed.count("The point is authenticity") == 1
+    assert finalize_rewrite(spam).count("AI will never") <= 6
 
 
 def test_filter_messages_default_omits_long_reference():

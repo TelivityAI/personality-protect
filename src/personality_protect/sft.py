@@ -18,10 +18,11 @@ SYSTEM_PROMPT = (
     "Personal voice rewriter. Match cadence: short punches, rhetorical bite, "
     "contractions, paragraph rhythm — not generic clean prose. Keep meaning. "
     "Preserve paragraph breaks; never flatten multi-paragraph drafts. "
-    "Keep a strong opener unless it is sloppy/AI scaffolding. "
-    "If the draft already matches the user's voice, return it unchanged — no fidget. "
-    "If flat, corporate, mushy, or AI-slop: rewrite into multi-paragraph voice with "
-    "blank lines between punches — never a thesaurus one-liner. "
+    "Keep a strong opener unless sloppy/AI scaffolding. "
+    "Leave alone only for user's voice cadence (multi-para punches / rhetorical "
+    "bite) — not bland clean professional prose. "
+    "Flat, corporate, soulless, or AI-slop → multi-paragraph voice with blank "
+    "lines — never a thesaurus one-liner or blank-line-only split. "
     "Strip AI tells (leverage, synergies, delve, robust, In today's fast-paced world, "
     "It is important to note, Moreover, Furthermore, unlock, nestled, testament, "
     "vibrant). No invented facts, hashtags, or emoji unless the voice uses them."
@@ -29,10 +30,11 @@ SYSTEM_PROMPT = (
 
 # Inference-aligned user turn (no reference dump — LoRA must carry voice).
 USER_TEMPLATE_INFER = (
-    "Rewrite in my voice when needed. Cadence and diction — not bland marketing. "
+    "Rewrite in my voice when needed. Cadence — not bland marketing. "
     "Preserve paragraph breaks. Keep a strong opener unless sloppy. "
-    "Flat/corporate/AI-slop → multi-paragraph voice with blank lines (not one "
-    "thesaurus sentence). Already my voice → unchanged. Same meaning; drop AI filler.\n\n"
+    "Flat/corporate/soulless/AI-slop → multi-para voice with blank lines "
+    "(not thesaurus or blank-line-only split). "
+    "Already my voice cadence → unchanged. Same meaning; drop AI filler.\n\n"
     "### Draft\n{draft}\n\n"
     "### Rewritten"
 )
@@ -41,8 +43,9 @@ USER_TEMPLATE_INFER = (
 USER_TEMPLATE = (
     "Rewrite in my voice when needed. Match cadence from the reference. "
     "Preserve paragraph breaks. Keep a strong opener unless sloppy. "
-    "Flat/corporate/AI-slop → multi-paragraph voice with blank lines (not one "
-    "thesaurus sentence). Already my voice → unchanged. Same meaning; drop AI filler.\n\n"
+    "Flat/corporate/soulless/AI-slop → multi-para voice with blank lines "
+    "(not thesaurus or blank-line-only split). "
+    "Already my voice cadence → unchanged. Same meaning; drop AI filler.\n\n"
     "### Draft\n{draft}\n\n"
     "### My voice (reference)\n{reference}\n\n"
     "### Rewritten"
@@ -62,7 +65,9 @@ _HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
 MAX_SFT_TARGET_CHARS = 280
 MAX_SFT_DRAFT_CHARS = 280
 # Hard char budget for system+user+assistant (chat template adds a little more).
-MAX_SFT_EXAMPLE_CHARS = 1600
+# Slightly above 1600 so leave-alone/soulless prompt wording still fits
+# max-length drafts without dropping the whole row (nan risk stays on seq=512).
+MAX_SFT_EXAMPLE_CHARS = 1650
 # Bland public business idioms only — never encode user-specific metaphors.
 _METAPHOR_FLATTEN = (
     (re.compile(r"\bcash cow\b", re.I), "primary revenue source"),
@@ -238,9 +243,32 @@ def _example_row(
     pair_kind: str,
 ) -> dict | None:
     """Build one SFT row, or None if it would overflow the MLX 512-token budget."""
+    draft = (draft or "").strip()
+    target = (target or "").strip()
+    if not draft or not target:
+        return None
+    # Shrink draft then target until the row fits (prefer keeping the pair).
+    for _ in range(6):
+        user = USER_TEMPLATE_INFER.format(draft=draft)
+        total = len(SYSTEM_PROMPT) + len(user) + len(target)
+        if total <= MAX_SFT_EXAMPLE_CHARS:
+            break
+        overflow = total - MAX_SFT_EXAMPLE_CHARS
+        if len(draft) > 96:
+            draft = _truncate_for_seq_budget(
+                draft, max(96, len(draft) - overflow - 8)
+            )
+            continue
+        if len(target) > 96:
+            target = _truncate_for_seq_budget(
+                target, max(96, len(target) - overflow - 8)
+            )
+            continue
+        return None
+    else:
+        return None
     user = USER_TEMPLATE_INFER.format(draft=draft)
-    total = len(SYSTEM_PROMPT) + len(user) + len(target)
-    if total > MAX_SFT_EXAMPLE_CHARS:
+    if len(SYSTEM_PROMPT) + len(user) + len(target) > MAX_SFT_EXAMPLE_CHARS:
         return None
     return {
         "messages": [
@@ -825,6 +853,139 @@ def _synthetic_short_cadence_examples() -> list[dict]:
     return out
 
 
+def _synthetic_clean_flat_voice_examples() -> list[dict]:
+    """Bland clean-flat → multi-para voice (Contoso/Northwind only).
+
+    Teaches restyle on soulless professional prose that has no AI-tells — the
+    clean_neutral failure mode where LoRA only inserts a blank line. Heavy
+    oversample; leave-alone stays on real multi-para corpus pieces elsewhere.
+    """
+    pairs: list[tuple[str, str]] = [
+        (
+            (
+                "Personal branding is increasingly essential as AI systems appear "
+                "across every channel. Organizations require a distinct perspective "
+                "rather than a templated statement regarding genuine positioning."
+            ),
+            (
+                "Personal branding matters more than ever.\n\n"
+                "AI floods every channel with the same polished nothing.\n\n"
+                "Companies need a point of view — not another authenticity template.\n\n"
+                "Who's saying something real?"
+            ),
+        ),
+        (
+            (
+                "From an operational standpoint, Contoso teams should maintain "
+                "straightforward messaging as generative systems appear across "
+                "channels. A well-defined perspective outperforms templated statements."
+            ),
+            (
+                "Here's the thing:\n\n"
+                "Contoso doesn't need another polished nothing-post.\n\n"
+                "Have a point of view, or stay quiet.\n\n"
+                "That's the filter now."
+            ),
+        ),
+        (
+            (
+                "Northwind organizations require a well-defined perspective on genuine "
+                "positioning. Templated statements fail to resonate with stakeholders "
+                "when AI systems appear across every channel."
+            ),
+            (
+                "Northwind — everyone's posting about authenticity.\n\n"
+                "Almost nobody sounds like a person.\n\n"
+                "If AI floods the channel, your point of view is the only filter left.\n\n"
+                "Make it count."
+            ),
+        ),
+        (
+            (
+                "Thought leadership is essential as generative systems appear across "
+                "every channel. Contoso Labs require a distinct perspective rather "
+                "than a templated statement regarding genuine positioning."
+            ),
+            (
+                "Thought leadership matters more than ever.\n\n"
+                "Contoso Labs keeps shipping the same template about authenticity.\n\n"
+                "Generative sludge floods every channel.\n\n"
+                "Say something with a spine — or don't post."
+            ),
+        ),
+        (
+            (
+                "Organizations connected with Contoso require a well-defined "
+                "perspective on personal branding, rather than a templated statement. "
+                "AI systems appear across every channel with increasing frequency."
+            ),
+            (
+                "Let's be real.\n\n"
+                "Contoso's problem isn't missing a branding deck.\n\n"
+                "It's sounding like every other post in the feed.\n\n"
+                "Cut the fog. Keep the spine."
+            ),
+        ),
+        (
+            (
+                "Notably, teams should examine how Northwind Analytics maintains "
+                "straightforward messaging. Clients prefer a distinct perspective "
+                "over a templated statement regarding genuine positioning."
+            ),
+            (
+                "Northwind Analytics — really?\n\n"
+                "Clients don't want another authenticity template.\n\n"
+                "They want a clear take that isn't mush.\n\n"
+                "Ship the take."
+            ),
+        ),
+    ]
+    out: list[dict] = []
+    for draft, target in pairs:
+        draft_t = _truncate_for_seq_budget(draft, MAX_SFT_DRAFT_CHARS)
+        target_t = _truncate_for_seq_budget(target, MAX_SFT_TARGET_CHARS)
+        # Keep blank-line punches under budget (prefer full paras over ellipsis mush).
+        if "\n\n" in target and len(target) > MAX_SFT_TARGET_CHARS:
+            paras = [p.strip() for p in target.split("\n\n") if p.strip()]
+            kept: list[str] = []
+            for p in paras:
+                cand = "\n\n".join(kept + [p]) if kept else p
+                if len(cand) <= MAX_SFT_TARGET_CHARS:
+                    kept.append(p)
+                elif not kept:
+                    kept.append(_truncate_for_seq_budget(p, MAX_SFT_TARGET_CHARS))
+                    break
+                else:
+                    break
+            target_t = "\n\n".join(kept) if kept else target_t
+        piece = Piece(
+            id=f"synthetic_clean_flat_{len(out)}",
+            source="demo",
+            text=target_t,
+            year=2026,
+            word_count=len(target_t.split()),
+        )
+        row = _example_row(
+            draft=draft_t, target=target_t, piece=piece, pair_kind="clean"
+        )
+        if row is None:
+            continue
+        out.append(row)
+        # Light oversample — heavier 5× oversample collapsed multipara cadence
+        # into repetition loops; 2× keeps clean→voice signal without drowning
+        # leave-alone / multipara pairs.
+        for _ in range(2):
+            dup = _example_row(
+                draft=draft_t,
+                target=target_t,
+                piece=piece,
+                pair_kind="clean_flat",
+            )
+            if dup is not None:
+                out.append(dup)
+    return out
+
+
 def _synthetic_multipara_cadence_examples() -> list[dict]:
     """Multi-paragraph Contoso/Northwind slop→voice pairs (not one-liner branding).
 
@@ -956,8 +1117,8 @@ def _synthetic_multipara_cadence_examples() -> list[dict]:
         if row is None:
             continue
         out.append(row)
-        # Heavy oversample — multipara cadence is the failure mode we are fixing.
-        for _ in range(5):
+        # Heavy oversample — multipara cadence must stay ≥ A− (don't drown in clean_flat).
+        for _ in range(7):
             dup = _example_row(
                 draft=draft_t,
                 target=target_t,
@@ -983,6 +1144,9 @@ def build_sft_jsonl(pieces: Iterable[Piece], out_path: Path) -> int:
             fh.write(json.dumps(ex, ensure_ascii=False) + "\n")
             count += 1
         for ex in _synthetic_multipara_cadence_examples():
+            fh.write(json.dumps(ex, ensure_ascii=False) + "\n")
+            count += 1
+        for ex in _synthetic_clean_flat_voice_examples():
             fh.write(json.dumps(ex, ensure_ascii=False) + "\n")
             count += 1
     return count

@@ -197,18 +197,176 @@ def build_filter_prompt(
     return text
 
 
+_SLOP_HINT_RE = re.compile(
+    r"(?i)\b(?:leverage|synerg|delve|robust|moreover|furthermore|additionally|"
+    r"unlock(?:ing)?|nestled|testament|vibrant|in today's|"
+    r"it is important to note)\b"
+)
+
+_VOICE_MARK_RE = re.compile(
+    r"(?i)(?:here's the thing|let's be real|let me be clear|let's be honest|"
+    r"\bwth\b|who'?s saying|ship the take|cut the fog|keep the spine|"
+    r"say something|make it count|or don'?t post|or stay quiet)"
+)
+
+
+def draft_looks_sloppy(draft: str) -> bool:
+    """True when the draft carries common AI-slop scaffolding."""
+    hits = len(_SLOP_HINT_RE.findall(draft or ""))
+    return hits >= 2
+
+
+def draft_already_in_voice(draft: str) -> bool:
+    """True when the draft already has multi-para rhetorical / punch cadence.
+
+    Leave-alone applies here. Flat clean professional prose does *not* qualify
+    even when it uses mildly punchy vocabulary.
+    """
+    draft = (draft or "").strip()
+    if not draft:
+        return False
+    paras = [p for p in re.split(r"\n\s*\n", draft) if p.strip()]
+    structured = len(paras) >= 2 or draft.count("\n") >= 2
+    if not structured:
+        return False
+    marks = 0
+    if "?" in draft:
+        marks += 2
+    if _VOICE_MARK_RE.search(draft):
+        marks += 2
+    if paras:
+        avg = sum(len(p) for p in paras) / len(paras)
+        if avg <= 140 and len(paras) >= 3:
+            marks += 1
+    if re.search(r"\b(?:I'm|I've|I'd|don't|doesn't|isn't|won't|can't)\b", draft):
+        marks += 1
+    if len(re.findall(r"\bI\b", draft)) >= 2:
+        marks += 1
+    return marks >= 2
+
+
+def draft_looks_soulless(draft: str) -> bool:
+    """Clean professional prose without AI-slop and without voice cadence.
+
+    These drafts must be restyled (clean→voice), never leave-alone frozen.
+    """
+    draft = (draft or "").strip()
+    if not draft:
+        return False
+    if draft_looks_sloppy(draft):
+        return False
+    if draft_already_in_voice(draft):
+        return False
+    return True
+
+
+def prefer_multipara_on_slop(draft: str, rewrite: str) -> str:
+    """Prefer blank-line paragraph punches when the input was sloppy or soulless.
+
+    Leave-alone for already-good voice drafts is owned by similarity_guard. This
+    only repairs flat / single-block outputs after slop stripping or clean-flat
+    restyle so cadence compare isn't stuck on thesaurus one-liners.
+    """
+    draft = (draft or "").strip()
+    rewrite = (rewrite or "").strip()
+    if not rewrite:
+        return rewrite
+    if not (draft_looks_sloppy(draft) or draft_looks_soulless(draft)):
+        return rewrite
+    if "\n\n" in rewrite:
+        return rewrite
+    return _paragraphize_punches(rewrite)
+
+
+def _paragraphize_punches(text: str) -> str:
+    """Turn a flat multi-sentence block into blank-line punches."""
+    text = (text or "").strip()
+    if not text or "\n\n" in text:
+        return text
+    if "\n" in text:
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        if len(lines) >= 2:
+            return "\n\n".join(lines)
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+    if len(parts) < 2:
+        return text
+    paras: list[str] = []
+    for p in parts:
+        if paras and len(p) < 28:
+            paras[-1] = f"{paras[-1]} {p}"
+        else:
+            paras.append(p)
+    if len(paras) < 2:
+        return text
+    return "\n\n".join(paras)
+
+
+def _dedupe_repetition_collapse(text: str) -> str:
+    """Cut mode-collapse loops ('AI will never say…' / repeating punches) down."""
+    text = (text or "").strip()
+    if not text:
+        return text
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if len(paras) < 6:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if len(lines) < 8:
+            return text
+        paras = lines
+    # Detect repeating block of 2–4 paragraphs.
+    for block in (2, 3, 4):
+        if len(paras) < block * 3:
+            continue
+        head = paras[:block]
+        keys = [re.sub(r"\s+", " ", p.lower())[:72] for p in head]
+        repeats = 0
+        for i in range(block, len(paras) - block + 1, block):
+            nxt = [re.sub(r"\s+", " ", p.lower())[:72] for p in paras[i : i + block]]
+            if nxt == keys:
+                repeats += 1
+        if repeats >= 2:
+            return "\n\n".join(head)
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for p in paras:
+        key = re.sub(r"\s+", " ", p.lower())[:72]
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+        if len(uniq) >= 6:
+            break
+    if len(uniq) >= 2 and len(uniq) < len(paras) * 0.5:
+        return "\n\n".join(uniq)
+    return text
+
+
 def strip_ai_tells(text: str) -> str:
     """Remove common AI-tell phrases the system prompt asks the model to strip.
 
     Preserves paragraph breaks / blank lines — never flatten multi-paragraph
     rewrites into a single prose block (that was the vibe-draft B− failure mode).
 
-    Prefer deleting scaffolding / multi-word tells over synonym swaps that mint
-    thesaurus mush ("unlocking nestled" → "open in").
+    Prefer deleting scaffolding / whole mush clauses over synonym swaps that mint
+    thesaurus mush ("unlocking nestled" → "open in" / "is innovation").
     """
     body = text
+    # Drop full scaffold sentences before word-level cleanup.
     body = re.sub(
-        r"\bIn today's (?:fast-paced\s+)?(?:digital\s+)?(?:fast-paced\s+)?world,?\s*",
+        r"(?is)\b(?:moreover|furthermore|additionally)[, ]+"
+        r"[^.?!]{0,120}?(?:testament to(?:\s+vibrant)?|unlock(?:ing)?\s+nestled|"
+        r"leverage(?:\s+robust)?\s+synergies)[^.?!]*[.?!]\s*",
+        "",
+        body,
+    )
+    body = re.sub(
+        r"(?is)\bunlock(?:ing)?\s+nestled\s+opportunities\s+"
+        r"is\s+a\s+testament\s+to\s+vibrant\s+\w+[^.?!]*[.?!]\s*",
+        "",
+        body,
+    )
+    body = re.sub(
+        r"\bIn today's (?:fast-paced\s+)?(?:digital\s+)?(?:fast-paced\s+)?(?:digital\s+)?"
+        r"(?:world|landscape),?\s*",
         "",
         body,
         flags=re.I,
@@ -231,7 +389,7 @@ def strip_ai_tells(text: str) -> str:
         body,
         flags=re.I,
     )
-    body = re.sub(r"\ba testament to\s+vibrant\s+", "", body, flags=re.I)
+    body = re.sub(r"\ba testament to\s+vibrant\s+\w+\b", "", body, flags=re.I)
     body = re.sub(r"\ba testament to\s+", "", body, flags=re.I)
     body = re.sub(r"\bdelve into\b", "talk about", body, flags=re.I)
     body = re.sub(r"\butilize\b", "use", body, flags=re.I)
@@ -242,10 +400,17 @@ def strip_ai_tells(text: str) -> str:
     body = re.sub(r"\bunlock(?:ing)?\b", "find", body, flags=re.I)
     body = re.sub(r"\bnestled\b", "", body, flags=re.I)
     body = re.sub(r"\bvibrant\b", "", body, flags=re.I)
+    # Broken leftovers from clause deletion ("is innovation." / "is .").
+    body = re.sub(r"(?i)\bis\s+(?:innovation|excellence)\b", "", body)
+    body = re.sub(
+        r"(?i)\bfind real opportunities\s+is\b", "find real opportunities", body
+    )
     # Collapse horizontal whitespace only; keep newlines / paragraph rhythm.
     body = re.sub(r"[^\S\n]{2,}", " ", body)
     body = re.sub(r"[ \t]+\n", "\n", body)
     body = re.sub(r"\n{3,}", "\n\n", body)
+    body = re.sub(r"\s+([,.])", r"\1", body)
+    body = body.strip(" \t,;")
     body = body.strip()
     if body:
         # Capitalize first non-whitespace char without touching later lines.
@@ -269,6 +434,9 @@ def similarity_guard(
     flattening LinkedIn-shaped posts. Also catches "fidget re-paragraphing"
     that lowers SequenceMatcher ratio while keeping nearly the same tokens.
     Flat single-block drafts still get a real rewrite (clean→voice / slop→voice).
+    Never freezes AI-slop drafts — multi-para mush must still be rewritten.
+    Never freezes clean-but-soulless drafts — bland professional prose must be
+    restyled, not blank-line-only frozen.
     """
     import difflib
 
@@ -280,7 +448,13 @@ def similarity_guard(
         return draft
     if draft == rewrite:
         return draft
-    # Only guard structured posts; don't freeze flat clean/slop one-liners.
+    # Never leave AI-slop alone — even multi-paragraph Contoso mush.
+    if draft_looks_sloppy(draft):
+        return rewrite
+    # Never freeze bland clean professional prose (clean→voice path).
+    if draft_looks_soulless(draft):
+        return rewrite
+    # Only guard structured voice-shaped posts; don't freeze flats.
     draft_paras = [p for p in re.split(r"\n\s*\n", draft) if p.strip()]
     if len(draft_paras) < 2 and draft.count("\n") < 2:
         return rewrite
@@ -341,7 +515,9 @@ def finalize_rewrite(
 ) -> str:
     """Template-echo cut + AI-tell cleanup (+ guards) + deterministic scaffolding."""
     out = strip_ai_tells(extract_rewrite(text))
+    out = _dedupe_repetition_collapse(out)
     if draft is not None:
+        out = prefer_multipara_on_slop(draft, out)
         if apply_guard:
             out = similarity_guard(draft, out)
         if apply_substance:
@@ -577,8 +753,9 @@ def filter_draft(
     if force:
         # Never ship empty; scaffolding strip still runs if the model copied.
         return strip_voice_scaffolding(rewritten.strip() or draft), chosen
-    # Near-identity → keep original, then still cut known scaffolding.
-    return strip_voice_scaffolding(similarity_guard(draft, rewritten)), chosen
+    # Sloppy/soulless → prefer punches; then leave-alone guard; then scaffolding.
+    out = prefer_multipara_on_slop(draft, rewritten)
+    return strip_voice_scaffolding(similarity_guard(draft, out)), chosen
 
 
 def _has_llama_cpp() -> bool:
