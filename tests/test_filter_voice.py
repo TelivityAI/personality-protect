@@ -147,6 +147,49 @@ def test_strip_voice_scaffolding_cuts_known_patterns():
     assert "quality.\n\nThe loop" in out
 
 
+def test_force_echo_must_not_write_voiced_file(tmp_path):
+    """Under --force, byte-identical rewrite is a hard fail (no fake voiced file)."""
+    from typer.testing import CliRunner
+
+    from personality_protect.cli import app
+
+    home = str(tmp_path)
+    runner = CliRunner()
+    assert (
+        runner.invoke(
+            app, ["--logo", "off", "init", "--home", home, "--json"]
+        ).exit_code
+        == 0
+    )
+    draft = tmp_path / "draft.md"
+    draft.write_text("Plain polished paragraph with no voice punch.\n", encoding="utf-8")
+    out = tmp_path / "voiced.md"
+
+    def _echo(draft_text, _paths, **kwargs):
+        return draft_text.strip(), "mock"
+
+    with patch("personality_protect.cli.filter_draft", side_effect=_echo):
+        result = runner.invoke(
+            app,
+            [
+                "--logo",
+                "off",
+                "filter",
+                "--file",
+                str(draft),
+                "--out",
+                str(out),
+                "--force",
+                "--home",
+                home,
+                "--json",
+            ],
+        )
+    assert result.exit_code == 1, result.output
+    assert not out.is_file()
+    assert "force_echo_reject" in result.stdout
+
+
 def test_strip_voice_scaffolding_cuts_article_throat_clearers():
     from personality_protect.filter import strip_voice_scaffolding
 

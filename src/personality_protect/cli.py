@@ -806,8 +806,10 @@ def filter_cmd(
         raise typer.Exit(1) from exc
 
     flags = rewrite_quality_flags(draft, rewritten)
-    if out:
-        out.write_text(rewritten + "\n", encoding="utf-8")
+    chunked = bool(auto_chunk and n_windows > 1)
+    # --force means "must rewrite". Byte-identical output is a hard failure —
+    # do not write a fake *-voiced.md that is just the Claude draft.
+    force_echo = bool(force and flags.get("unchanged"))
 
     if as_json:
         typer.echo(
@@ -817,23 +819,31 @@ def filter_cmd(
                     "text": rewritten,
                     "max_tokens": budget,
                     "force": force,
-                    "chunked": bool(auto_chunk and n_windows > 1),
+                    "chunked": chunked,
                     "chunk_windows": n_windows if auto_chunk else 1,
+                    "force_echo_reject": force_echo,
                     **flags,
                 },
                 indent=2,
                 ensure_ascii=False,
             )
         )
+        if force_echo:
+            raise typer.Exit(1)
+        if out:
+            out.write_text(rewritten + "\n", encoding="utf-8")
         return
-    chunk_note = (
-        f" chunked={n_windows}windows"
-        if auto_chunk and n_windows > 1
-        else ""
-    )
+
+    chunk_note = f" chunked={n_windows}windows" if chunked else ""
     console.print(
         f"[dim]backend={used} max_tokens={budget} force={force}{chunk_note}[/dim]"
     )
+    if force_echo:
+        console.print(
+            "[red]--force produced byte-identical output (echo). "
+            "Not writing voiced file — filter did not rewrite.[/red]"
+        )
+        raise typer.Exit(1)
     if flags["unchanged"]:
         console.print(
             "[yellow]Filter left draft unchanged "
@@ -847,9 +857,10 @@ def filter_cmd(
         console.print(
             "[red]Rewrite looks truncated — raise --max-tokens and re-run.[/red]"
         )
-    console.print(rewritten)
     if out:
+        out.write_text(rewritten + "\n", encoding="utf-8")
         console.print(f"[dim]wrote {out}[/dim]")
+    console.print(rewritten)
 
 
 @app.command("eval")
