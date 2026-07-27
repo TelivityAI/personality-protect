@@ -448,6 +448,8 @@ def filter_draft(
     elif backend == "gguf":
         chosen = "llama"
 
+    attempts = 3 if force and chosen != "mock" else 1
+
     if chosen == "mock":
         rewritten = _filter_mock(draft, adapter_dir)
     elif chosen == "llama":
@@ -458,28 +460,34 @@ def filter_draft(
                 f"Expected under {paths.models_dir} (~5–7 GB quantized Qwen3.5-9B)."
             )
         rewritten = _filter_llama(
-            draft, gguf_path, adapter_dir, budget, force=force
+            draft, gguf_path, adapter_dir, budget, force=force, attempts=attempts
         )
     elif chosen == "mlx":
         model_id = config.base_model or DEFAULT_MLX_MODEL
         rewritten = _filter_mlx(
-            draft, adapter_dir, model_id, budget, paths=paths, force=force
+            draft,
+            adapter_dir,
+            model_id,
+            budget,
+            paths=paths,
+            force=force,
+            attempts=attempts,
         )
     elif chosen == "transformers":
         rewritten = _filter_transformers(
-            draft, adapter_dir, config.base_model, budget, force=force
+            draft,
+            adapter_dir,
+            config.base_model,
+            budget,
+            force=force,
+            attempts=attempts,
         )
     else:
         raise RuntimeError(f"Unknown filter backend: {chosen}")
 
     if force:
-        out = rewritten.strip()
-        # Never ship empty: stop tokens / extract_rewrite can wipe a bad sample.
-        # Caller still sees likely_truncated via quality flags if they compare lengths
-        # after a failed attempt — but empty file overwrites are worse.
-        if not out:
-            return draft, chosen
-        return out, chosen
+        # Never ship empty; identical copy after retries is an honest leave-alone.
+        return (rewritten.strip() or draft), chosen
     # Near-identity → keep original (paragraphs + opener intact).
     return similarity_guard(draft, rewritten), chosen
 
@@ -533,6 +541,7 @@ def _filter_llama(
     max_tokens: int,
     *,
     force: bool = False,
+    attempts: int = 1,
 ) -> str:
     try:
         from llama_cpp import Llama
@@ -563,16 +572,22 @@ def _filter_llama(
 
     temp = FILTER_TEMPERATURE_FORCE if force else FILTER_TEMPERATURE
     llm = Llama(**kwargs)
-    out = llm(
-        prompt,
-        max_tokens=max_tokens,
-        temperature=temp,
-        top_p=FILTER_TOP_P,
-        repeat_penalty=FILTER_REPEAT_PENALTY,
-        stop=list(FILTER_STOP),
-    )
-    text = out["choices"][0]["text"] if out.get("choices") else str(out)
-    return finalize_rewrite(str(text), draft=draft, apply_guard=not force)
+    draft_s = draft.strip()
+    best = ""
+    for _ in range(max(1, attempts)):
+        out = llm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temp,
+            top_p=FILTER_TOP_P,
+            repeat_penalty=FILTER_REPEAT_PENALTY,
+            stop=list(FILTER_STOP),
+        )
+        text = out["choices"][0]["text"] if out.get("choices") else str(out)
+        best = finalize_rewrite(str(text), draft=draft, apply_guard=not force)
+        if not force or (best.strip() and best.strip() != draft_s):
+            break
+    return best
 
 
 def _filter_mlx(
@@ -585,6 +600,7 @@ def _filter_mlx(
     use_adapter: bool = True,
     few_shot: str | None = None,
     force: bool = False,
+    attempts: int = 1,
 ) -> str:
     # CRITICAL: mlx_lm.generate installs wired_limit(~40GB) which jetsam-kills
     # Python on a 48GB Mac. Cap BEFORE importing/loading. Default ≤16 GB.
@@ -640,18 +656,24 @@ def _filter_mlx(
         # Stop markers cut Draft/Rewritten template loops; do not hard-cap below
         # the caller budget — that truncated ~1k-word articles mid-sentence.
         temp = FILTER_TEMPERATURE_FORCE if force else FILTER_TEMPERATURE
-        gen_kwargs: dict = {
-            "max_tokens": max(64, min(MAX_MAX_TOKENS, int(max_tokens))),
-            "verbose": False,
-        }
-        try:
-            from mlx_lm.sample_utils import make_sampler
+        draft_s = draft.strip()
+        best = ""
+        for _ in range(max(1, attempts)):
+            gen_kwargs: dict = {
+                "max_tokens": max(64, min(MAX_MAX_TOKENS, int(max_tokens))),
+                "verbose": False,
+            }
+            try:
+                from mlx_lm.sample_utils import make_sampler
 
-            gen_kwargs["sampler"] = make_sampler(temp=temp, top_p=FILTER_TOP_P)
-        except Exception:
-            pass
-        out = generate(model, tokenizer, prompt=prompt, **gen_kwargs)
-        return finalize_rewrite(str(out), draft=draft, apply_guard=not force)
+                gen_kwargs["sampler"] = make_sampler(temp=temp, top_p=FILTER_TOP_P)
+            except Exception:
+                pass
+            out = generate(model, tokenizer, prompt=prompt, **gen_kwargs)
+            best = finalize_rewrite(str(out), draft=draft, apply_guard=not force)
+            if not force or (best.strip() and best.strip() != draft_s):
+                break
+        return best
     finally:
         release_mlx_memory()
 
@@ -685,6 +707,7 @@ def _filter_transformers(
     max_tokens: int,
     *,
     force: bool = False,
+    attempts: int = 1,
 ) -> str:
     try:
         import torch
@@ -722,18 +745,24 @@ def _filter_transformers(
     inputs = tokenizer(prompt, return_tensors="pt")
     if torch.cuda.is_available():
         inputs = {k: v.cuda() for k, v in inputs.items()}
-    with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=max_tokens,
-            do_sample=True,
-            temperature=temp,
-            top_p=FILTER_TOP_P,
-        )
-    text = tokenizer.decode(output[0], skip_special_tokens=True)
-    if "### Rewritten" in text:
-        text = text.split("### Rewritten", 1)[1].strip()
-    return finalize_rewrite(text, draft=draft, apply_guard=not force)
+    draft_s = draft.strip()
+    best = ""
+    for _ in range(max(1, attempts)):
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                do_sample=True,
+                temperature=temp,
+                top_p=FILTER_TOP_P,
+            )
+        text = tokenizer.decode(output[0], skip_special_tokens=True)
+        if "### Rewritten" in text:
+            text = text.split("### Rewritten", 1)[1].strip()
+        best = finalize_rewrite(text, draft=draft, apply_guard=not force)
+        if not force or (best.strip() and best.strip() != draft_s):
+            break
+    return best
 
 
 def read_draft_input(text: str | None, file: Path | None) -> str:
