@@ -27,6 +27,10 @@ DEFAULT_MAX_TOKENS = 512
 MAX_MAX_TOKENS = 4096
 # Rough English chars/token; rewrite needs ≥ draft length plus margin.
 _CHARS_PER_TOKEN = 3
+# Article-length drafts auto-chunk; short probes (≤~1.3k) stay single-shot.
+FILTER_CHUNK_THRESHOLD = 1600
+# Paragraph windows sized like SFT chunk pairs (seq budget ~512 tokens).
+FILTER_CHUNK_MAX_CHARS = 320
 _TEMPLATE_SECTION_RE = re.compile(
     r"\n\s*###\s*(?:Draft|Rewritten|My voice(?:\s*\(reference\))?)\b",
     re.IGNORECASE,
@@ -201,6 +205,74 @@ def suggest_max_tokens(draft: str, *, override: int | None = None) -> int:
     return min(MAX_MAX_TOKENS, max(DEFAULT_MAX_TOKENS, approx + 256))
 
 
+def paragraph_windows(
+    text: str, max_chars: int = FILTER_CHUNK_MAX_CHARS
+) -> list[str]:
+    """Pack draft paragraphs into windows that fit the filter generation budget."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not paras:
+        return [text[:max_chars]] if max_chars > 0 else [text]
+    if max_chars <= 0:
+        return ["\n\n".join(paras)]
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for para in paras:
+        if len(para) > max_chars:
+            if cur:
+                chunks.append("\n\n".join(cur))
+                cur, cur_len = [], 0
+            # Hard-split oversize paragraphs on sentence boundaries when possible.
+            parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", para) if s.strip()]
+            if len(parts) <= 1:
+                chunks.append(para[:max_chars])
+                continue
+            buf: list[str] = []
+            buf_len = 0
+            for sent in parts:
+                add = len(sent) + (1 if buf else 0)
+                if buf and buf_len + add > max_chars:
+                    chunks.append(" ".join(buf))
+                    buf, buf_len = [sent], len(sent)
+                elif len(sent) > max_chars:
+                    if buf:
+                        chunks.append(" ".join(buf))
+                        buf, buf_len = [], 0
+                    chunks.append(sent[:max_chars])
+                else:
+                    buf.append(sent)
+                    buf_len += add
+            if buf:
+                chunks.append(" ".join(buf))
+            continue
+        add = len(para) + (2 if cur else 0)
+        if cur and cur_len + add > max_chars:
+            chunks.append("\n\n".join(cur))
+            cur, cur_len = [para], len(para)
+        else:
+            cur.append(para)
+            cur_len += add
+    if cur:
+        chunks.append("\n\n".join(cur))
+    return chunks
+
+
+def stitch_filter_chunks(chunks: list[str]) -> str:
+    """Join chunk rewrites with blank lines (preserve longform paragraph rhythm)."""
+    parts = [c.strip() for c in chunks if c and c.strip()]
+    return "\n\n".join(parts)
+
+
+def should_chunk_filter(
+    draft: str, *, threshold: int = FILTER_CHUNK_THRESHOLD
+) -> bool:
+    """True when draft is article-length and should use chunked inference."""
+    return len((draft or "").strip()) > int(threshold)
+
+
 def filter_system_prompt(*, force: bool = False) -> str:
     return FILTER_SYSTEM_PROMPT_FORCE if force else FILTER_SYSTEM_PROMPT
 
@@ -301,6 +373,10 @@ def draft_already_in_voice(draft: str) -> bool:
     # Rhetorical ? only counts with short-punch structure (not alone).
     if "?" in draft and punchy:
         marks += 2
+    # Rhetorical cascade (vibe-draft Q-stack) is enough for leave-alone even
+    # when average paragraph length runs long (pending_vibe shape).
+    elif draft.count("?") >= 3 and len(paras) >= 3:
+        marks += 3
     if punchy:
         marks += 1
     if re.search(r"\b(?:I'm|I've|I'd|don't|doesn't|isn't|won't|can't)\b", draft):
@@ -727,6 +803,7 @@ def filter_draft(
     max_tokens: int | None = None,
     gguf: Path | None = None,
     force: bool = False,
+    chunk: bool | None = None,
 ) -> tuple[str, str]:
     """Return (rewritten_text, backend_used).
 
@@ -737,13 +814,14 @@ def filter_draft(
     ``max_tokens`` defaults to a draft-length budget (see ``suggest_max_tokens``).
     ``force`` requires a rewrite (stronger prompt, skip similarity leave-alone guard)
     — use for polished frontier drafts that otherwise trigger copy-through.
+    ``chunk`` overrides auto chunked inference for article-length drafts
+    (``None`` = auto when ``len(draft) > FILTER_CHUNK_THRESHOLD``).
     """
     config = load_config(paths)
     adapter_dir = _latest_adapter(paths)
     draft = draft.strip()
     if not draft:
         return "", "none"
-    budget = suggest_max_tokens(draft, override=max_tokens)
 
     chosen: str = backend
     if backend == "auto":
@@ -778,6 +856,30 @@ def filter_draft(
     elif backend == "gguf":
         chosen = "llama"
 
+    # Leave-alone before any model call: already-voice short drafts must not
+    # fidget or mode-collapse. Article-length never qualifies (see heuristic).
+    if not force and draft_already_in_voice(draft):
+        return apply_voice_postprocess(draft, draft=draft), chosen
+
+    use_chunk = should_chunk_filter(draft) if chunk is None else bool(chunk)
+    windows = paragraph_windows(draft) if use_chunk else [draft]
+    if use_chunk and len(windows) > 1:
+        # Longform: strong rewrite prompts per window; never leave-alone freeze.
+        # (force prompts are too light and yield blank-line near-copies.)
+        rewritten = _filter_draft_chunked(
+            draft,
+            windows,
+            paths=paths,
+            adapter_dir=adapter_dir,
+            config=config,
+            chosen=chosen,
+            gguf=gguf,
+            force=False,
+            max_tokens=max_tokens,
+        )
+        return rewritten, chosen
+
+    budget = suggest_max_tokens(draft, override=max_tokens)
     attempts = 3 if force and chosen != "mock" else 1
 
     if chosen == "mock":
@@ -821,6 +923,89 @@ def filter_draft(
     # Sloppy/soulless → prefer punches; then leave-alone guard; then postprocess.
     out = prefer_multipara_on_slop(draft, rewritten)
     return apply_voice_postprocess(similarity_guard(draft, out), draft=draft), chosen
+
+
+def _filter_draft_chunked(
+    draft: str,
+    windows: list[str],
+    *,
+    paths: ProfilePaths,
+    adapter_dir: Path,
+    config,
+    chosen: str,
+    gguf: Path | None,
+    force: bool,
+    max_tokens: int | None,
+) -> str:
+    """Filter paragraph windows and stitch; scaffolding/substance on full text.
+
+    Chunked longform always skips per-window similarity leave-alone (polished
+    Claude windows would otherwise freeze). Prompts stay on the strong rewrite
+    path (``force=False``) so we do not get blank-line-only near-copies.
+    """
+    # Per-chunk budget from window size (not full article).
+    piece_budget = suggest_max_tokens("x" * FILTER_CHUNK_MAX_CHARS)
+    if max_tokens is not None:
+        # Honor explicit smaller caps; ignore huge full-article budgets.
+        piece_budget = min(piece_budget, max(64, int(max_tokens)))
+    attempts = 3 if chosen != "mock" else 1
+    rewrites: list[str]
+
+    if chosen == "mlx":
+        model_id = config.base_model or DEFAULT_MLX_MODEL
+        rewrites = _filter_mlx_chunks(
+            windows,
+            adapter_dir,
+            model_id,
+            piece_budget,
+            paths=paths,
+            force=force,
+            apply_guard=False,
+            attempts=attempts,
+        )
+    else:
+        rewrites = []
+        for window in windows:
+            if chosen == "mock":
+                piece = _filter_mock(window, adapter_dir)
+            elif chosen == "llama":
+                gguf_path = resolve_gguf_path(
+                    paths, filename=config.gguf_file, explicit=gguf
+                )
+                if gguf_path is None:
+                    raise RuntimeError(
+                        "No local GGUF found. Run: personality-protect download "
+                        f"--format gguf\nExpected under {paths.models_dir}."
+                    )
+                piece = _filter_llama(
+                    window,
+                    gguf_path,
+                    adapter_dir,
+                    piece_budget,
+                    force=force,
+                    attempts=attempts,
+                )
+                # llama finalize used apply_guard=not force; force=False would
+                # leave-alone freeze — re-run finalize without guard.
+                piece = finalize_rewrite(piece, draft=window, apply_guard=False)
+            elif chosen == "transformers":
+                piece = _filter_transformers(
+                    window,
+                    adapter_dir,
+                    config.base_model,
+                    piece_budget,
+                    force=force,
+                    attempts=attempts,
+                )
+                piece = finalize_rewrite(piece, draft=window, apply_guard=False)
+            else:
+                raise RuntimeError(f"Unknown filter backend: {chosen}")
+            rewrites.append(piece.strip() or window)
+
+    stitched = stitch_filter_chunks(rewrites) or draft
+    # Guards on the full article: substance only (chunk path already forced rewrite).
+    stitched = substance_guard(draft, stitched)
+    return apply_voice_postprocess(stitched, draft=draft)
 
 
 def _has_llama_cpp() -> bool:
@@ -933,11 +1118,40 @@ def _filter_mlx(
     force: bool = False,
     attempts: int = 1,
 ) -> str:
+    results = _filter_mlx_chunks(
+        [draft],
+        adapter_dir,
+        base_model,
+        max_tokens,
+        paths=paths,
+        use_adapter=use_adapter,
+        few_shot=few_shot,
+        force=force,
+        attempts=attempts,
+    )
+    return results[0] if results else ""
+
+
+def _filter_mlx_chunks(
+    drafts: list[str],
+    adapter_dir: Path,
+    base_model: str,
+    max_tokens: int,
+    *,
+    paths: ProfilePaths | None = None,
+    use_adapter: bool = True,
+    few_shot: str | None = None,
+    force: bool = False,
+    apply_guard: bool | None = None,
+    attempts: int = 1,
+) -> list[str]:
+    """Rewrite one or more draft windows with a single MLX model load."""
     # CRITICAL: mlx_lm.generate installs wired_limit(~40GB) which jetsam-kills
     # Python on a 48GB Mac. Cap BEFORE importing/loading. Default ≤16 GB.
     from personality_protect.mlx_runtime import ensure_mlx_wired_cap, release_mlx_memory
 
     ensure_mlx_wired_cap(memory_gb=16.0)
+    guard = (not force) if apply_guard is None else bool(apply_guard)
 
     try:
         from mlx_lm import generate, load
@@ -950,32 +1164,9 @@ def _filter_mlx(
     adapter = None
     if use_adapter and _has_mlx_adapter(adapter_dir):
         adapter = str(adapter_dir)
-    # Do NOT paste a long SFT assistant snippet as "### My voice (reference)":
-    # weak adapters regurgitate that corpus block instead of rewriting the draft.
-    # LoRA weights carry voice; few-shot (prompt baseline) may inject anchors above.
-    messages = build_filter_messages(
-        draft, reference=None, few_shot=few_shot, force=force
-    )
 
     try:
         model, tokenizer = load(base_model, adapter_path=adapter)
-        # Match training: chat template + assistant generation prompt.
-        if getattr(tokenizer, "has_chat_template", False) or getattr(
-            tokenizer, "chat_template", None
-        ):
-            # Qwen3 defaults enable_thinking=True; that burns tokens on meta
-            # "Thinking Process" and never returns a clean rewrite.
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        else:
-            prompt = build_filter_prompt(
-                draft, reference=None, few_shot=few_shot, force=force
-            )
-
         # Stop on template markers so we never loop Draft/Rewritten sections.
         for stop in FILTER_STOP:
             try:
@@ -983,28 +1174,57 @@ def _filter_mlx(
             except Exception:
                 pass
 
-        # Budget enough tokens for full rewrites (articles need >>512).
-        # Stop markers cut Draft/Rewritten template loops; do not hard-cap below
-        # the caller budget — that truncated ~1k-word articles mid-sentence.
         temp = FILTER_TEMPERATURE_FORCE if force else FILTER_TEMPERATURE
-        draft_s = draft.strip()
-        best = ""
-        for _ in range(max(1, attempts)):
-            gen_kwargs: dict = {
-                "max_tokens": max(64, min(MAX_MAX_TOKENS, int(max_tokens))),
-                "verbose": False,
-            }
-            try:
-                from mlx_lm.sample_utils import make_sampler
+        out_chunks: list[str] = []
+        for draft in drafts:
+            draft = (draft or "").strip()
+            if not draft:
+                out_chunks.append("")
+                continue
+            # Do NOT paste a long SFT assistant snippet as "### My voice (reference)":
+            # weak adapters regurgitate that corpus block instead of rewriting the draft.
+            messages = build_filter_messages(
+                draft, reference=None, few_shot=few_shot, force=force
+            )
+            if getattr(tokenizer, "has_chat_template", False) or getattr(
+                tokenizer, "chat_template", None
+            ):
+                # Qwen3 defaults enable_thinking=True; that burns tokens on meta
+                # "Thinking Process" and never returns a clean rewrite.
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            else:
+                prompt = build_filter_prompt(
+                    draft, reference=None, few_shot=few_shot, force=force
+                )
 
-                gen_kwargs["sampler"] = make_sampler(temp=temp, top_p=FILTER_TOP_P)
-            except Exception:
-                pass
-            out = generate(model, tokenizer, prompt=prompt, **gen_kwargs)
-            best = finalize_rewrite(str(out), draft=draft, apply_guard=not force)
-            if not force or (best.strip() and best.strip() != draft_s):
-                break
-        return best
+            draft_s = draft
+            best = ""
+            for _ in range(max(1, attempts)):
+                gen_kwargs: dict = {
+                    "max_tokens": max(64, min(MAX_MAX_TOKENS, int(max_tokens))),
+                    "verbose": False,
+                }
+                try:
+                    from mlx_lm.sample_utils import make_sampler
+
+                    gen_kwargs["sampler"] = make_sampler(temp=temp, top_p=FILTER_TOP_P)
+                except Exception:
+                    pass
+                out = generate(model, tokenizer, prompt=prompt, **gen_kwargs)
+                best = finalize_rewrite(str(out), draft=draft, apply_guard=guard)
+                if best.strip() and best.strip() != draft_s:
+                    # Prefer a real rewrite over copy-through when retrying.
+                    break
+                if not force and guard:
+                    # Leave-alone path may legitimately copy.
+                    break
+            out_chunks.append(best.strip() or draft)
+        return out_chunks
     finally:
         release_mlx_memory()
 

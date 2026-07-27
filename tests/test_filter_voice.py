@@ -389,6 +389,40 @@ def test_draft_already_in_voice_detects_vibe_shaped():
     assert not draft_looks_soulless(vibe)
 
 
+def test_filter_draft_leave_alone_skips_model_for_vibe(tmp_path):
+    """Already-in-voice short drafts must not fidget or mode-collapse."""
+    from personality_protect.config import get_paths
+    from personality_protect.demo import run_demo
+    from personality_protect.filter import filter_draft
+
+    run_demo(home=tmp_path)
+    paths = get_paths("demo", home=tmp_path)
+    draft = (
+        "These questions keep popping up every time I read another vibe coding take.\n\n"
+        "How much of the labs' revenue is the first pass, and how much is cleanup?\n\n"
+        "Maybe we are too hard on vibe coders. Who's saying the model finishes?"
+    )
+    calls: list[str] = []
+
+    def boom(d: str, *_a, **_k):
+        calls.append(d)
+        raise AssertionError("model must not run for leave-alone voice drafts")
+
+    with patch("personality_protect.filter._filter_mock", side_effect=boom):
+        out, used = filter_draft(draft, paths, backend="mock")
+    assert used == "mock"
+    assert calls == []
+    assert out == draft.strip()
+    # --force still rewrites
+    with patch(
+        "personality_protect.filter._filter_mock",
+        side_effect=lambda d, *_a, **_k: "Cut the fog.\n\nKeep the spine.",
+    ):
+        forced, _ = filter_draft(draft, paths, backend="mock", force=True)
+    assert forced != draft
+    assert "Cut the fog" in forced
+
+
 def test_draft_already_in_voice_rejects_polished_long_claude():
     from personality_protect.filter import draft_already_in_voice
 
@@ -485,3 +519,127 @@ def test_mlx_wired_cap_clamps_generate_requests(monkeypatch):
         # Simulate mlx_lm.generate.wired_limit requesting ~40 GB
         fake_core.set_wired_limit(40 * 10**9)
         assert calls[-1] == 16 * 10**9
+
+
+def test_paragraph_windows_packs_under_budget_and_preserves_short():
+    from personality_protect.filter import (
+        FILTER_CHUNK_MAX_CHARS,
+        paragraph_windows,
+        stitch_filter_chunks,
+    )
+
+    short = "Contoso needs a distinct voice, not a template."
+    assert paragraph_windows(short) == [short]
+
+    paras = [
+        "Contoso Labs ships another memo on workplace communication quality.",
+        "Here's the problem: auditors punish compressed thinking as low effort.",
+        "Northwind Analytics scores warmth and brand alignment like substance.",
+        "Here's the part that should genuinely bother anyone running these audits.",
+        "If Contoso keeps scoring texture, it trains polished indecision.",
+    ]
+    # Inflate so packing needs multiple windows under the infer budget.
+    long = "\n\n".join(p + (" Extra clause." * 8) for p in paras)
+    assert len(long) > FILTER_CHUNK_MAX_CHARS * 2
+    windows = paragraph_windows(long, max_chars=FILTER_CHUNK_MAX_CHARS)
+    assert len(windows) >= 2
+    assert all(len(w) <= FILTER_CHUNK_MAX_CHARS + 5 for w in windows)
+    # Stitch restores blank-line paragraph rhythm.
+    stitched = stitch_filter_chunks(windows)
+    assert "\n\n" in stitched
+    assert "Contoso Labs" in stitched
+    assert "polished indecision" in stitched
+
+
+def test_should_chunk_filter_skips_short_probes():
+    from personality_protect.filter import FILTER_CHUNK_THRESHOLD, should_chunk_filter
+
+    assert FILTER_CHUNK_THRESHOLD >= 1600
+    assert not should_chunk_filter("x" * 670)  # slop_multipara-sized
+    assert not should_chunk_filter("x" * 1283)  # pending_vibe-sized
+    assert should_chunk_filter("x" * 1601)
+    assert should_chunk_filter("y" * 5000)
+
+
+def test_filter_draft_short_stays_singleshot(tmp_path):
+    """Short drafts must not enter the chunked path (probe grades depend on it)."""
+    from personality_protect.config import get_paths
+    from personality_protect.demo import run_demo
+    from personality_protect.filter import filter_draft
+
+    run_demo(home=tmp_path)
+    paths = get_paths("demo", home=tmp_path)
+    draft = (
+        "In today's fast-paced digital world, Contoso must leverage robust synergies.\n\n"
+        "Furthermore, leaders should delve into authentic storytelling."
+    )
+    calls: list[str] = []
+
+    def fake_mock(d: str, _adapter_dir):
+        calls.append(d)
+        return "Cut the fog.\n\nContoso's problem is sounding like every other post."
+
+    with patch("personality_protect.filter._filter_mock", side_effect=fake_mock):
+        out, used = filter_draft(draft, paths, backend="mock")
+    assert used == "mock"
+    assert len(calls) == 1
+    assert calls[0] == draft.strip()
+    assert "Cut the fog" in out
+
+
+def test_filter_draft_long_auto_chunks_and_rewrites(tmp_path):
+    """Article-length drafts auto-chunk; stitched output is a real rewrite delta."""
+    from personality_protect.config import get_paths
+    from personality_protect.demo import run_demo
+    from personality_protect.eval_compare import longform_metrics
+    from personality_protect.filter import FILTER_CHUNK_MAX_CHARS, filter_draft
+
+    run_demo(home=tmp_path)
+    paths = get_paths("demo", home=tmp_path)
+
+    # Contoso longform with scaffolding — above auto-chunk threshold.
+    body = []
+    for i in range(12):
+        body.append(
+            f"Contoso Labs memo section {i} argues that Northwind must evaluate "
+            f"texture as carefully as substance when reviewing workplace writing."
+        )
+    draft = (
+        "Here's the problem: Contoso audits punish compressed thinking.\n\n"
+        + "\n\n".join(body)
+        + "\n\nHere's the part that should genuinely bother anyone running these audits.\n\n"
+        "Northwind will keep publishing polished indecision at greater volume."
+    )
+    assert len(draft) > 1600
+
+    calls: list[str] = []
+
+    def fake_mock(d: str, _adapter_dir):
+        calls.append(d)
+        # Distinct rewrite per chunk (not near-copy).
+        return (
+            d.replace("argues that", "says")
+            .replace("must evaluate", "should judge")
+            .replace("Here's the problem:", "")
+            .replace(
+                "Here's the part that should genuinely bother anyone running these audits.",
+                "",
+            )
+            .strip()
+            + " Cut the fog."
+        )
+
+    with patch("personality_protect.filter._filter_mock", side_effect=fake_mock):
+        out, used = filter_draft(draft, paths, backend="mock", force=True)
+
+    assert used == "mock"
+    assert len(calls) >= 2
+    assert all(len(c) <= FILTER_CHUNK_MAX_CHARS + 40 for c in calls)
+    assert "Here's the problem" not in out
+    assert "Here's the part that should genuinely bother" not in out
+    metrics = longform_metrics(draft, out)
+    assert metrics["scaffolding_after"] == 0
+    assert metrics["near_copy"] is False
+    assert metrics["blank_line_only_noop"] is False
+    assert "Cut the fog" in out
+    assert "\n\n" in out
