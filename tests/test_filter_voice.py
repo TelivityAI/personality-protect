@@ -647,16 +647,20 @@ def test_filter_draft_short_stays_singleshot(tmp_path):
 
 def test_novelty_guard_rejects_invented_vocabulary():
     from personality_protect.filter import (
+        draft_already_in_voice,
         introduced_vocabulary,
         novelty_guard,
         novelty_too_high,
         strip_ai_tells,
     )
 
+    # Already-voice short: novelty must still reject additive invention.
     draft = (
-        "Contoso audits punish compressed thinking as low effort.\n\n"
-        "Northwind scores warmth like substance."
+        "Here's the thing.\n\n"
+        "I don't buy Contoso's audit theater.\n\n"
+        "Cut the fog. Keep the spine on Northwind warmth scores."
     )
+    assert draft_already_in_voice(draft) is True
     generative = (
         draft
         + "\n\nWrite with some spine instead of packaging your thoughts in bandages.\n"
@@ -674,6 +678,14 @@ def test_novelty_guard_rejects_invented_vocabulary():
     assert "leverage" not in cleaned.lower()
     assert novelty_too_high(slop, cleaned) is False
     assert introduced_vocabulary(slop, cleaned) == []
+
+    # Short slop restyle may introduce cadence words — do not freeze to draft.
+    voicey = (
+        "Here's the thing.\n\n"
+        "Cut the fog. Keep the spine.\n\n"
+        "Contoso needs real connections, not synergies."
+    )
+    assert novelty_guard(slop, voicey) == voicey.strip()
 
 
 def test_strip_capitalizes_orphan_after_problem_cut():

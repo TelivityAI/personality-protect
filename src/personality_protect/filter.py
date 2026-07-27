@@ -205,10 +205,22 @@ def novelty_too_high(
 
 
 def novelty_guard(draft: str, rewrite: str) -> str:
-    """Keep draft when rewrite looks like generative invention, not a trim."""
-    if novelty_too_high(draft, rewrite):
-        return (draft or "").strip()
-    return (rewrite or "").strip()
+    """Keep draft when rewrite looks like generative invention, not a trim.
+
+    Short slop / soulless clean drafts need cadence rewrites that introduce
+    voice vocabulary by design — do not freeze those. Novelty still blocks
+    additive invention on already-voice shorts and on article-length drafts
+    (the #13 bandages/whoeres failure mode).
+    """
+    d = (draft or "").strip()
+    r = (rewrite or "").strip()
+    if draft_looks_sloppy(d):
+        return r
+    if len(d) <= 1600 and draft_looks_soulless(d):
+        return r
+    if novelty_too_high(d, r):
+        return d
+    return r
 
 
 def restore_structural_openers(draft: str, rewrite: str) -> str:
