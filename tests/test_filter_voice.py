@@ -142,21 +142,43 @@ def test_strip_voice_scaffolding_cuts_known_patterns():
     assert "worth being honest" not in out
     assert "That's what people miss" in out
     assert "Eight people in every session." in out
-    # Must not glue the next sentence onto the prior period.
+    # Admission and analysis stay separate paragraphs (not welded).
     assert "quality.The" not in out
-    assert "quality. The loop" in out
+    assert "quality.\n\nThe loop" in out
 
 
-def test_strip_voice_scaffolding_cuts_soft_didnt_see_leftover():
+def test_strip_keeps_load_bearing_didnt_see_hinge():
     from personality_protect.filter import strip_voice_scaffolding
 
     text = (
         '"This is clearly ChatGPT slop."\n\n'
-        "The commenter didn't see:\n\n"
+        "The comment appeared under a message.\n\n"
+        "Here's what the commenter didn't see:\n\n"
         "The hours of circling the problem."
     )
     out = strip_voice_scaffolding(text)
-    assert "didn't see:" not in out
+    assert "Here's what the commenter didn't see:" in out
+    assert "This is clearly ChatGPT slop." in out
+    assert "hours of circling" in out
+
+
+def test_restore_structural_openers_puts_back_quote_and_hinge():
+    from personality_protect.filter import apply_voice_postprocess
+
+    draft = (
+        '"This is clearly ChatGPT slop."\n\n'
+        "The comment appeared under a message.\n\n"
+        "Here's what the commenter didn't see:\n\n"
+        "The hours of circling the problem."
+    )
+    # Model dropped the premise quote and the hinge.
+    model_out = (
+        "The comment appeared under a message.\n\n"
+        "The hours of circling the problem."
+    )
+    out = apply_voice_postprocess(model_out, draft=draft)
+    assert out.startswith('"This is clearly ChatGPT slop."')
+    assert "Here's what the commenter didn't see:" in out
     assert "hours of circling" in out
 
 
