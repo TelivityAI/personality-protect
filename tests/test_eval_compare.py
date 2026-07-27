@@ -16,6 +16,7 @@ from personality_protect.eval_compare import (
     run_eval,
     scaffolding_count,
     slop_score,
+    specificity_scorecard,
 )
 from personality_protect.filter import FILTER_TEMPERATURE, build_filter_prompt, filter_system_prompt
 from personality_protect.models import Piece
@@ -44,6 +45,37 @@ def test_slop_score_detects_tells():
     clean = "I cut the fog and keep the spine of the argument."
     assert slop_score(dirty) >= 3
     assert slop_score(clean) == 0
+
+
+def test_specificity_scorecard_gates_parable_vs_named():
+    parable = next(p for p in list_synthetic_drafts() if p.stem == "clean_article")
+    card = specificity_scorecard(parable.read_text(encoding="utf-8"))
+    assert card["pass"] is False
+    assert "numbers_per_1k" in card["failed"]
+
+    dense = (
+        "GDS. NDC. API.\n\n"
+        "Contoso said no in 2024. Northwind said wait. Fabrikam took 75%.\n\n"
+        "You own the call. You ship the risk.\n\n"
+        "Contoso Labs cut 12 pilots. Northwind kept GPT out of the PNR.\n\n"
+        "You. Not the deck.\n"
+    )
+    good = specificity_scorecard(dense)
+    assert good["pass"] is True
+    assert good["proper_nouns_per_1k"] >= 80
+    assert good["numbers_per_1k"] >= 15
+    assert good["you_count"] > good["i_count"]
+
+
+def test_cli_scorecard_fails_parable(tmp_path: Path):
+    article = next(p for p in list_synthetic_drafts() if p.stem == "clean_article")
+    res = runner.invoke(
+        app,
+        ["--logo", "off", "scorecard", "--file", str(article), "--json"],
+    )
+    assert res.exit_code == 1, res.output
+    data = json.loads(res.output)
+    assert data["pass"] is False
 
 
 def test_longform_metrics_flags_near_copy_and_scaffolding():

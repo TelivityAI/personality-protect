@@ -88,6 +88,227 @@ def _word_set(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9']+", (text or "").lower()))
 
 
+# Draft specificity gates (pre-voice). A filter cannot insert named entities or
+# benchmarks — fail cheap at draft time. Thresholds match operator scorecards
+# on real longform (not cadence taste).
+SCORECARD_MIN_PROPER_PER_1K = 80.0
+SCORECARD_MIN_NUMBERS_PER_1K = 15.0
+SCORECARD_MAX_MEDIAN_SENTENCE = 8.0
+SCORECARD_MIN_SHORT_LINE_RATIO = 0.45
+
+_COMMON_CAPS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "if",
+        "when",
+        "where",
+        "what",
+        "why",
+        "how",
+        "who",
+        "this",
+        "that",
+        "these",
+        "those",
+        "then",
+        "than",
+        "for",
+        "with",
+        "from",
+        "into",
+        "onto",
+        "over",
+        "under",
+        "after",
+        "before",
+        "because",
+        "while",
+        "although",
+        "however",
+        "therefore",
+        "meanwhile",
+        "also",
+        "just",
+        "only",
+        "even",
+        "still",
+        "already",
+        "here",
+        "there",
+        "was",
+        "were",
+        "are",
+        "is",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "must",
+        "can",
+        "add",
+        "was",
+        "where",
+        "most",
+        "many",
+        "some",
+        "every",
+        "each",
+        "all",
+        "none",
+        "no",
+        "not",
+        "yes",
+        "you",
+        "your",
+        "yours",
+        "i",
+        "we",
+        "they",
+        "he",
+        "she",
+        "it",
+        "its",
+        "our",
+        "their",
+    }
+)
+
+
+def _word_tokens(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9']+", text or "")
+
+
+def _sentence_word_counts(text: str) -> list[int]:
+    """Sentence lengths; bare short lines without terminals count as sentences."""
+    body = (text or "").strip()
+    if not body:
+        return []
+    counts: list[int] = []
+    for block in re.split(r"\n+", body):
+        block = block.strip()
+        if not block:
+            continue
+        parts = re.split(r"(?<=[.!?…])\s+", block)
+        for part in parts:
+            n = len(_word_tokens(part))
+            if n:
+                counts.append(n)
+    return counts
+
+
+def count_proper_nouns(text: str) -> int:
+    """Named-entity proxy: acronyms, multi-word Title Case, mid-sentence Capitals.
+
+    Avoids counting sentence-initial ``Add`` / ``Was`` / ``Where`` as entities.
+    Contoso-safe heuristic — not a NER model.
+    """
+    body = text or ""
+    hits = 0
+    hits += len(re.findall(r"\b[A-Z]{2,}\b", body))
+    hits += len(re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", body))
+    # Mid-sentence capital after lowercase/digit punctuation (not line start).
+    for m in re.finditer(r"(?<=[a-z0-9,;:\"'”’)\]])\s+([A-Z][a-zA-Z0-9'-]{1,})\b", body):
+        tok = m.group(1)
+        if tok.isupper() and len(tok) >= 2:
+            continue  # already counted as acronym
+        if tok.lower() in _COMMON_CAPS:
+            continue
+        hits += 1
+    return hits
+
+
+def count_numbers(text: str) -> int:
+    """Digits / percents / years — signal of falsifiable writing."""
+    return len(re.findall(r"\b\d+(?:[.,]\d+)?%?\b", text or ""))
+
+
+def specificity_scorecard(
+    text: str,
+    *,
+    min_proper_per_1k: float = SCORECARD_MIN_PROPER_PER_1K,
+    min_numbers_per_1k: float = SCORECARD_MIN_NUMBERS_PER_1K,
+    max_median_sentence: float = SCORECARD_MAX_MEDIAN_SENTENCE,
+    min_short_line_ratio: float = SCORECARD_MIN_SHORT_LINE_RATIO,
+) -> dict[str, Any]:
+    """Deterministic draft gate: specificity before any voice filter.
+
+    Pass when proper nouns, numbers, sentence/line shape, and you>I clear
+    thresholds. A voice filter cannot insert Travelport or a benchmark table.
+    """
+    body = (text or "").strip()
+    words = _word_tokens(body)
+    n_words = max(1, len(words))
+    proper = count_proper_nouns(body)
+    numbers = count_numbers(body)
+    sent_counts = _sentence_word_counts(body)
+    if sent_counts:
+        ordered = sorted(sent_counts)
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            median_sent = float(ordered[mid])
+        else:
+            median_sent = (ordered[mid - 1] + ordered[mid]) / 2.0
+    else:
+        median_sent = 0.0
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    short_lines = sum(1 for ln in lines if len(_word_tokens(ln)) <= 8)
+    short_line_ratio = (short_lines / len(lines)) if lines else 0.0
+    you_n = len(re.findall(r"\byou\b", body, flags=re.I))
+    i_n = len(re.findall(r"\bI\b", body))
+    proper_1k = proper * 1000.0 / n_words
+    numbers_1k = numbers * 1000.0 / n_words
+    you_1k = you_n * 1000.0 / n_words
+    i_1k = i_n * 1000.0 / n_words
+
+    checks = {
+        "proper_nouns_per_1k": proper_1k >= float(min_proper_per_1k),
+        "numbers_per_1k": numbers_1k >= float(min_numbers_per_1k),
+        "median_sentence": median_sent <= float(max_median_sentence) and median_sent > 0,
+        "short_line_ratio": short_line_ratio >= float(min_short_line_ratio),
+        "you_gt_i": you_n > i_n,
+    }
+    failed = [k for k, ok in checks.items() if not ok]
+    return {
+        "words": len(words),
+        "proper_nouns": proper,
+        "numbers": numbers,
+        "proper_nouns_per_1k": round(proper_1k, 2),
+        "numbers_per_1k": round(numbers_1k, 2),
+        "median_sentence_words": round(median_sent, 2),
+        "short_line_ratio": round(short_line_ratio, 4),
+        "you_count": you_n,
+        "i_count": i_n,
+        "you_per_1k": round(you_1k, 2),
+        "i_per_1k": round(i_1k, 2),
+        "thresholds": {
+            "min_proper_per_1k": min_proper_per_1k,
+            "min_numbers_per_1k": min_numbers_per_1k,
+            "max_median_sentence": max_median_sentence,
+            "min_short_line_ratio": min_short_line_ratio,
+            "you_gt_i": True,
+        },
+        "checks": checks,
+        "failed": failed,
+        "pass": len(failed) == 0,
+    }
+
+
 def longform_metrics(draft: str, rewritten: str) -> dict[str, Any]:
     """Deterministic longform gate metrics (no LLM grader).
 
