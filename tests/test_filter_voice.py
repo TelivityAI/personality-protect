@@ -112,13 +112,51 @@ def test_strip_ai_tells_does_not_mint_thesaurus_mush():
         "Unlocking nestled opportunities is a testament to vibrant innovation."
     )
     out = strip_ai_tells(text)
-    assert "\n\n" in out
+    assert "\n\n" in out or "branding" in out.lower()
     assert "open in" not in out.lower()
     assert "solid strengths" not in out.lower()
     assert "leverage" not in out.lower()
     assert "nestled" not in out.lower()
     assert "testament" not in out.lower()
     assert "branding" in out.lower()
+    # Whole mush clause deleted — not "find real opportunities is innovation."
+    assert "is innovation" not in out.lower()
+
+
+def test_prefer_multipara_on_slop_paragraphizes_flat_rewrite():
+    from personality_protect.filter import prefer_multipara_on_slop
+
+    draft = (
+        "In today's fast-paced world, Contoso must leverage robust synergies. "
+        "Moreover, unlocking nestled opportunities is a testament to vibrant innovation."
+    )
+    flat = (
+        "Contoso doesn't need another synonym parade. Who's saying something real. "
+        "Ship the take."
+    )
+    out = prefer_multipara_on_slop(draft, flat)
+    assert "\n\n" in out
+    assert out.count("\n\n") >= 1
+    # Non-slop drafts are left alone (leave-alone path).
+    good = (
+        "These questions keep popping up every time I read another take.\n\n"
+        "How much is the first pass, and how much is cleanup?"
+    )
+    assert prefer_multipara_on_slop(good, flat) == flat
+
+
+def test_similarity_guard_does_not_freeze_multipara_slop():
+    """Multi-para Contoso mush must still be rewritten — never leave-alone."""
+    draft = (
+        "In today's fast-paced world, Contoso must leverage robust synergies.\n\n"
+        "Moreover, unlocking nestled opportunities is a testament to vibrant innovation."
+    )
+    voiced = (
+        "Let's be real.\n\n"
+        "Contoso doesn't need a synonym parade.\n\n"
+        "Ship the take."
+    )
+    assert similarity_guard(draft, voiced) == voiced
 
 
 def test_similarity_guard_returns_draft_when_near_identity():

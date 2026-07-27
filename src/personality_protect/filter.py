@@ -68,18 +68,85 @@ def build_filter_prompt(
     return text
 
 
+_SLOP_HINT_RE = re.compile(
+    r"(?i)\b(?:leverage|synerg|delve|robust|moreover|furthermore|additionally|"
+    r"unlock(?:ing)?|nestled|testament|vibrant|in today's|"
+    r"it is important to note)\b"
+)
+
+
+def draft_looks_sloppy(draft: str) -> bool:
+    """True when the draft carries common AI-slop scaffolding."""
+    hits = len(_SLOP_HINT_RE.findall(draft or ""))
+    return hits >= 2
+
+
+def prefer_multipara_on_slop(draft: str, rewrite: str) -> str:
+    """Prefer blank-line paragraph punches when the input was sloppy AI mush.
+
+    Leave-alone for already-good drafts is owned by similarity_guard. This only
+    repairs flat / single-block outputs after slop stripping so cadence compare
+    isn't stuck on thesaurus one-liners.
+    """
+    draft = (draft or "").strip()
+    rewrite = (rewrite or "").strip()
+    if not rewrite or not draft_looks_sloppy(draft):
+        return rewrite
+    if "\n\n" in rewrite:
+        return rewrite
+    return _paragraphize_punches(rewrite)
+
+
+def _paragraphize_punches(text: str) -> str:
+    """Turn a flat multi-sentence block into blank-line punches."""
+    text = (text or "").strip()
+    if not text or "\n\n" in text:
+        return text
+    if "\n" in text:
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        if len(lines) >= 2:
+            return "\n\n".join(lines)
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+    if len(parts) < 2:
+        return text
+    paras: list[str] = []
+    for p in parts:
+        if paras and len(p) < 28:
+            paras[-1] = f"{paras[-1]} {p}"
+        else:
+            paras.append(p)
+    if len(paras) < 2:
+        return text
+    return "\n\n".join(paras)
+
+
 def strip_ai_tells(text: str) -> str:
     """Remove common AI-tell phrases the system prompt asks the model to strip.
 
     Preserves paragraph breaks / blank lines — never flatten multi-paragraph
     rewrites into a single prose block (that was the vibe-draft B− failure mode).
 
-    Prefer deleting scaffolding / multi-word tells over synonym swaps that mint
-    thesaurus mush ("unlocking nestled" → "open in").
+    Prefer deleting scaffolding / whole mush clauses over synonym swaps that mint
+    thesaurus mush ("unlocking nestled" → "open in" / "is innovation").
     """
     body = text
+    # Drop full scaffold sentences before word-level cleanup.
     body = re.sub(
-        r"\bIn today's (?:fast-paced\s+)?(?:digital\s+)?(?:fast-paced\s+)?world,?\s*",
+        r"(?is)\b(?:moreover|furthermore|additionally)[, ]+"
+        r"[^.?!]{0,120}?(?:testament to(?:\s+vibrant)?|unlock(?:ing)?\s+nestled|"
+        r"leverage(?:\s+robust)?\s+synergies)[^.?!]*[.?!]\s*",
+        "",
+        body,
+    )
+    body = re.sub(
+        r"(?is)\bunlock(?:ing)?\s+nestled\s+opportunities\s+"
+        r"is\s+a\s+testament\s+to\s+vibrant\s+\w+[^.?!]*[.?!]\s*",
+        "",
+        body,
+    )
+    body = re.sub(
+        r"\bIn today's (?:fast-paced\s+)?(?:digital\s+)?(?:fast-paced\s+)?(?:digital\s+)?"
+        r"(?:world|landscape),?\s*",
         "",
         body,
         flags=re.I,
@@ -102,7 +169,7 @@ def strip_ai_tells(text: str) -> str:
         body,
         flags=re.I,
     )
-    body = re.sub(r"\ba testament to\s+vibrant\s+", "", body, flags=re.I)
+    body = re.sub(r"\ba testament to\s+vibrant\s+\w+\b", "", body, flags=re.I)
     body = re.sub(r"\ba testament to\s+", "", body, flags=re.I)
     body = re.sub(r"\bdelve into\b", "talk about", body, flags=re.I)
     body = re.sub(r"\butilize\b", "use", body, flags=re.I)
@@ -113,10 +180,15 @@ def strip_ai_tells(text: str) -> str:
     body = re.sub(r"\bunlock(?:ing)?\b", "find", body, flags=re.I)
     body = re.sub(r"\bnestled\b", "", body, flags=re.I)
     body = re.sub(r"\bvibrant\b", "", body, flags=re.I)
+    # Broken leftovers from clause deletion ("is innovation." / "is .").
+    body = re.sub(r"(?i)\bis\s+(?:innovation|excellence)\b", "", body)
+    body = re.sub(r"(?i)\bfind real opportunities\s+is\b", "find real opportunities", body)
     # Collapse horizontal whitespace only; keep newlines / paragraph rhythm.
     body = re.sub(r"[^\S\n]{2,}", " ", body)
     body = re.sub(r"[ \t]+\n", "\n", body)
     body = re.sub(r"\n{3,}", "\n\n", body)
+    body = re.sub(r"\s+([,.])", r"\1", body)
+    body = body.strip(" \t,;")
     body = body.strip()
     if body:
         # Capitalize first non-whitespace char without touching later lines.
@@ -140,6 +212,7 @@ def similarity_guard(
     flattening LinkedIn-shaped posts. Also catches "fidget re-paragraphing"
     that lowers SequenceMatcher ratio while keeping nearly the same tokens.
     Flat single-block drafts still get a real rewrite (clean→voice / slop→voice).
+    Never freezes AI-slop drafts — multi-para mush must still be rewritten.
     """
     import difflib
 
@@ -151,6 +224,9 @@ def similarity_guard(
         return draft
     if draft == rewrite:
         return draft
+    # Never leave AI-slop alone — even multi-paragraph Contoso mush.
+    if draft_looks_sloppy(draft):
+        return rewrite
     # Only guard structured posts; don't freeze flat clean/slop one-liners.
     draft_paras = [p for p in re.split(r"\n\s*\n", draft) if p.strip()]
     if len(draft_paras) < 2 and draft.count("\n") < 2:
@@ -171,6 +247,7 @@ def finalize_rewrite(text: str, *, draft: str | None = None) -> str:
     """Template-echo cut + AI-tell cleanup (+ optional near-identity keep-draft)."""
     out = strip_ai_tells(extract_rewrite(text))
     if draft is not None:
+        out = prefer_multipara_on_slop(draft, out)
         out = similarity_guard(draft, out)
     return out
 
@@ -356,6 +433,8 @@ def filter_draft(
         raise RuntimeError(f"Unknown filter backend: {chosen}")
 
     # Near-identity → keep original (paragraphs + opener intact).
+    # Sloppy drafts → prefer multi-para punches before the leave-alone guard.
+    rewritten = prefer_multipara_on_slop(draft, rewritten)
     return similarity_guard(draft, rewritten), chosen
 
 

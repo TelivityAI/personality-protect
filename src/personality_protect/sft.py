@@ -812,13 +812,157 @@ def _synthetic_short_cadence_examples() -> list[dict]:
         if row is None:
             continue
         out.append(row)
-        # Heavy oversample — short drafts are the failure mode.
-        for _ in range(3):
+        # Light oversample — multipara pairs carry the heavy lift now.
+        for _ in range(1):
             dup = _example_row(
                 draft=draft,
                 target=target,
                 piece=piece,
                 pair_kind=f"{kind}_cadence",
+            )
+            if dup is not None:
+                out.append(dup)
+    return out
+
+
+def _synthetic_multipara_cadence_examples() -> list[dict]:
+    """Multi-paragraph Contoso/Northwind slop→voice pairs (not one-liner branding).
+
+    Drafts are multi-para AI mush with blank lines. Targets keep blank lines,
+    rhetorical questions, and short punches. Sized for the MLX 512-token budget.
+    """
+    pairs: list[tuple[str, str, str]] = [
+        (
+            "slop",
+            (
+                "In today's world, Contoso must leverage robust synergies across channels.\n\n"
+                "Moreover, unlocking nestled opportunities is a testament to vibrant "
+                "innovation.\n\n"
+                "Furthermore, Contoso Labs should delve into storytelling with robust "
+                "methods."
+            ),
+            (
+                "Let's be real.\n\n"
+                "Contoso doesn't need another synonym parade.\n\n"
+                "Who's saying something with a spine?\n\n"
+                "Ship the take — or don't post."
+            ),
+        ),
+        (
+            "slop",
+            (
+                "Moreover, Northwind must leverage synergies to delve into leadership.\n\n"
+                "Unlocking nestled opportunities is a testament to vibrant innovation.\n\n"
+                "Additionally, teams utilize robust frameworks that unlock synergistic "
+                "outcomes."
+            ),
+            (
+                "Northwind Analytics — really?\n\n"
+                "You don't need synergies. You need a clear take.\n\n"
+                "Stop unlocking nestled nothing.\n\n"
+                "That's the whole game."
+            ),
+        ),
+        (
+            "slop",
+            (
+                "Contoso Labs must leverage cutting-edge paradigms for thought leadership.\n\n"
+                "It is important to note that we should delve into customer delight.\n\n"
+                "Additionally, robust synergies nestle innovation at the core."
+            ),
+            (
+                "Contoso Labs keeps talking about paradigms.\n\n"
+                "The vertical already knows who has a real point of view.\n\n"
+                "Customer delight isn't a framework.\n\n"
+                "Drop the sludge. Say the thing."
+            ),
+        ),
+        (
+            "clean",
+            (
+                "Thought leadership matters as generative systems appear across channels.\n\n"
+                "Organizations require a distinct perspective, not another templated "
+                "statement.\n\n"
+                "Contoso teams should maintain straightforward messaging."
+            ),
+            (
+                "Thought leadership matters more than ever.\n\n"
+                "Generative sludge floods every channel.\n\n"
+                "Contoso needs a point of view — not another authenticity template.\n\n"
+                "Have a spine, or stay quiet."
+            ),
+        ),
+        (
+            "clean",
+            (
+                "Personal branding is essential as AI systems appear across channels.\n\n"
+                "Northwind organizations require a well-defined perspective on genuine "
+                "positioning.\n\n"
+                "Templated statements fail to resonate with stakeholders."
+            ),
+            (
+                "Personal branding? It's the filter now.\n\n"
+                "Northwind — everyone's posting about authenticity.\n\n"
+                "Almost nobody sounds like a person.\n\n"
+                "Make it count."
+            ),
+        ),
+        (
+            "slop",
+            (
+                "Furthermore, Contoso must leverage robust synergies to unlock nestled "
+                "opportunities.\n\n"
+                "Moreover, vibrant innovation is a testament to leadership in today's "
+                "world.\n\n"
+                "Additionally, teams utilize robust methods with confidence."
+            ),
+            (
+                "Here's the thing:\n\n"
+                "Contoso's problem isn't missing synergies.\n\n"
+                "It's sounding like every other post in the feed.\n\n"
+                "Cut the fog. Keep the spine."
+            ),
+        ),
+    ]
+    def _fit_paras(text: str, limit: int) -> str:
+        """Keep as many blank-line paragraphs as fit under the char budget."""
+        paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+        kept: list[str] = []
+        for p in paras:
+            cand = "\n\n".join(kept + [p]) if kept else p
+            if len(cand) <= limit:
+                kept.append(p)
+            elif not kept:
+                kept.append(_truncate_for_seq_budget(p, limit))
+                break
+            else:
+                break
+        return "\n\n".join(kept) if kept else _truncate_for_seq_budget(text, limit)
+
+    out: list[dict] = []
+    for kind, draft, target in pairs:
+        draft_t = _fit_paras(draft, MAX_SFT_DRAFT_CHARS)
+        target_t = _fit_paras(target, MAX_SFT_TARGET_CHARS)
+        piece = Piece(
+            id=f"synthetic_multipara_{kind}_{len(out)}",
+            source="demo",
+            text=target_t,
+            year=2026,
+            word_count=len(target_t.split()),
+        )
+        row = _example_row(
+            draft=draft_t, target=target_t, piece=piece, pair_kind=kind
+        )
+        if row is None:
+            continue
+        out.append(row)
+        # Heavy oversample — multipara cadence is the failure mode we are fixing.
+        for _ in range(5):
+            dup = _example_row(
+                draft=draft_t,
+                target=target_t,
+                piece=piece,
+                pair_kind=f"{kind}_multipara",
             )
             if dup is not None:
                 out.append(dup)
@@ -836,6 +980,9 @@ def build_sft_jsonl(pieces: Iterable[Piece], out_path: Path) -> int:
                 fh.write(json.dumps(ex, ensure_ascii=False) + "\n")
                 count += 1
         for ex in _synthetic_short_cadence_examples():
+            fh.write(json.dumps(ex, ensure_ascii=False) + "\n")
+            count += 1
+        for ex in _synthetic_multipara_cadence_examples():
             fh.write(json.dumps(ex, ensure_ascii=False) + "\n")
             count += 1
     return count

@@ -294,7 +294,7 @@ def test_synthetic_short_cadence_examples_are_multi_para_voice():
     from personality_protect.sft import _synthetic_short_cadence_examples
 
     rows = _synthetic_short_cadence_examples()
-    assert len(rows) >= 12
+    assert len(rows) >= 6
     kinds = {r["meta"]["pair_kind"] for r in rows}
     assert "slop" in kinds and "clean" in kinds
     for r in rows:
@@ -307,6 +307,30 @@ def test_synthetic_short_cadence_examples_are_multi_para_voice():
         blob = (draft + "\n" + target).lower()
         assert "travelport" not in blob
         assert "linkedin.com" not in blob
+
+
+def test_synthetic_multipara_cadence_examples_are_multipara_both_sides():
+    from personality_protect.sft import _synthetic_multipara_cadence_examples
+
+    rows = _synthetic_multipara_cadence_examples()
+    assert len(rows) >= 18
+    kinds = {r["meta"]["pair_kind"] for r in rows}
+    assert "slop" in kinds
+    assert any(k.endswith("_multipara") for k in kinds)
+    multipara = [r for r in rows if r["meta"]["pair_kind"].endswith("_multipara")]
+    assert multipara
+    for r in multipara[:6]:
+        user = r["messages"][1]["content"]
+        draft = user.split("### Draft\n", 1)[1].split("\n\n### Rewritten", 1)[0]
+        target = r["messages"][-1]["content"]
+        assert "\n\n" in draft, "multipara slop draft must keep blank lines"
+        assert "\n\n" in target
+        assert "?" in target or "—" in target or "Let's" in target or "Here's" in target
+        blob = (draft + "\n" + target).lower()
+        assert "travelport" not in blob
+        assert "life vest" not in blob
+        assert "linkedin.com" not in blob
+        assert "contoso" in blob or "northwind" in blob
 
 
 def test_clean_generic_draft_forces_rewrite_even_on_flat_prose():
