@@ -888,8 +888,8 @@ def scorecard_cmd(
 ) -> None:
     """Gate a draft on specificity before voicing (no model call).
 
-    Checks proper nouns / numbers / sentence & line shape / you>I.
-    A voice filter cannot insert named entities or benchmarks — fail here.
+    Hard FAIL: proper nouns /1k and numbers /1k (corpus floors).
+    Advisory only: median sentence, short-line ratio, you vs I.
     """
     _banner_from_ctx(ctx, json_mode=as_json)
     try:
@@ -907,10 +907,14 @@ def scorecard_cmd(
     console.print(f"[bold]Scorecard[/bold] label={label} words={card['words']}")
     console.print(
         f"proper_nouns/1k={card['proper_nouns_per_1k']} "
+        f"(need ≥{card['thresholds']['min_proper_per_1k']}) "
         f"numbers/1k={card['numbers_per_1k']} "
-        f"median_sentence={card['median_sentence_words']} "
+        f"(need ≥{card['thresholds']['min_numbers_per_1k']})"
+    )
+    console.print(
+        f"[dim]advisory median_sentence={card['median_sentence_words']} "
         f"short_line_ratio={card['short_line_ratio']} "
-        f"you={card['you_count']} i={card['i_count']}"
+        f"you={card['you_count']} i={card['i_count']}[/dim]"
     )
     if card["pass"]:
         console.print("[green]PASS[/green] — draft clears specificity gates.")

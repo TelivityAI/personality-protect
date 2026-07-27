@@ -52,6 +52,20 @@ def test_specificity_scorecard_gates_parable_vs_named():
     card = specificity_scorecard(parable.read_text(encoding="utf-8"))
     assert card["pass"] is False
     assert "numbers_per_1k" in card["failed"]
+    # Formatting / you>I are advisory — never hard-fail.
+    assert "median_sentence" not in card["failed"]
+    assert "short_line_ratio" not in card["failed"]
+    assert "you_gt_i" not in card["failed"]
+    assert "advisory" in card
+
+    # First-person heavy piece still passes if names + numbers clear floors.
+    first_person = (
+        "I asked Contoso in 2024. I got 12 answers. Northwind and Fabrikam "
+        "showed up in the PNR. GDS. NDC. API. I still ship the take."
+    )
+    fp = specificity_scorecard(first_person)
+    assert fp["pass"] is True
+    assert fp["i_count"] >= fp["you_count"]
 
     dense = (
         "GDS. NDC. API.\n\n"
@@ -62,9 +76,8 @@ def test_specificity_scorecard_gates_parable_vs_named():
     )
     good = specificity_scorecard(dense)
     assert good["pass"] is True
-    assert good["proper_nouns_per_1k"] >= 80
-    assert good["numbers_per_1k"] >= 15
-    assert good["you_count"] > good["i_count"]
+    assert good["proper_nouns_per_1k"] >= 48
+    assert good["numbers_per_1k"] >= 5
 
 
 def test_cli_scorecard_fails_parable(tmp_path: Path):
@@ -76,6 +89,7 @@ def test_cli_scorecard_fails_parable(tmp_path: Path):
     assert res.exit_code == 1, res.output
     data = json.loads(res.output)
     assert data["pass"] is False
+    assert set(data["failed"]) <= {"proper_nouns_per_1k", "numbers_per_1k"}
 
 
 def test_longform_metrics_flags_near_copy_and_scaffolding():
