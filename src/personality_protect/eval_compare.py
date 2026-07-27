@@ -16,13 +16,13 @@ from typing import Any
 from personality_protect.config import ProfilePaths, load_config
 from personality_protect.filter import (
     FILTER_TEMPERATURE,
+    filter_system_prompt,
     build_filter_prompt,
     filter_draft,
     mlx_prompt_baseline,
     read_draft_input,
     strip_ai_tells,
 )
-from personality_protect.sft import SYSTEM_PROMPT
 
 # Soft AI-tell patterns used for a tiny local "slop score" on receipts
 _SLOP_PATTERNS = (
@@ -181,7 +181,7 @@ def run_eval(
         "label": label,
         "slop_before": slop_score(draft),
         "slop_after": slop_score(rewritten),
-        "system_prompt": SYSTEM_PROMPT,
+        "system_prompt": filter_system_prompt(),
         "dir": str(out_dir),
     }
     (out_dir / "receipt.json").write_text(
@@ -230,7 +230,7 @@ def run_compare(
             "prompt_baseline": slop_score(baseline),
             "lora": slop_score(lora_text),
         },
-        "system_prompt": SYSTEM_PROMPT,
+        "system_prompt": filter_system_prompt(),
         "dir": str(out_dir),
     }
     (out_dir / "receipt.json").write_text(
