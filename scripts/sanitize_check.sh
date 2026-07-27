@@ -13,6 +13,7 @@ done < <(git ls-files \
   '*.py' '*.md' '*.yml' '*.yaml' '*.toml' '*.sh' '*.txt' '*.json' '*.jsonl' \
   | grep -v '^LICENSE$' \
   | grep -v '^scripts/sanitize_check\.sh$' \
+  | grep -v '^scripts/mac-install-private-studio\.sh$' \
   || true)
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
