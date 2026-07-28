@@ -99,6 +99,8 @@ def _word_set(text: str) -> set[str]:
 # on LinkedIn. Articles keep the corpus floor (~6.6/1k). Demanding numbers
 # when ``numbers_available`` is empty pushes the drafter to invent them.
 # Median sentence / short-line / you>I are advisory only.
+# Channel p10s under *this* counter. Re-derive on the private article corpus
+# after counter changes (word numerals / distinct keys) — do not hand-tune.
 SCORECARD_MIN_PROPER_PER_1K_POST = 20.0
 SCORECARD_MIN_PROPER_PER_1K_ARTICLE = 42.0
 # Back-compat alias → article floor (stricter default when channel omitted).
@@ -265,6 +267,8 @@ def count_proper_nouns(text: str) -> int:
     body = text or ""
     hits = 0
     hits += len(re.findall(r"\b[A-Z]{2,}\b", body))
+    # Finance / ops shorthand: P&L, S&OP, etc.
+    hits += len(re.findall(r"\b[A-Z](?:&[A-Z])+\b", body))
     hits += len(re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", body))
     # Mid-sentence capital after lowercase/digit punctuation (not line start).
     for m in re.finditer(r"(?<=[a-z0-9,;:\"'”’)\]])\s+([A-Z][a-zA-Z0-9'-]{1,})\b", body):
@@ -290,9 +294,51 @@ _NON_EVIDENCE_NUMBER_CONTEXT = re.compile(
 )
 _EVIDENCE_UNIT = (
     r"(?:years?|yrs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?"
-    r"|passengers?|pax|flights?|seconds?|tickets?|bookings?"
-    r"|seats?|cases?|invoices?|accounts?|records?|exceptions?)\b"
+    r"|quarters?|times?"
+    r"|passengers?|pax|flights?|seconds?|tickets?|bookings?|rebookings?"
+    r"|seats?|cases?|invoices?|accounts?|records?|exceptions?"
+    r"|channels?|travelers?|travellers?)\b"
 )
+_WORD_NUMERAL = (
+    r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+    r"eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+    r"eighty|ninety|hundred|thousand|hundreds|thousands)"
+)
+_WORD_NUMERAL_VALUE = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+    "twenty": "20",
+    "thirty": "30",
+    "forty": "40",
+    "fifty": "50",
+    "sixty": "60",
+    "seventy": "70",
+    "eighty": "80",
+    "ninety": "90",
+    "hundred": "100",
+    "thousand": "1000",
+    "hundreds": "100s",
+    "thousands": "1000s",
+}
 _EVIDENCE_NUMBER = re.compile(
     r"(?i)"
     r"(?:€|\$|£)\s?\d+(?:[.,]\d+)?(?:\s*(?:m|bn|k|million|billion))?"
@@ -301,19 +347,48 @@ _EVIDENCE_NUMBER = re.compile(
     + _EVIDENCE_UNIT
     + r"|\b\d+(?:[.,]\d+)?\+?\s*-?\s*"
     + _EVIDENCE_UNIT
+    # Spelled-out counts with a unit ("twelve … flights", "seven years").
+    + r"|(?:\ba\s+)?"
+    + _WORD_NUMERAL
+    + r"(?:\s+[A-Za-z]+){0,3}\s+"
+    + _EVIDENCE_UNIT
     + r"|\b(?:19|20)\d{2}\b"
 )
 
 
+def _number_evidence_key(span: str) -> str:
+    """Normalize a figure span so repeats of one fact count once."""
+    s = re.sub(r"\s+", " ", (span or "").strip().lower())
+    s = s.replace(",", "")
+    s = re.sub(r"\+$", "", s)
+    # Map leading spelled numeral to digits so "seven years" == "7 years".
+    m = re.match(rf"(?:a )?({_WORD_NUMERAL})\b(.*)$", s, re.IGNORECASE)
+    if m:
+        word = m.group(1).lower()
+        rest = m.group(2)
+        digit = _WORD_NUMERAL_VALUE.get(word, word)
+        s = f"{digit}{rest}".strip()
+    # Collapse optional adjectives between value and unit for keying.
+    s = re.sub(r"(\d+%?)\s+(?:[a-z]+\s+){1,3}", r"\1 ", s)
+    return s
+
+
 def count_numbers(text: str) -> int:
-    """Evidence figures: %, money, N+unit (incl. thousands with a unit), years.
+    """Evidence figures: %, money, N+unit (digits or spelled), years.
 
     Do **not** count: Category/version labels, ``T+N`` / ``T+a to T+b`` timelines,
     or bare/queue ``position N`` without a unit noun. Thousands count only with a
     unit (``3,000 invoices``), never bare ``1,100``.
+
+    Distinct values only — repeating ``3,000 invoices`` four times counts as one.
     """
     masked = _NON_EVIDENCE_NUMBER_CONTEXT.sub(" ", text or "")
-    return len(_EVIDENCE_NUMBER.findall(masked))
+    keys: set[str] = set()
+    for span in _EVIDENCE_NUMBER.findall(masked):
+        key = _number_evidence_key(span)
+        if key:
+            keys.add(key)
+    return len(keys)
 
 
 def specificity_scorecard(
