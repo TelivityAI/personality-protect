@@ -691,19 +691,20 @@ def test_novelty_guard_rejects_invented_vocabulary():
 
     # Specific short draft (soulless, not slop): voice rewrite may add diction.
     # novelty_too_high must agree with novelty_guard so --force does not false-reject.
-    edifact = (
-        "Modern NDC booking flows look great until a wheelchair request.\n\n"
-        "The flow drops into EDIFACT. PNR state takes over. The GDS carries it home.\n\n"
-        "You've built a demo that works until the first SSR."
+    specific = (
+        "Modern Contoso onboarding flows look great until a compliance hold.\n\n"
+        "The flow drops into Contoso Ledger. Northwind state takes over. "
+        "Fabrikam carries it home.\n\n"
+        "You've built a demo that works until the first exception."
     )
     voiced = (
-        edifact
+        specific
         + "\n\nCut the fog on the happy path. The fallback is the product."
     )
-    assert draft_looks_sloppy(edifact) is False
-    assert novelty_applies(edifact) is False
-    assert novelty_too_high(edifact, voiced) is False
-    assert novelty_guard(edifact, voiced) == voiced.strip()
+    assert draft_looks_sloppy(specific) is False
+    assert novelty_applies(specific) is False
+    assert novelty_too_high(specific, voiced) is False
+    assert novelty_guard(specific, voiced) == voiced.strip()
 
 
 def test_strip_capitalizes_orphan_after_problem_cut():
