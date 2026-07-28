@@ -72,7 +72,9 @@ FILTER_USER_TEMPLATE_INFER = (
 # drafts; polished frontier prose often triggers that path. Force requires a rewrite.
 FILTER_SYSTEM_PROMPT_FORCE = (
     "Personal voice rewriter. Prefer a light rewrite over a copy — but NEVER delete "
-    "arguments, claims, evidence, or context callbacks (e.g. 'In a previous piece'). "
+    "arguments, claims, evidence, or context callbacks "
+    "(e.g. 'In a previous piece', 'Last time I said'). "
+    "First-sentence self-references are voice, not scaffolding — keep them. "
     "A pass that removes substance is worse than leaving the draft unchanged. "
     "Throat-clearing lines ('Here's what X…:') are stripped by a separate deterministic "
     "pass — do not invent replacements for them; focus on diction/cadence only. "
@@ -87,7 +89,8 @@ FILTER_SYSTEM_PROMPT_FORCE = (
 
 FILTER_USER_TEMPLATE_FORCE = (
     "Light rewrite in my voice. Keep every argument and context beat. Do not drop "
-    "load-bearing sentences. Do not reparagraph just to insert blank lines. "
+    "load-bearing sentences or first-person callbacks ('Last time I said', "
+    "'In a previous piece'). Do not reparagraph just to insert blank lines. "
     "Same meaning; full draft. (Scaffolding like 'Here's what X…:' is removed "
     "elsewhere — do not rewrite those lines into weaker fragments.)\n\n"
     "### Draft\n{draft}\n\n"
@@ -127,6 +130,10 @@ _LEADING_QUOTE_PARA_RE = re.compile(
 )
 _DIDNT_SEE_HINGE_RE = re.compile(
     r"(?im)^((?:Here's|Here is) what\b[^\n]*\bdidn't see:|The commenter didn't see:)\s*$",
+)
+# First-person context callbacks — voice, not throat-clearing.
+_LAST_TIME_I_SAID_RE = re.compile(
+    r"(?im)^(Last time I said\b[^.!?\n]*[.!?]?)",
 )
 
 
@@ -268,6 +275,22 @@ def restore_structural_openers(draft: str, rewrite: str) -> str:
                     out = f"{qm2.group(1).strip()}\n\n{hinge}\n\n{rest}"
                 else:
                     out = hinge + "\n\n" + out
+
+    # Protect "Last time I said…" — model often strips it as fake scaffolding.
+    lm = _LAST_TIME_I_SAID_RE.search(draft)
+    if lm:
+        callback = lm.group(1).strip()
+        if callback and not re.search(re.escape(callback), out, re.IGNORECASE):
+            # Prefer splicing before the orphaned follow-on sentence when present.
+            after = draft[lm.end() :].lstrip()
+            follow = ""
+            if after:
+                follow = re.split(r"(?<=[.!?])\s+", after, maxsplit=1)[0].strip()
+            if follow and follow in out:
+                idx = out.find(follow)
+                out = out[:idx] + callback + " " + out[idx:]
+            else:
+                out = callback + "\n\n" + out
     return out.strip()
 
 

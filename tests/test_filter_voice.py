@@ -242,6 +242,25 @@ def test_restore_structural_openers_puts_back_quote_and_hinge():
     assert "hours of circling" in out
 
 
+def test_restore_last_time_i_said_callback():
+    from personality_protect.filter import apply_voice_postprocess
+
+    draft = (
+        "Last time I said hotel and air aren't the same game. "
+        "Fair question I got: what actually transfers?\n\n"
+        "Connectivity discipline. Contoso Ledger ops. Northwind supply."
+    )
+    # Model stripped the self-reference and left the orphan.
+    model_out = (
+        "Fair question I got: what actually transfers?\n\n"
+        "Connectivity discipline. Contoso Ledger ops. Northwind supply."
+    )
+    out = apply_voice_postprocess(model_out, draft=draft)
+    assert out.startswith("Last time I said")
+    assert "Fair question I got" in out
+    assert "Contoso Ledger" in out
+
+
 def test_substance_guard_rejects_catastrophic_drops_only():
     from personality_protect.filter import substance_guard
 

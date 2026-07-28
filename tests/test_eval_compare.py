@@ -98,6 +98,23 @@ def test_count_numbers_evidence_not_labels_or_timeline():
     assert count_numbers(anatomy) == 3  # 64%, 3,000+ invoices, 12 years
 
 
+def test_count_numbers_word_numerals_and_distinct_values():
+    # Spelled-out counts with units are evidence.
+    words = (
+        "After twelve long haul flights and forty times the load, "
+        "seven years of ops, five complex rebookings, two quarters, "
+        "hundreds of bookings, a hundred delayed travelers, "
+        "three channels, six hours."
+    )
+    assert count_numbers(words) >= 8
+    # Repeats of one fact count once.
+    assert count_numbers("3,000 invoices. Again 3,000 invoices. Still 3,000 invoices.") == 1
+    # Digit and spelled form of the same claim collapse.
+    assert count_numbers("Seven years. Also 7 years.") == 1
+    # Bare spelled numeral without a unit still does not count.
+    assert count_numbers("Twelve alone is not evidence.") == 0
+
+
 def test_specificity_scorecard_gates_parable_vs_named():
     parable = next(p for p in list_synthetic_drafts() if p.stem == "clean_article")
     card = specificity_scorecard(parable.read_text(encoding="utf-8"), channel="article")
