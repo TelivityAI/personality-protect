@@ -998,8 +998,10 @@ def filter_draft(
     use_chunk = should_chunk_filter(draft) if chunk is None else bool(chunk)
     windows = paragraph_windows(draft) if use_chunk else [draft]
     if use_chunk and len(windows) > 1:
-        # Longform: strong rewrite prompts per window; never leave-alone freeze.
-        # (force prompts are too light and yield blank-line near-copies.)
+        # Longform: strong rewrite prompts per window; skip per-window leave-alone.
+        # Default force=False — force prompts often yield blank-line near-copies.
+        # When the caller passed --force and the stitch is still a byte copy,
+        # retry once with force=True so long pieces are not silent no-ops.
         rewritten = _filter_draft_chunked(
             draft,
             windows,
@@ -1011,6 +1013,23 @@ def filter_draft(
             force=False,
             max_tokens=max_tokens,
         )
+        if force and rewritten.strip() == draft.strip() and chosen != "mock":
+            rewritten = _filter_draft_chunked(
+                draft,
+                windows,
+                paths=paths,
+                adapter_dir=adapter_dir,
+                config=config,
+                chosen=chosen,
+                gguf=gguf,
+                force=True,
+                max_tokens=max_tokens,
+            )
+        if force:
+            return (
+                apply_voice_postprocess(rewritten.strip() or draft, draft=draft),
+                chosen,
+            )
         return rewritten, chosen
 
     budget = suggest_max_tokens(draft, override=max_tokens)

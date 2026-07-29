@@ -830,6 +830,48 @@ def test_filter_draft_long_auto_chunks_strips_scaffolding(tmp_path):
     assert "\n\n" in out
 
 
+def test_filter_draft_long_force_retries_when_chunked_echo(tmp_path):
+    """--force on longform must retry with force=True if the first stitch copies."""
+    from personality_protect.config import get_paths
+    from personality_protect.demo import run_demo
+    from personality_protect.filter import filter_draft
+
+    run_demo(home=tmp_path)
+    paths = get_paths("demo", home=tmp_path)
+
+    body = []
+    for i in range(12):
+        body.append(
+            f"Contoso Labs memo section {i} argues that Northwind must evaluate "
+            f"texture as carefully as substance when reviewing workplace writing."
+        )
+    draft = (
+        "Contoso audits punish compressed thinking.\n\n"
+        + "\n\n".join(body)
+        + "\n\nNorthwind will keep publishing polished indecision at greater volume."
+    )
+    assert len(draft) > 1600
+
+    force_flags: list[bool] = []
+
+    def fake_chunked(d, windows, **kwargs):
+        force_flags.append(bool(kwargs.get("force")))
+        if not kwargs.get("force"):
+            return d  # first pass: silent echo
+        # Second pass: subtractive trim (no invented vocabulary).
+        return d.replace(" at greater volume", "", 1)
+
+    with patch(
+        "personality_protect.filter._filter_draft_chunked", side_effect=fake_chunked
+    ):
+        out, used = filter_draft(draft, paths, backend="mlx", force=True)
+
+    assert used == "mlx"
+    assert force_flags == [False, True]
+    assert "at greater volume" not in out
+    assert out.strip() != draft.strip()
+
+
 def test_filter_draft_short_leave_alone_still_single_shot(tmp_path):
     """Short already-voice drafts stay leave-alone; chunk reject/retry must not fire."""
     from personality_protect.config import get_paths
