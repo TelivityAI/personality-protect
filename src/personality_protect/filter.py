@@ -440,6 +440,9 @@ def should_chunk_filter(
     draft: str, *, threshold: int = FILTER_CHUNK_THRESHOLD
 ) -> bool:
     """True when draft is article-length and should use chunked inference."""
+    # TODO(longform): align article inference with translator train sections —
+    # section → translate each → stitch via split_translator_source_sections +
+    # stitch_filter_chunks. Avoid a half-built whole-article echo path.
     return len((draft or "").strip()) > int(threshold)
 
 
