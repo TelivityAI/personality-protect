@@ -115,6 +115,9 @@ def test_count_numbers_word_numerals_and_distinct_values():
     assert count_numbers("Seven years. Also 7 years.") == 1
     # Bare spelled numeral without a unit still does not count.
     assert count_numbers("Twelve alone is not evidence.") == 0
+    # Glue words between numeral and noun are not a quantified claim.
+    assert count_numbers("Pick one and channel the rest through Contoso.") == 0
+    assert count_numbers("Hundreds of bookings cleared same day.") == 1
 
 
 def test_specificity_scorecard_gates_parable_vs_named():

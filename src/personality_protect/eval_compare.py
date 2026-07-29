@@ -350,9 +350,10 @@ _EVIDENCE_NUMBER = re.compile(
     + _EVIDENCE_UNIT
     # Spelled-out counts with a unit ("twelve … flights", "seven years").
     # Bare calendar years (2019) and version ids are not evidence — need a unit.
+    # Intervening tokens may be adjectives / "of"; not glue (and/or/the/…).
     + r"|(?:\ba\s+)?"
     + _WORD_NUMERAL
-    + r"(?:\s+[A-Za-z]+){0,3}\s+"
+    + r"(?:\s+(?:of|(?!and\b|or\b|but\b|the\b|a\b|an\b|to\b|for\b|in\b|on\b|at\b|by\b)[A-Za-z]+)){0,3}\s+"
     + _EVIDENCE_UNIT
 )
 
