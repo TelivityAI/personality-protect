@@ -95,19 +95,20 @@ def _word_set(text: str) -> set[str]:
 # ``count_proper_nouns`` (excludes sentence-initial capitals). A single 48/1k
 # gate rejected ~34% of posts and ~17% of articles.
 #
-# Numbers: ~48% of real posts have zero figures (p10/p25 = 0) — no hard gate
-# on LinkedIn. Articles keep the corpus floor (~6.6/1k). Demanding numbers
-# when ``numbers_available`` is empty pushes the drafter to invent them.
+# Numbers: report on both channels, hard-gate on neither. Under the shipped
+# evidence counter, article corpus median sits ~3.5/1k with p10 ~1.6 — a 6.6
+# floor sat above the median and rejected most published articles. Demanding
+# numbers when ``numbers_available`` is empty pushes the drafter to invent them.
 # Median sentence / short-line / you>I are advisory only.
-# Channel p10s under *this* counter. Re-derive on the private article corpus
-# after counter changes (word numerals / distinct keys) — do not hand-tune.
+# Proper-noun floors: channel p10s under ``count_proper_nouns`` (keep this
+# counter — do not swap). Re-derive after counter changes; do not hand-tune.
 SCORECARD_MIN_PROPER_PER_1K_POST = 20.0
 SCORECARD_MIN_PROPER_PER_1K_ARTICLE = 42.0
 # Back-compat alias → article floor (stricter default when channel omitted).
 SCORECARD_MIN_PROPER_PER_1K = SCORECARD_MIN_PROPER_PER_1K_ARTICLE
 SCORECARD_MIN_NUMBERS_PER_1K_POST = 0.0
-SCORECARD_MIN_NUMBERS_PER_1K_ARTICLE = 6.6
-# Back-compat alias → article numbers floor.
+SCORECARD_MIN_NUMBERS_PER_1K_ARTICLE = 0.0
+# Back-compat alias → numbers floor (advisory on every channel).
 SCORECARD_MIN_NUMBERS_PER_1K = SCORECARD_MIN_NUMBERS_PER_1K_ARTICLE
 
 
@@ -132,7 +133,7 @@ def resolve_numbers_floor(
     *,
     words: int | None = None,
 ) -> float:
-    """Pick numbers /1k floor. Posts: 0 (advisory only). Articles: corpus floor."""
+    """Pick numbers /1k floor. Always 0 — report only, never hard-fail."""
     ch = (channel or "").strip().lower()
     if ch in {"linkedin", "post", "posts", "li", "short"}:
         return SCORECARD_MIN_NUMBERS_PER_1K_POST
@@ -400,11 +401,11 @@ def specificity_scorecard(
 ) -> dict[str, Any]:
     """Deterministic draft gate: specificity before any voice filter.
 
-    Hard FAIL: proper nouns /1k (channel p10). Numbers /1k are hard only on
-    articles (~6.6); on LinkedIn posts they are advisory (floor 0) — half of
-    real posts have zero figures.
-    Advisory only (never FAIL): median sentence, short-line ratio, you vs I,
-    and post-channel numbers.
+    Hard FAIL: proper nouns /1k (channel p10). Numbers /1k are advisory on
+    every channel (floor 0) — report the value, never gate; inventing figures
+    to clear a quota is worse than a thin numbers line.
+    Advisory only (never FAIL): numbers, median sentence, short-line ratio,
+    you vs I.
     A voice filter cannot insert named entities or a benchmark table.
     """
     body = (text or "").strip()
