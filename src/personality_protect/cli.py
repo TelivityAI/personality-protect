@@ -844,6 +844,8 @@ def filter_cmd(
     # --force means "must rewrite". Byte-identical output is a hard failure —
     # do not write a fake *-voiced.md that is just the Claude draft.
     force_echo = bool(force and flags.get("unchanged"))
+    # Translator may invent diction, never entities/figures absent from source.
+    invent_reject = bool(flags.get("invented_facts"))
 
     if as_json:
         typer.echo(
@@ -856,13 +858,14 @@ def filter_cmd(
                     "chunked": chunked,
                     "chunk_windows": n_windows if auto_chunk else 1,
                     "force_echo_reject": force_echo,
+                    "invent_reject": invent_reject,
                     **flags,
                 },
                 indent=2,
                 ensure_ascii=False,
             )
         )
-        if force_echo:
+        if force_echo or invent_reject:
             raise typer.Exit(1)
         if out:
             out.write_text(rewritten + "\n", encoding="utf-8")
@@ -876,6 +879,14 @@ def filter_cmd(
         console.print(
             "[red]--force produced byte-identical output (echo). "
             "Not writing voiced file — filter did not rewrite.[/red]"
+        )
+        raise typer.Exit(1)
+    if invent_reject:
+        console.print(
+            "[red]Rewrite invented proper nouns or evidence figures "
+            f"(proper+{flags.get('invented_proper_count', 0)} "
+            f"numbers+{flags.get('invented_number_count', 0)}). "
+            "Not writing voiced file — keep source entities/figures only.[/red]"
         )
         raise typer.Exit(1)
     if flags["unchanged"]:

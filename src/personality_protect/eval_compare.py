@@ -259,27 +259,40 @@ def _sentence_word_counts(text: str) -> list[int]:
     return counts
 
 
+def extract_proper_noun_keys(text: str) -> set[str]:
+    """Named-entity proxy keys (lowercased) for invention checks.
+
+    Same span heuristics as ``count_proper_nouns`` — Contoso-safe, not NER.
+    Deduped for membership tests (invented vs present in source).
+    """
+    return {span.lower() for span in _iter_proper_noun_spans(text)}
+
+
 def count_proper_nouns(text: str) -> int:
     """Named-entity proxy: acronyms, multi-word Title Case, mid-sentence Capitals.
 
     Avoids counting sentence-initial ``Add`` / ``Was`` / ``Where`` as entities.
-    Contoso-safe heuristic — not a NER model.
+    Contoso-safe heuristic — not a NER model. Counts occurrences (not unique).
     """
+    return sum(1 for _ in _iter_proper_noun_spans(text))
+
+
+def _iter_proper_noun_spans(text: str):
+    """Yield proper-noun proxy spans (original casing)."""
     body = text or ""
-    hits = 0
-    hits += len(re.findall(r"\b[A-Z]{2,}\b", body))
-    # Finance / ops shorthand: P&L, S&OP, etc.
-    hits += len(re.findall(r"\b[A-Z](?:&[A-Z])+\b", body))
-    hits += len(re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", body))
-    # Mid-sentence capital after lowercase/digit punctuation (not line start).
+    for span in re.findall(r"\b[A-Z]{2,}\b", body):
+        yield span
+    for span in re.findall(r"\b[A-Z](?:&[A-Z])+\b", body):
+        yield span
+    for span in re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", body):
+        yield span
     for m in re.finditer(r"(?<=[a-z0-9,;:\"'”’)\]])\s+([A-Z][a-zA-Z0-9'-]{1,})\b", body):
         tok = m.group(1)
         if tok.isupper() and len(tok) >= 2:
             continue  # already counted as acronym
         if tok.lower() in _COMMON_CAPS:
             continue
-        hits += 1
-    return hits
+        yield tok
 
 
 # Evidence figures only — not labels or narrative clocks.
@@ -375,6 +388,17 @@ def _number_evidence_key(span: str) -> str:
     return s
 
 
+def extract_evidence_number_keys(text: str) -> set[str]:
+    """Distinct evidence-figure keys (%, money, N+unit) for invention checks."""
+    masked = _NON_EVIDENCE_NUMBER_CONTEXT.sub(" ", text or "")
+    keys: set[str] = set()
+    for span in _EVIDENCE_NUMBER.findall(masked):
+        key = _number_evidence_key(span)
+        if key:
+            keys.add(key)
+    return keys
+
+
 def count_numbers(text: str) -> int:
     """Evidence figures: %, money, N+unit (digits or spelled), years.
 
@@ -384,13 +408,7 @@ def count_numbers(text: str) -> int:
 
     Distinct values only — repeating ``3,000 invoices`` four times counts as one.
     """
-    masked = _NON_EVIDENCE_NUMBER_CONTEXT.sub(" ", text or "")
-    keys: set[str] = set()
-    for span in _EVIDENCE_NUMBER.findall(masked):
-        key = _number_evidence_key(span)
-        if key:
-            keys.add(key)
-    return len(keys)
+    return len(extract_evidence_number_keys(text))
 
 
 def specificity_scorecard(
