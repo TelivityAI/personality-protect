@@ -16,7 +16,7 @@ from personality_protect.filter import (
     strip_ai_tells,
     suggest_max_tokens,
 )
-from personality_protect.sft import SYSTEM_PROMPT, USER_TEMPLATE, USER_TEMPLATE_INFER
+from personality_protect.sft import SYSTEM_PROMPT, USER_TEMPLATE_INFER
 
 
 def test_extract_rewrite_strips_template_echo_loops():
@@ -55,18 +55,16 @@ def test_extract_rewrite_handles_rewritten_header_prefix():
     assert extract_rewrite(text) == "Plain voice rewrite only."
 
 
-def test_filter_user_content_matches_sft_shape_with_reference():
+def test_filter_user_content_with_reference_still_requires_translation():
     user = build_filter_user_content(
-        "We must leverage synergies.",
-        reference="I cut the fog and keep the spine.",
-    )
-    assert user == USER_TEMPLATE.format(
-        draft="We must leverage synergies.",
-        reference="I cut the fog and keep the spine.",
+        "Contoso must leverage synergies.",
+        reference="Contoso cuts the fog and keeps the spine.",
     )
     assert "### Draft" in user
     assert "### My voice (reference)" in user
     assert user.rstrip().endswith("### Rewritten")
+    assert "do not leave unchanged" in user.lower()
+    assert "already my voice cadence" not in user.lower()
 
 
 def test_filter_user_content_without_reference_still_ends_at_rewritten():
@@ -97,14 +95,15 @@ def test_prompts_preserve_paragraphs_and_allow_leave_alone():
     assert "soulless" in user_l or "clean" in user_l
 
 
-def test_filter_prompt_pushes_past_polished_generic():
-    """Inference must not treat clean polished drafts as automatic leave-alone."""
+def test_filter_prompt_requires_translation():
+    """Default inference asks for a rewrite instead of offering leave-alone."""
     sys_l = FILTER_SYSTEM_PROMPT.lower()
-    assert "polished" in sys_l or "frontier" in sys_l or "generic" in sys_l
+    assert "do not leave unchanged" in sys_l
     assert "truncate" in sys_l or "full draft" in sys_l
     assert "header" in sys_l
     user_l = FILTER_USER_TEMPLATE_INFER.lower()
-    assert "throat-clearing" in user_l or "only if" in user_l
+    assert "do not leave unchanged" in user_l
+    assert "leave unchanged only if" not in user_l
     assert "whole draft" in user_l or "mid-piece" in user_l
 
 
@@ -188,6 +187,49 @@ def test_force_echo_must_not_write_voiced_file(tmp_path):
     assert result.exit_code == 1, result.output
     assert not out.is_file()
     assert "force_echo_reject" in result.stdout
+
+
+def test_force_novel_diction_is_not_rejected(tmp_path):
+    """Translator mode permits new diction; only force echo is a hard failure."""
+    from typer.testing import CliRunner
+
+    from personality_protect.cli import app
+
+    home = str(tmp_path)
+    runner = CliRunner()
+    assert (
+        runner.invoke(
+            app, ["--logo", "off", "init", "--home", home, "--json"]
+        ).exit_code
+        == 0
+    )
+    draft = "Contoso publishes a formal quarterly operations memo."
+    rewrite = "Contoso shipped the memo. Clean. Direct. No corporate fog."
+    out = tmp_path / "voiced.md"
+
+    with patch(
+        "personality_protect.cli.filter_draft",
+        return_value=(rewrite, "mock"),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "--logo",
+                "off",
+                "filter",
+                "--text",
+                draft,
+                "--out",
+                str(out),
+                "--force",
+                "--home",
+                home,
+                "--json",
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    assert out.read_text(encoding="utf-8").strip() == rewrite
+    assert "force_novelty_reject" not in result.stdout
 
 
 def test_strip_voice_scaffolding_cuts_article_throat_clearers():
@@ -324,6 +366,23 @@ def test_substance_guard_rejects_catastrophic_drops_only():
         "Extra beat."
     )
     assert substance_guard(draft, split) == split
+
+
+def test_truncation_guard_rejects_empty_or_cutoff_not_fresh_diction():
+    from personality_protect.filter import truncation_guard
+
+    draft = (
+        "Contoso publishes a formal quarterly operations memo with detailed findings. "
+        "Northwind reviews every section before the final release."
+    )
+    translated = (
+        "Contoso shipped the quarterly memo. The findings landed clean. "
+        "Northwind checked every section."
+    )
+    assert truncation_guard(draft, translated) == translated
+    assert truncation_guard(draft, "") == draft
+    assert truncation_guard(draft, "Contoso shipped the quarterly memo but") == draft
+    assert truncation_guard(draft, "Done.") == draft
 
 
 def test_suggest_max_tokens_scales_for_articles():
@@ -496,8 +555,8 @@ def test_draft_already_in_voice_detects_vibe_shaped():
     assert not draft_looks_soulless(vibe)
 
 
-def test_filter_draft_leave_alone_skips_model_for_vibe(tmp_path):
-    """Already-in-voice short drafts must not fidget or mode-collapse."""
+def test_filter_draft_default_calls_model_for_nonempty_voice_draft(tmp_path):
+    """Translator default always invokes the model, even for voice-shaped input."""
     from personality_protect.config import get_paths
     from personality_protect.demo import run_demo
     from personality_protect.filter import filter_draft
@@ -511,23 +570,25 @@ def test_filter_draft_leave_alone_skips_model_for_vibe(tmp_path):
     )
     calls: list[str] = []
 
-    def boom(d: str, *_a, **_k):
+    def translate(d: str, *_a, **_k):
         calls.append(d)
-        raise AssertionError("model must not run for leave-alone voice drafts")
+        return d + "\n\nContoso lands the point without corporate fog."
 
-    with patch("personality_protect.filter._filter_mock", side_effect=boom):
+    with patch("personality_protect.filter._filter_mock", side_effect=translate):
         out, used = filter_draft(draft, paths, backend="mock")
     assert used == "mock"
-    assert calls == []
-    assert out == draft.strip()
-    # --force still runs the model, but invented vocabulary is rejected.
+    assert calls == [draft]
+    assert "corporate fog" in out
+    # --force also permits translator diction.
     with patch(
         "personality_protect.filter._filter_mock",
-        side_effect=lambda d, *_a, **_k: "Cut the fog.\n\nKeep the spine.",
+        side_effect=lambda d, *_a, **_k: (
+            d + "\n\nCut the corporate fog. Keep the Contoso spine."
+        ),
     ):
         forced, _ = filter_draft(draft, paths, backend="mock", force=True)
-    assert "Cut the fog" not in forced
-    assert "spine" not in forced
+    assert "corporate fog" in forced
+    assert "Contoso spine" in forced
     # Subtractive force rewrite (no new vocabulary) is kept.
     with patch(
         "personality_protect.filter._filter_mock",
@@ -692,12 +753,9 @@ def test_filter_draft_short_stays_singleshot(tmp_path):
 
     def fake_mock(d: str, _adapter_dir):
         calls.append(d)
-        # Subtractive only — no invented vocabulary.
         return (
-            d.replace("In today's fast-paced digital world, ", "")
-            .replace("leverage ", "")
-            .replace("Furthermore, ", "")
-            .replace("delve into ", "")
+            "In today's digital world, Contoso must build authentic connections.\n\n"
+            "Furthermore, leaders should talk about authentic storytelling."
         )
 
     with patch("personality_protect.filter._filter_mock", side_effect=fake_mock):
@@ -784,7 +842,7 @@ def test_strip_capitalizes_orphan_after_problem_cut():
 
 
 def test_filter_draft_long_auto_chunks_strips_scaffolding(tmp_path):
-    """Article-length drafts auto-chunk; generative novelty falls back to strip-only."""
+    """Article-length translator keeps new diction and strips scaffolding."""
     from personality_protect.config import get_paths
     from personality_protect.demo import run_demo
     from personality_protect.eval_compare import longform_metrics
@@ -811,7 +869,7 @@ def test_filter_draft_long_auto_chunks_strips_scaffolding(tmp_path):
 
     def fake_mock(d: str, _adapter_dir):
         calls.append(d)
-        # Invented vocabulary — must be rejected by novelty_guard.
+        # Translator mode permits fresh diction.
         return d + "\n\nCut the fog with bandages and chatbots."
 
     with patch("personality_protect.filter._filter_mock", side_effect=fake_mock):
@@ -822,8 +880,8 @@ def test_filter_draft_long_auto_chunks_strips_scaffolding(tmp_path):
     assert all(len(c) <= FILTER_CHUNK_MAX_CHARS + 40 for c in calls)
     assert "Here's the problem" not in out
     assert "Here's the part that should genuinely bother" not in out
-    assert "bandages" not in out
-    assert "chatbots" not in out
+    assert "bandages" in out
+    assert "chatbots" in out
     assert out.startswith("Contoso audits") or "Contoso audits" in out
     metrics = longform_metrics(draft, out)
     assert metrics["scaffolding_after"] == 0
@@ -872,8 +930,8 @@ def test_filter_draft_long_force_retries_when_chunked_echo(tmp_path):
     assert out.strip() != draft.strip()
 
 
-def test_filter_draft_short_leave_alone_still_single_shot(tmp_path):
-    """Short already-voice drafts stay leave-alone; chunk reject/retry must not fire."""
+def test_filter_draft_short_voice_draft_is_translated_single_shot(tmp_path):
+    """Short voice-shaped drafts still call the model without chunking."""
     from personality_protect.config import get_paths
     from personality_protect.demo import run_demo
     from personality_protect.filter import filter_draft
@@ -899,5 +957,5 @@ def test_filter_draft_short_leave_alone_still_single_shot(tmp_path):
         out, used = filter_draft(draft, paths, backend="mock")
 
     assert used == "mock"
-    assert calls == []  # leave-alone before model
-    assert out.strip() == draft.strip()
+    assert calls == [draft]
+    assert "(should not run)" in out

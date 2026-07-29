@@ -84,6 +84,11 @@ from personality_protect.train import (
     detect_backend,
     run_train,
 )
+from personality_protect.translator_eval import (
+    load_packaged_author_holdout,
+    load_packaged_foreign_holdout,
+    score_translator_holdout,
+)
 
 app = typer.Typer(
     name="personality-protect",
@@ -170,7 +175,7 @@ def main(
         typer.echo(
             "Commands: init | download | ingest | select | train | filter | "
             "eval | compare | scorecard | pair-gate | sterile-check | "
-            "demo | api | logo | status"
+            "translator-eval | demo | api | logo | status"
         )
 
 
@@ -505,6 +510,14 @@ def train_cmd(
         "--sft-only",
         help="Build local SFT JSONL only; skip weight training.",
     ),
+    pairs: Optional[Path] = typer.Option(
+        None,
+        "--pairs",
+        help=(
+            "Gated flatten→author JSONL (pairs.kept.jsonl). "
+            "Voice-pair mode: translator SFT only; skips leave_alone/identity minting."
+        ),
+    ),
     profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
     home: Optional[Path] = typer.Option(None, "--home"),
     as_json: bool = typer.Option(False, "--json"),
@@ -514,6 +527,10 @@ def train_cmd(
     paths = get_paths(profile, home=home)
     if backend not in {"auto", "mlx", "cuda", "cpu", "mock"}:
         console.print(f"[red]Unknown backend: {backend}[/red]")
+        raise typer.Exit(2)
+
+    if pairs is not None and not pairs.is_file():
+        console.print(f"[red]pairs file not found: {pairs}[/red]")
         raise typer.Exit(2)
 
     try:
@@ -528,6 +545,8 @@ def train_cmd(
     if not as_json and not sft_only:
         console.print(f"Backend: [bold]{detected}[/bold]")
         console.print(backend_docs(detected))
+        if pairs is not None:
+            console.print(f"Voice-pair mode: translator SFT from {pairs}")
         if proof and max_steps is None and not smoke and not mock:
             console.print(
                 f"Steps: proof mode ({PROOF_MAX_STEPS}) in chunks of {chunk_steps}"
@@ -733,6 +752,7 @@ def train_cmd(
             resume=resume,
             force_retrain=force_retrain,
             progress_callback=callback,
+            pairs=pairs,
         )
     except (FileNotFoundError, RuntimeError, MockFallbackError) as exc:
         console.print(f"[red]{exc}[/red]")
@@ -774,7 +794,7 @@ def filter_cmd(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Always rewrite (skip leave-alone); for polished frontier drafts.",
+        help="Fail if the translator returns a byte-identical echo.",
     ),
     chunk: Optional[bool] = typer.Option(
         None,
@@ -824,8 +844,6 @@ def filter_cmd(
     # --force means "must rewrite". Byte-identical output is a hard failure —
     # do not write a fake *-voiced.md that is just the Claude draft.
     force_echo = bool(force and flags.get("unchanged"))
-    # Inverse of echo: generative invention that slipped past novelty_guard.
-    force_novelty = bool(force and flags.get("novelty_high"))
 
     if as_json:
         typer.echo(
@@ -838,14 +856,13 @@ def filter_cmd(
                     "chunked": chunked,
                     "chunk_windows": n_windows if auto_chunk else 1,
                     "force_echo_reject": force_echo,
-                    "force_novelty_reject": force_novelty,
                     **flags,
                 },
                 indent=2,
                 ensure_ascii=False,
             )
         )
-        if force_echo or force_novelty:
+        if force_echo:
             raise typer.Exit(1)
         if out:
             out.write_text(rewritten + "\n", encoding="utf-8")
@@ -861,21 +878,10 @@ def filter_cmd(
             "Not writing voiced file — filter did not rewrite.[/red]"
         )
         raise typer.Exit(1)
-    if force_novelty:
-        console.print(
-            "[red]Rewrite invented too much new vocabulary "
-            f"({flags.get('new_word_count')} new words). "
-            "Not writing voiced file — voice filter must stay subtractive.[/red]"
-        )
-        raise typer.Exit(1)
     if flags["unchanged"]:
         console.print(
             "[yellow]Filter left draft unchanged "
-            "(leave-alone / similarity / substance guard — try --force).[/yellow]"
-        )
-    if flags.get("substance_loss"):
-        console.print(
-            "[red]Rewrite dropped too much substance — kept draft.[/red]"
+            "(model echo or truncation guard).[/yellow]"
         )
     if flags["likely_truncated"]:
         console.print(
@@ -1319,6 +1325,95 @@ def sterile_check_cmd(
             console.print(
                 f"[red]FAIL[/red] — {', '.join(result['failed'])}. "
                 "Do not generate the training set; fix the flatten prompt/model."
+            )
+            for code, msg in result["reasons"].items():
+                console.print(f"  {code}: {msg}")
+    raise typer.Exit(0 if result["pass"] else 1)
+
+
+@app.command("translator-eval")
+def translator_eval_cmd(
+    ctx: typer.Context,
+    output_file: Path = typer.Option(
+        ...,
+        "--output-file",
+        help="Translator rewrite to score (required).",
+    ),
+    input_file: Optional[Path] = typer.Option(
+        None,
+        "--input-file",
+        help="Sterile / foreign holdout input (omit with --packaged).",
+    ),
+    author_band: Optional[Path] = typer.Option(
+        None,
+        "--author-band",
+        help="Held-out author post for voice-band axes (omit with --packaged).",
+    ),
+    packaged: bool = typer.Option(
+        False,
+        "--packaged",
+        help="Use Contoso-safe packaged foreign + author-holdout fixtures.",
+    ),
+    min_frag_gap_ratio: float = typer.Option(
+        MIN_FRAG_GAP_RATIO,
+        "--min-frag-gap-ratio",
+        help="Fail if output short-line ratio − input is below this.",
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Score a voice-translator rewrite against holdout axes.
+
+    Success = proper / fragments / you·I move toward the author band vs the
+    sterile input. Failure = byte-identical echo or still press-release band.
+    Ear-test remains operator judgment; this automates axis checks only.
+    Contoso-safe packaged fixtures — no personal data.
+    """
+    _banner_from_ctx(ctx, json_mode=as_json)
+    if not output_file.is_file():
+        console.print(f"[red]output file not found: {output_file}[/red]")
+        raise typer.Exit(2)
+
+    if packaged:
+        sterile = load_packaged_foreign_holdout()
+        author = load_packaged_author_holdout()
+    else:
+        if input_file is None or author_band is None:
+            console.print(
+                "[red]Provide --input-file and --author-band, or use --packaged.[/red]"
+            )
+            raise typer.Exit(2)
+        if not input_file.is_file() or not author_band.is_file():
+            console.print("[red]input-file and author-band must be existing files[/red]")
+            raise typer.Exit(2)
+        sterile = input_file.read_text(encoding="utf-8")
+        author = author_band.read_text(encoding="utf-8")
+
+    result = score_translator_holdout(
+        sterile,
+        output_file.read_text(encoding="utf-8"),
+        author,
+        min_frag_gap_ratio=min_frag_gap_ratio,
+    )
+    if as_json:
+        typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        console.print(
+            f"[bold]Translator holdout eval[/bold] "
+            f"{'PASS' if result['pass'] else 'FAIL'}"
+        )
+        console.print(f"axes_moved={result['axes_moved']}")
+        console.print(
+            f"frag_gap={result['frag_gap_ratio']} "
+            f"echo={result['echo']}"
+        )
+        if result["pass"]:
+            console.print(
+                "[green]PASS[/green] — axes moved toward author band "
+                "(ear-test still operator judgment)."
+            )
+        else:
+            console.print(
+                f"[red]FAIL[/red] — {', '.join(result['failed'])}."
             )
             for code, msg in result["reasons"].items():
                 console.print(f"  {code}: {msg}")
