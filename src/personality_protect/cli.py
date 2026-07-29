@@ -64,6 +64,18 @@ from personality_protect.logo import (
 )
 from personality_protect.mlx_train import DEFAULT_CHUNK_STEPS, PROOF_MAX_STEPS
 from personality_protect.models import load_index, summarize_by_source_year
+from personality_protect.pair_gate import (
+    MAX_INPUT_PROPER_PER_1K,
+    MAX_STERILE_FRAG_DELTA,
+    MAX_STERILE_PROPER_DELTA,
+    MAX_STERILE_YOU_DELTA,
+    MIN_FRAG_GAP_RATIO,
+    MIN_MEDIAN_SENTENCE_GAP,
+    gate_jsonl,
+    gate_pair,
+    sterile_flattener_check,
+    write_kept_jsonl,
+)
 from personality_protect.select import run_select
 from personality_protect.train import (
     MockFallbackError,
@@ -157,7 +169,8 @@ def main(
         typer.echo("")
         typer.echo(
             "Commands: init | download | ingest | select | train | filter | "
-            "eval | compare | scorecard | demo | api | logo | status"
+            "eval | compare | scorecard | pair-gate | sterile-check | "
+            "demo | api | logo | status"
         )
 
 
@@ -1089,6 +1102,227 @@ def api_cmd(
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(2) from exc
+
+
+@app.command("pair-gate")
+def pair_gate_cmd(
+    ctx: typer.Context,
+    pairs: Optional[Path] = typer.Option(
+        None,
+        "--pairs",
+        help="JSONL of voice pairs (input/output, not_you/author, …).",
+    ),
+    input_text: Optional[str] = typer.Option(
+        None, "--input-text", help="Single-pair input (not-you) text."
+    ),
+    output_text: Optional[str] = typer.Option(
+        None, "--output-text", help="Single-pair output (author voice) text."
+    ),
+    input_file: Optional[Path] = typer.Option(
+        None, "--input-file", help="Read single-pair input from file."
+    ),
+    output_file: Optional[Path] = typer.Option(
+        None, "--output-file", help="Read single-pair output from file."
+    ),
+    keep_out: Optional[Path] = typer.Option(
+        None,
+        "--keep-out",
+        help="Write kept JSONL rows here (batch mode only).",
+    ),
+    drop_log: Optional[Path] = typer.Option(
+        None,
+        "--drop-log",
+        help="Write dropped rows + reasons as JSON here (batch mode).",
+    ),
+    max_input_proper_1k: float = typer.Option(
+        MAX_INPUT_PROPER_PER_1K,
+        "--max-input-proper-1k",
+        help="Fail if flattened input proper/1k exceeds this.",
+    ),
+    min_frag_gap_ratio: float = typer.Option(
+        MIN_FRAG_GAP_RATIO,
+        "--min-frag-gap-ratio",
+        help="Fail if output short-line ratio − input is below this.",
+    ),
+    min_median_sentence_gap: float = typer.Option(
+        MIN_MEDIAN_SENTENCE_GAP,
+        "--min-median-sentence-gap",
+        help="Fail if input median sentence length − output is below this.",
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Drop poisoned flatten→voice pairs before training.
+
+    Automated checks (no eyeballing): input proper/1k ceiling, fragment-gap
+    floor, input you>i must be false, input median sentence meaningfully
+    longer than output. Dropped pairs are logged with reasons.
+    """
+    _banner_from_ctx(ctx, json_mode=as_json)
+    kwargs = {
+        "max_input_proper_1k": max_input_proper_1k,
+        "min_frag_gap_ratio": min_frag_gap_ratio,
+        "min_median_sentence_gap": min_median_sentence_gap,
+    }
+
+    if pairs is not None:
+        if not pairs.is_file():
+            console.print(f"[red]pairs file not found: {pairs}[/red]")
+            raise typer.Exit(2)
+        try:
+            report = gate_jsonl(pairs, **kwargs)
+        except (ValueError, json.JSONDecodeError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(2) from exc
+        if keep_out is not None:
+            write_kept_jsonl(report["kept_rows"], keep_out)
+        if drop_log is not None:
+            drop_log.write_text(
+                json.dumps(
+                    {
+                        "dropped": report["dropped"],
+                        "rows": [
+                            {
+                                "line": r["line"],
+                                "failed": r["failed"],
+                                "reasons": r["reasons"],
+                                "axes": r["axes"],
+                            }
+                            for r in report["dropped_rows"]
+                        ],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        summary = {
+            "path": report["path"],
+            "total": report["total"],
+            "kept": report["kept"],
+            "dropped": report["dropped"],
+            "thresholds": report["thresholds"],
+            "drop_reasons": {},
+        }
+        for row in report["dropped_rows"]:
+            for code in row["failed"]:
+                summary["drop_reasons"][code] = (
+                    summary["drop_reasons"].get(code, 0) + 1
+                )
+        if as_json:
+            typer.echo(json.dumps(summary, indent=2, ensure_ascii=False))
+        else:
+            console.print(
+                f"[bold]Pair gate[/bold] total={summary['total']} "
+                f"kept={summary['kept']} dropped={summary['dropped']}"
+            )
+            if summary["drop_reasons"]:
+                console.print(f"drop_reasons={summary['drop_reasons']}")
+            if keep_out is not None:
+                console.print(f"kept → {keep_out}")
+            if drop_log is not None:
+                console.print(f"drop log → {drop_log}")
+        raise typer.Exit(0 if report["dropped"] == 0 else 1)
+
+    inp = input_text
+    out = output_text
+    if input_file is not None:
+        inp = input_file.read_text(encoding="utf-8")
+    if output_file is not None:
+        out = output_file.read_text(encoding="utf-8")
+    if inp is None or out is None:
+        console.print(
+            "[red]Provide --pairs JSONL, or both input and output "
+            "(--input-text/--output-text or --input-file/--output-file).[/red]"
+        )
+        raise typer.Exit(2)
+
+    result = gate_pair(inp, out, **kwargs)
+    if as_json:
+        typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        console.print(
+            f"[bold]Pair gate[/bold] "
+            f"{'PASS' if result['pass'] else 'FAIL'}"
+        )
+        console.print(
+            f"input proper/1k={result['input']['proper_per_1k']} "
+            f"you_gt_i={result['input']['you_gt_i']} "
+            f"median={result['input']['median_sentence_words']}"
+        )
+        console.print(
+            f"output short_line={result['output']['short_line_ratio']} "
+            f"median={result['output']['median_sentence_words']} "
+            f"frag_gap={result['frag_gap_ratio']} "
+            f"median_gap={result['median_sentence_gap']}"
+        )
+        if not result["pass"]:
+            console.print(f"[red]failed={result['failed']}[/red]")
+            for code, msg in result["reasons"].items():
+                console.print(f"  {code}: {msg}")
+    raise typer.Exit(0 if result["pass"] else 1)
+
+
+@app.command("sterile-check")
+def sterile_check_cmd(
+    ctx: typer.Context,
+    author_flat: Path = typer.Option(
+        ...,
+        "--author-flat",
+        help="Flatten of one author post (same prompt as foreign).",
+    ),
+    foreign_flat: Path = typer.Option(
+        ...,
+        "--foreign-flat",
+        help="Flatten of a press release you did not write.",
+    ),
+    max_proper_delta: float = typer.Option(
+        MAX_STERILE_PROPER_DELTA, "--max-proper-delta"
+    ),
+    max_frag_delta: float = typer.Option(
+        MAX_STERILE_FRAG_DELTA, "--max-frag-delta"
+    ),
+    max_you_delta: int = typer.Option(MAX_STERILE_YOU_DELTA, "--max-you-delta"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Contamination preflight before bulk pair generation.
+
+    Flatten one author post and one foreign press release with the same
+    sterile prompt. If the author-derived flatten scores higher on proper
+    nouns, fragments, or you/I, the flattener is leaking — do not generate
+    hundreds of pairs until this passes.
+    """
+    _banner_from_ctx(ctx, json_mode=as_json)
+    if not author_flat.is_file() or not foreign_flat.is_file():
+        console.print("[red]author-flat and foreign-flat must be existing files[/red]")
+        raise typer.Exit(2)
+    result = sterile_flattener_check(
+        author_flat.read_text(encoding="utf-8"),
+        foreign_flat.read_text(encoding="utf-8"),
+        max_proper_delta=max_proper_delta,
+        max_frag_delta=max_frag_delta,
+        max_you_delta=max_you_delta,
+    )
+    if as_json:
+        typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        console.print(
+            f"[bold]Sterile flattener check[/bold] "
+            f"{'PASS' if result['pass'] else 'FAIL'}"
+        )
+        console.print(f"deltas={result['deltas']}")
+        if result["pass"]:
+            console.print(
+                "[green]PASS[/green] — flattener looks sterile; safe to bulk-pair."
+            )
+        else:
+            console.print(
+                f"[red]FAIL[/red] — {', '.join(result['failed'])}. "
+                "Do not generate the training set; fix the flatten prompt/model."
+            )
+            for code, msg in result["reasons"].items():
+                console.print(f"  {code}: {msg}")
+    raise typer.Exit(0 if result["pass"] else 1)
 
 
 @app.command("status")
