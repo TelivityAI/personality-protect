@@ -14,7 +14,6 @@ from personality_protect.config import (
     load_config,
 )
 from personality_protect.download import resolve_gguf_path
-from personality_protect.sft import USER_TEMPLATE
 
 FilterBackend = Literal["auto", "llama", "gguf", "mlx", "transformers", "mock"]
 
@@ -36,20 +35,16 @@ _TEMPLATE_SECTION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Inference-only prompts. Training still uses sft.SYSTEM_PROMPT / USER_TEMPLATE_INFER
-# (leave-alone pairs). At filter time we push harder: polished-generic prose is not
-# "already my voice," and long drafts must not be truncated mid-sentence.
+# Inference-only translator prompts. Scaffolding cleanup stays in deterministic
+# postprocessing below rather than becoming a model objective.
 FILTER_SYSTEM_PROMPT = (
-    "Personal voice rewriter. Match cadence: short punches, rhetorical bite, "
+    "Voice translator. Rewrite the draft into the author's voice. Preserve meaning. "
+    "Do not leave unchanged. Match cadence: short punches, rhetorical bite, "
     "contractions, paragraph rhythm — not generic clean prose. Keep meaning. "
     "Preserve paragraph breaks; never flatten multi-paragraph drafts. "
     "Keep section headers when the draft has them (long-form needs scanability). "
-    "Keep a strong opener unless it is sloppy/AI scaffolding. "
-    "Polished frontier prose is NOT automatically your voice — rewrite diction and "
-    "cadence when it reads clean-generic (throat-clearing like "
-    "'Here's what X actually looked like:', soft setups that promise content, "
-    "padded transitions). Return unchanged only when punches and bite already match. "
-    "If flat, corporate, mushy, or AI-slop: rewrite into multi-paragraph voice with "
+    "Keep a strong opener. If flat, corporate, mushy, or AI-slop: rewrite into "
+    "multi-paragraph voice with "
     "blank lines between punches — never a thesaurus one-liner. "
     "Strip AI tells (leverage, synergies, delve, robust, In today's fast-paced world, "
     "It is important to note, Moreover, Furthermore, unlock, nestled, testament, "
@@ -58,18 +53,27 @@ FILTER_SYSTEM_PROMPT = (
 )
 
 FILTER_USER_TEMPLATE_INFER = (
-    "Rewrite in my voice. Cadence and diction — not bland marketing or "
+    "Rewrite into the author's voice. Preserve meaning. Do not leave unchanged. "
+    "Cadence and diction — not bland marketing or "
     "polished-generic. Preserve paragraph breaks and section headers. Keep a strong "
-    "opener unless sloppy. Flat/corporate/AI-slop/throat-clearing → multi-paragraph "
-    "voice with blank lines (not one thesaurus sentence). Leave unchanged ONLY if it "
-    "already sounds like me. Same meaning; drop AI filler. Cover the whole draft — "
+    "opener. Flat/corporate/AI-slop → multi-paragraph "
+    "voice with blank lines (not one thesaurus sentence). Same meaning; drop AI filler. "
+    "Cover the whole draft — "
     "do not stop mid-piece.\n\n"
     "### Draft\n{draft}\n\n"
     "### Rewritten"
 )
 
-# Force mode: never leave-alone. Adapter was trained to copy "already voice"
-# drafts; polished frontier prose often triggers that path. Force requires a rewrite.
+FILTER_USER_TEMPLATE_REFERENCE = (
+    "Rewrite into the author's voice. Preserve meaning. Do not leave unchanged. "
+    "Match cadence from the reference and preserve paragraph breaks.\n\n"
+    "### Draft\n{draft}\n\n"
+    "### My voice (reference)\n{reference}\n\n"
+    "### Rewritten"
+)
+
+# Force mode uses stronger retry-oriented instructions. Default mode also always
+# translates; the CLI distinction is that --force treats an echo as failure.
 FILTER_SYSTEM_PROMPT_FORCE = (
     "Personal voice rewriter. Prefer a light rewrite over a copy — but NEVER delete "
     "arguments, claims, evidence, or context callbacks "
@@ -199,13 +203,11 @@ NOVELTY_MAX_NEW_FRAC = 0.03
 
 
 def novelty_applies(draft: str) -> bool:
-    """When the subtractive novelty kill-switch should run.
+    """When the legacy/diagnostic novelty check considers a draft.
 
     Article-length: always (whoeres/bandages failure mode).
     Short slop / short soulless: never — voice rewrite must invent diction.
-    Short already-voice: yes — block additive invention on leave-alone shapes.
-
-    Must match ``novelty_guard`` and ``force_novelty_reject`` (same predicate).
+    Short already-voice: yes.
     """
     d = (draft or "").strip()
     if not d:
@@ -242,11 +244,7 @@ def novelty_too_high(
 
 
 def novelty_guard(draft: str, rewrite: str) -> str:
-    """Keep draft when rewrite looks like generative invention, not a trim.
-
-    Exemptions live in ``novelty_applies`` so CLI ``force_novelty_reject`` and
-    the guard cannot disagree (post-03 EDIFACT false reject).
-    """
+    """Legacy opt-in guard that keeps draft when novelty exceeds its threshold."""
     d = (draft or "").strip()
     r = (rewrite or "").strip()
     if novelty_too_high(d, r):
@@ -307,12 +305,13 @@ def apply_voice_postprocess(
     text: str,
     *,
     draft: str | None = None,
-    enforce_novelty: bool = True,
+    enforce_novelty: bool = False,
 ) -> str:
-    """Reject generative novelty, strip scaffolding, restore structural openers.
+    """Strip scaffolding and restore structural openers.
 
     Novelty ignores vocabulary introduced by deterministic ``strip_ai_tells`` /
-    scaffolding cleanup. ``enforce_novelty=False`` is for tests only.
+    scaffolding cleanup. The opt-in novelty guard is retained for diagnostics and
+    legacy callers, but translator inference permits fresh diction.
     """
     out = (text or "").strip()
     if draft is not None and enforce_novelty:
@@ -414,7 +413,10 @@ def build_filter_user_content(
     """User turn matching SFT shape so LoRA completes a rewrite, not a template loop."""
     draft = draft.strip()
     if reference and reference.strip():
-        return USER_TEMPLATE.format(draft=draft, reference=reference.strip())
+        return FILTER_USER_TEMPLATE_REFERENCE.format(
+            draft=draft,
+            reference=reference.strip(),
+        )
     if force:
         return FILTER_USER_TEMPLATE_FORCE.format(draft=draft)
     return FILTER_USER_TEMPLATE_INFER.format(draft=draft)
@@ -778,14 +780,33 @@ def substance_guard(
     return rewrite
 
 
+def truncation_guard(draft: str, rewrite: str) -> str:
+    """Keep the draft only when model output is empty or likely cut off."""
+    draft = (draft or "").strip()
+    rewrite = (rewrite or "").strip()
+    if not draft:
+        return rewrite
+    if not rewrite:
+        return draft
+    if draft == rewrite:
+        return draft
+    ratio = len(rewrite) / len(draft)
+    ends_clean = rewrite[-1] in ".!?'\"”’)"
+    if ratio < 0.40 or (ratio < 0.55 and not ends_clean):
+        return draft
+    return rewrite
+
+
 def finalize_rewrite(
     text: str,
     *,
     draft: str | None = None,
-    apply_guard: bool = True,
-    apply_substance: bool = True,
+    apply_guard: bool = False,
+    apply_substance: bool = False,
+    apply_truncation: bool = True,
+    enforce_novelty: bool = False,
 ) -> str:
-    """Template-echo cut + AI-tell cleanup (+ guards) + deterministic scaffolding."""
+    """Clean model output and apply safety guards plus scaffolding lint."""
     out = strip_ai_tells(extract_rewrite(text))
     out = _dedupe_repetition_collapse(out)
     if draft is not None:
@@ -794,8 +815,14 @@ def finalize_rewrite(
             out = similarity_guard(draft, out)
         if apply_substance:
             out = substance_guard(draft, out)
+        if apply_truncation:
+            out = truncation_guard(draft, out)
     # Always last: deterministic cuts + restore load-bearing openers from draft.
-    return apply_voice_postprocess(out, draft=draft)
+    return apply_voice_postprocess(
+        out,
+        draft=draft,
+        enforce_novelty=enforce_novelty,
+    )
 
 
 def rewrite_quality_flags(draft: str, rewrite: str) -> dict[str, bool | float | int]:
@@ -946,8 +973,8 @@ def filter_draft(
     MLX 4-bit → transformers → mock.
 
     ``max_tokens`` defaults to a draft-length budget (see ``suggest_max_tokens``).
-    ``force`` requires a rewrite (stronger prompt, skip similarity leave-alone guard)
-    — use for polished frontier drafts that otherwise trigger copy-through.
+    Default mode always translates every non-empty draft. ``force`` adds retry and
+    makes a byte-identical result a CLI hard failure.
     ``chunk`` overrides auto chunked inference for article-length drafts
     (``None`` = auto when ``len(draft) > FILTER_CHUNK_THRESHOLD``).
     """
@@ -990,15 +1017,10 @@ def filter_draft(
     elif backend == "gguf":
         chosen = "llama"
 
-    # Leave-alone before any model call: already-voice short drafts must not
-    # fidget or mode-collapse. Article-length never qualifies (see heuristic).
-    if not force and draft_already_in_voice(draft):
-        return apply_voice_postprocess(draft, draft=draft), chosen
-
     use_chunk = should_chunk_filter(draft) if chunk is None else bool(chunk)
     windows = paragraph_windows(draft) if use_chunk else [draft]
     if use_chunk and len(windows) > 1:
-        # Longform: strong rewrite prompts per window; skip per-window leave-alone.
+        # Longform: strong rewrite prompts per window.
         # Default force=False — force prompts often yield blank-line near-copies.
         # When the caller passed --force and the stitch is still a byte copy,
         # retry once with force=True so long pieces are not silent no-ops.
@@ -1027,7 +1049,10 @@ def filter_draft(
             )
         if force:
             return (
-                apply_voice_postprocess(rewritten.strip() or draft, draft=draft),
+                apply_voice_postprocess(
+                    truncation_guard(draft, rewritten),
+                    draft=draft,
+                ),
                 chosen,
             )
         return rewritten, chosen
@@ -1071,11 +1096,18 @@ def filter_draft(
         raise RuntimeError(f"Unknown filter backend: {chosen}")
 
     if force:
-        # Never ship empty; postprocess still runs if the model copied.
-        return apply_voice_postprocess(rewritten.strip() or draft, draft=draft), chosen
-    # Sloppy/soulless → prefer punches; then leave-alone guard; then postprocess.
+        # Never ship empty or truncated; the CLI rejects a byte-identical echo.
+        return (
+            apply_voice_postprocess(
+                truncation_guard(draft, rewritten),
+                draft=draft,
+            ),
+            chosen,
+        )
+    # Sloppy/soulless → prefer punches, then keep only substance safety + lint.
     out = prefer_multipara_on_slop(draft, rewritten)
-    return apply_voice_postprocess(similarity_guard(draft, out), draft=draft), chosen
+    out = truncation_guard(draft, out)
+    return apply_voice_postprocess(out, draft=draft), chosen
 
 
 def _filter_draft_chunked(
@@ -1090,12 +1122,7 @@ def _filter_draft_chunked(
     force: bool,
     max_tokens: int | None,
 ) -> str:
-    """Filter paragraph windows and stitch; scaffolding/substance on full text.
-
-    Chunked longform always skips per-window similarity leave-alone (polished
-    Claude windows would otherwise freeze). Prompts stay on the strong rewrite
-    path (``force=False``) so we do not get blank-line-only near-copies.
-    """
+    """Filter paragraph windows and stitch; scaffolding/substance on full text."""
     # Per-chunk budget from window size (not full article).
     piece_budget = suggest_max_tokens("x" * FILTER_CHUNK_MAX_CHARS)
     if max_tokens is not None:
@@ -1138,8 +1165,7 @@ def _filter_draft_chunked(
                     force=force,
                     attempts=attempts,
                 )
-                # llama finalize used apply_guard=not force; force=False would
-                # leave-alone freeze — re-run finalize without guard.
+                # Normalize the backend result without similarity leave-alone.
                 piece = finalize_rewrite(piece, draft=window, apply_guard=False)
             elif chosen == "transformers":
                 piece = _filter_transformers(
@@ -1156,8 +1182,7 @@ def _filter_draft_chunked(
             rewrites.append(piece.strip() or window)
 
     stitched = stitch_filter_chunks(rewrites) or draft
-    # Guards on the full article: substance only (chunk path already forced rewrite).
-    stitched = substance_guard(draft, stitched)
+    stitched = truncation_guard(draft, stitched)
     return apply_voice_postprocess(stitched, draft=draft)
 
 
@@ -1187,9 +1212,7 @@ def _filter_mock(draft: str, adapter_dir: Path) -> str:
     body = strip_ai_tells(body)
     if openers and len(body) < 40:
         cue = openers[0].strip()
-        # Only prepend an anchor if it doesn't invent words absent from the draft.
-        if not novelty_too_high(draft, f"{cue}\n\n{body}"):
-            return f"{cue}\n\n{body}".strip()
+        return f"{cue}\n\n{body}".strip()
     return body.strip()
 
 
@@ -1243,7 +1266,7 @@ def _filter_llama(
             stop=list(FILTER_STOP),
         )
         text = out["choices"][0]["text"] if out.get("choices") else str(out)
-        best = finalize_rewrite(str(text), draft=draft, apply_guard=not force)
+        best = finalize_rewrite(str(text), draft=draft, apply_guard=False)
         if not force or (best.strip() and best.strip() != draft_s):
             break
     return best
@@ -1294,7 +1317,7 @@ def _filter_mlx_chunks(
     from personality_protect.mlx_runtime import ensure_mlx_wired_cap, release_mlx_memory
 
     ensure_mlx_wired_cap(memory_gb=16.0)
-    guard = (not force) if apply_guard is None else bool(apply_guard)
+    guard = False if apply_guard is None else bool(apply_guard)
 
     try:
         from mlx_lm import generate, load
@@ -1364,7 +1387,6 @@ def _filter_mlx_chunks(
                     # Prefer a real rewrite over copy-through when retrying.
                     break
                 if not force and guard:
-                    # Leave-alone path may legitimately copy.
                     break
             out_chunks.append(best.strip() or draft)
         return out_chunks
@@ -1453,7 +1475,7 @@ def _filter_transformers(
         text = tokenizer.decode(output[0], skip_special_tokens=True)
         if "### Rewritten" in text:
             text = text.split("### Rewritten", 1)[1].strip()
-        best = finalize_rewrite(text, draft=draft, apply_guard=not force)
+        best = finalize_rewrite(text, draft=draft, apply_guard=False)
         if not force or (best.strip() and best.strip() != draft_s):
             break
     return best

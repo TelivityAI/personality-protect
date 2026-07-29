@@ -29,7 +29,7 @@ from personality_protect.mlx_train import (
     run_chunked_mlx_train,
 )
 from personality_protect.select import selected_pieces
-from personality_protect.sft import build_sft_from_profile
+from personality_protect.sft import build_sft_from_pairs, build_sft_from_profile
 
 BackendName = Literal["auto", "mlx", "cuda", "cpu", "mock"]
 
@@ -235,14 +235,23 @@ def run_train(
     resume: bool = False,
     force_retrain: bool = False,
     progress_callback: ProgressCallback | None = None,
+    pairs: Path | None = None,
 ) -> TrainResult:
     config = load_config(paths)
-    n_selected = len(selected_pieces(paths))
-    corpus_note = check_corpus_size(
-        n_selected, force=force or sft_only, smoke=smoke or mock
-    )
+    voice_pair_mode = pairs is not None
+    if voice_pair_mode:
+        # Gated flatten→author pairs are the data floor; skip selected-piece gate.
+        corpus_note = None
+    else:
+        n_selected = len(selected_pieces(paths))
+        corpus_note = check_corpus_size(
+            n_selected, force=force or sft_only, smoke=smoke or mock
+        )
 
-    if force_rebuild_sft or not paths.sft_jsonl.is_file():
+    if voice_pair_mode:
+        assert pairs is not None  # for type checkers
+        sft_path, n = build_sft_from_pairs(pairs, paths.sft_jsonl)
+    elif force_rebuild_sft or not paths.sft_jsonl.is_file():
         sft_path, n = build_sft_from_profile(paths)
     else:
         sft_path = paths.sft_jsonl
@@ -269,6 +278,11 @@ def run_train(
     steps = auto_max_steps(n, smoke=smoke or mock, max_steps=max_steps)
 
     if sft_only:
+        mode_note = (
+            f" Voice-pair translator SFT from {pairs}."
+            if voice_pair_mode
+            else ""
+        )
         result = TrainResult(
             backend="sft_only",
             status="sft_ready",
@@ -276,6 +290,7 @@ def run_train(
             base_model=config.base_model,
             examples=n,
             notes=f"SFT JSONL written to {sft_path} ({n} examples). No weights trained."
+            + mode_note
             + (f"\n{corpus_note}" if corpus_note else ""),
             steps=0,
             smoke=smoke,

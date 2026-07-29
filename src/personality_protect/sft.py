@@ -28,6 +28,24 @@ SYSTEM_PROMPT = (
     "vibrant). No invented facts, hashtags, or emoji unless the voice uses them."
 )
 
+# Voice-pair mode: always translate; never teach leave-alone / copy-through.
+TRANSLATOR_SYSTEM_PROMPT = (
+    "Voice translator. Rewrite the draft into the author's voice. "
+    "Preserve meaning. Do not leave unchanged. Match cadence: short punches, "
+    "rhetorical bite, contractions, paragraph rhythm — not generic clean prose. "
+    "Preserve paragraph breaks; never flatten multi-paragraph drafts. "
+    "Strip AI tells (leverage, synergies, delve, robust, In today's fast-paced world, "
+    "It is important to note, Moreover, Furthermore, unlock, nestled, testament, "
+    "vibrant). No invented facts, hashtags, or emoji unless the voice uses them."
+)
+
+TRANSLATOR_USER_TEMPLATE = (
+    "Rewrite into the author's voice. Preserve meaning. Do not leave unchanged. "
+    "Match cadence — not bland marketing. Preserve paragraph breaks.\n\n"
+    "### Draft\n{draft}\n\n"
+    "### Rewritten"
+)
+
 # Inference-aligned user turn (no reference dump — LoRA must carry voice).
 USER_TEMPLATE_INFER = (
     "Rewrite in my voice when needed. Cadence — not bland marketing. "
@@ -1182,6 +1200,102 @@ def _synthetic_multipara_cadence_examples() -> list[dict]:
             if dup is not None:
                 out.append(dup)
     return out
+
+
+def pair_to_translator_example(
+    draft: str,
+    target: str,
+    *,
+    piece_id: str = "pair",
+    source: str = "voice_pair",
+    year: int | None = None,
+    line_no: int | None = None,
+) -> dict | None:
+    """Build one translator SFT row from a gated flatten→author pair.
+
+    Uses TRANSLATOR_SYSTEM_PROMPT (always rewrite; never leave-alone). Returns
+    None if the row cannot fit the MLX seq budget after truncation.
+    """
+    draft = _truncate_for_seq_budget((draft or "").strip(), MAX_SFT_DRAFT_CHARS)
+    target = _truncate_for_seq_budget((target or "").strip(), MAX_SFT_TARGET_CHARS)
+    if not draft or not target:
+        return None
+    for _ in range(6):
+        user = TRANSLATOR_USER_TEMPLATE.format(draft=draft)
+        total = len(TRANSLATOR_SYSTEM_PROMPT) + len(user) + len(target)
+        if total <= MAX_SFT_EXAMPLE_CHARS:
+            break
+        overflow = total - MAX_SFT_EXAMPLE_CHARS
+        if len(draft) > 96:
+            draft = _truncate_for_seq_budget(
+                draft, max(96, len(draft) - overflow - 8)
+            )
+            continue
+        if len(target) > 96:
+            target = _truncate_for_seq_budget(
+                target, max(96, len(target) - overflow - 8)
+            )
+            continue
+        return None
+    else:
+        return None
+    user = TRANSLATOR_USER_TEMPLATE.format(draft=draft)
+    if len(TRANSLATOR_SYSTEM_PROMPT) + len(user) + len(target) > MAX_SFT_EXAMPLE_CHARS:
+        return None
+    meta: dict = {
+        "piece_id": piece_id if line_no is None else f"{piece_id}:{line_no}",
+        "source": source,
+        "year": year,
+        "word_count": len(target.split()),
+        "pair_kind": "translator",
+    }
+    if line_no is not None:
+        meta["line_no"] = line_no
+    return {
+        "messages": [
+            {"role": "system", "content": TRANSLATOR_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": target},
+        ],
+        "meta": meta,
+    }
+
+
+def examples_from_pairs_jsonl(pairs_path: Path) -> list[dict]:
+    """Load gated JSONL pairs into translator chat examples (no leave-alone)."""
+    # Lazy import: pair_gate → eval_compare → filter → sft.
+    from personality_protect.pair_gate import iter_jsonl_pairs
+
+    out: list[dict] = []
+    for line_no, _row, inp, target in iter_jsonl_pairs(pairs_path):
+        ex = pair_to_translator_example(
+            inp, target, piece_id="voice_pair", line_no=line_no
+        )
+        if ex is not None:
+            out.append(ex)
+    return out
+
+
+def build_sft_from_pairs(
+    pairs_path: Path, out_path: Path
+) -> tuple[Path, int]:
+    """Write translator-only SFT JSONL from gated flatten→author pairs.
+
+    Skips leave_alone / identity / copy-through and all corpus piece minting.
+    """
+    if not pairs_path.is_file():
+        raise FileNotFoundError(f"pairs file not found: {pairs_path}")
+    examples = examples_from_pairs_jsonl(pairs_path)
+    if not examples:
+        raise RuntimeError(
+            f"No usable translator examples from {pairs_path}. "
+            "Check pair keys (input/output or not_you/author) and seq budget."
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fh:
+        for ex in examples:
+            fh.write(json.dumps(ex, ensure_ascii=False) + "\n")
+    return out_path, len(examples)
 
 
 def build_sft_jsonl(pieces: Iterable[Piece], out_path: Path) -> int:
