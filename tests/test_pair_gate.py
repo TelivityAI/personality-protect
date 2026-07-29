@@ -11,6 +11,7 @@ from personality_protect.cli import app
 from personality_protect.pair_gate import (
     gate_jsonl,
     gate_pair,
+    infer_pair_channel,
     sterile_flattener_check,
     text_axes,
 )
@@ -53,6 +54,17 @@ FOREIGN_FLAT = (
     "and store managers responsible for fulfillment service levels."
 )
 
+# Article-body shaped: continuous prose, zero short-line punch, you>i voice delta.
+# Frag gap vs FLAT_CONTOSO is ~0 — post channel must reject; article/auto must keep.
+ARTICLE_VOICED_CONTOSO = (
+    "Contoso Ledger still owns Category 12, and you ship the reconciliation "
+    "or you own the outage when partners escalate. The program office already "
+    "knows the roadmap is theater, so stop pretending published milestones "
+    "are the work that keeps settlement windows honest across regional "
+    "offices after the readiness boards finish their reviews. Additional "
+    "guidance covers escalation paths for category twelve incidents that "
+    "span more than one business unit and still need a named owner."
+)
 
 def test_text_axes_you_gt_i():
     axes = text_axes(VOICED_CONTOSO)
@@ -94,9 +106,80 @@ def test_gate_pair_fails_voiced_input_proper_density():
 
 def test_gate_pair_fails_missing_frag_gap():
     twin = FLAT_CONTOSO
-    result = gate_pair(twin, twin)
+    result = gate_pair(twin, twin, channel="post")
     assert result["pass"] is False
     assert "min_frag_gap_ratio" in result["failed"]
+
+
+def test_article_pair_skips_fragment_gap_and_auto_detects_prose():
+    article = gate_pair(
+        FLAT_CONTOSO,
+        ARTICLE_VOICED_CONTOSO,
+        channel="article",
+    )
+    auto = gate_pair(FLAT_CONTOSO, ARTICLE_VOICED_CONTOSO, channel="auto")
+
+    for result in (article, auto):
+        assert result["pass"] is True
+        assert result["resolved_channel"] == "article"
+        assert "min_frag_gap_ratio" not in result["applied_checks"]
+        assert "min_frag_gap_ratio" in result["skipped_checks"]
+        assert result["thresholds"]["min_frag_gap_ratio"] is None
+
+
+def test_post_pair_still_requires_fragment_gap():
+    result = gate_pair(
+        FLAT_CONTOSO,
+        ARTICLE_VOICED_CONTOSO,
+        channel="post",
+    )
+    assert result["pass"] is False
+    assert result["resolved_channel"] == "post"
+    assert "min_frag_gap_ratio" in result["failed"]
+    assert "min_frag_gap_ratio" in result["applied_checks"]
+
+
+def test_contamination_checks_fail_on_both_channels():
+    dense = (
+        "Contoso Fabrikam Northwind AdventureWorks Contoso Ledger ships "
+        "Azure Contoso Hub with Contoso Graph and Contoso Mesh for Contoso "
+        "Partners across Contoso Regions while Contoso Board reviews Contoso "
+        "Roadmap items with Contoso Ops and Contoso Legal each quarter."
+    )
+    for channel in ("post", "article"):
+        you_leak = gate_pair(POISONED_FLAT, VOICED_CONTOSO, channel=channel)
+        proper_leak = gate_pair(dense, VOICED_CONTOSO, channel=channel)
+        median_leak = gate_pair(
+            "Contoso ships. Partners wait. Roadmaps slip.",
+            (
+                "The Contoso reconciliation program continues through a "
+                "careful operational review with partner teams across every "
+                "region before the release proceeds."
+            ),
+            channel=channel,
+        )
+        assert "input_you_gt_i" in you_leak["failed"]
+        assert "max_input_proper_1k" in proper_leak["failed"]
+        assert "min_median_sentence_gap" in median_leak["failed"]
+
+
+def test_auto_prefers_explicit_pair_metadata():
+    assert (
+        infer_pair_channel(
+            FLAT_CONTOSO,
+            VOICED_CONTOSO,
+            metadata={"source_type": "article"},
+        )
+        == "article"
+    )
+    assert (
+        infer_pair_channel(
+            FLAT_CONTOSO,
+            ARTICLE_VOICED_CONTOSO,
+            metadata={"channel": "linkedin"},
+        )
+        == "post"
+    )
 
 
 def test_gate_pair_fails_short_input_median():
@@ -148,6 +231,38 @@ def test_gate_jsonl_keeps_and_drops(tmp_path: Path):
     assert "input_you_gt_i" in report["dropped_rows"][0]["failed"]
 
 
+def test_gate_jsonl_uses_metadata_and_reports_resolved_channels(tmp_path: Path):
+    path = tmp_path / "pairs.jsonl"
+    rows = [
+        {
+            "input": FLAT_CONTOSO,
+            "output": ARTICLE_VOICED_CONTOSO,
+            "source_type": "article",
+            "id": "contoso-article",
+        },
+        {
+            "input": FLAT_CONTOSO,
+            "output": ARTICLE_VOICED_CONTOSO,
+            "source_type": "post",
+            "id": "contoso-post",
+        },
+    ]
+    path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    report = gate_jsonl(path, channel="auto")
+
+    assert report["kept"] == 1
+    assert report["dropped"] == 1
+    assert report["resolved_channels"] == {"article": 1, "post": 1}
+    assert report["kept_rows"][0]["resolved_channel"] == "article"
+    assert report["dropped_rows"][0]["resolved_channel"] == "post"
+    assert report["kept_rows"][0]["thresholds"]["min_frag_gap_ratio"] is None
+    assert "min_frag_gap_ratio" in report["dropped_rows"][0]["applied_checks"]
+
+
 def test_cli_pair_gate_single_json():
     result = runner.invoke(
         app,
@@ -165,6 +280,28 @@ def test_cli_pair_gate_single_json():
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["pass"] is True
+
+
+def test_cli_pair_gate_accepts_channel():
+    result = runner.invoke(
+        app,
+        [
+            "--logo",
+            "off",
+            "pair-gate",
+            "--input-text",
+            FLAT_CONTOSO,
+            "--output-text",
+            ARTICLE_VOICED_CONTOSO,
+            "--channel",
+            "article",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["resolved_channel"] == "article"
+    assert "min_frag_gap_ratio" in payload["skipped_checks"]
 
 
 def test_cli_pair_gate_batch_drop_log(tmp_path: Path):

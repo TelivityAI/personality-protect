@@ -33,6 +33,13 @@ MAX_INPUT_PROPER_PER_1K = 30.0
 MIN_FRAG_GAP_RATIO = 0.08
 # Flattened input should run longer sentences than the voiced output.
 MIN_MEDIAN_SENTENCE_GAP = 2.0
+# Auto-channel fallback for shorter article sections. The existing scorecard
+# convention uses 500 words as the long-form boundary; prose-shaped sections
+# below that boundary are articles when they have almost no standalone short
+# lines and sentence length is in a conventional prose range.
+AUTO_ARTICLE_WORDS = 500
+AUTO_ARTICLE_MAX_SHORT_LINE_RATIO = 0.10
+AUTO_ARTICLE_MIN_MEDIAN_SENTENCE_WORDS = 12.0
 
 # Sterile-flattener preflight: author_flat vs foreign_flat deltas.
 MAX_STERILE_PROPER_DELTA = 8.0
@@ -80,19 +87,114 @@ def text_axes(text: str) -> dict[str, Any]:
     }
 
 
+def _metadata_strings(metadata: dict[str, Any] | None) -> dict[str, str]:
+    """Flatten channel-relevant scalar metadata without inspecting pair text."""
+    if not metadata:
+        return {}
+    values: dict[str, str] = {}
+    for key, value in metadata.items():
+        normalized_key = str(key).strip().lower()
+        if isinstance(value, dict) and normalized_key in {"meta", "metadata"}:
+            values.update(_metadata_strings(value))
+        elif isinstance(value, (str, int)):
+            values[normalized_key] = str(value).strip().lower()
+    return values
+
+
+def infer_pair_channel(
+    input_text: str,
+    output_text: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Resolve ``post`` or ``article`` deterministically for one pair.
+
+    Explicit pair metadata wins: ``source_type``/``channel`` values, article
+    section roles, then ids/paths containing article or LinkedIn/post markers.
+    With no explicit signal, output word count follows the repo's existing
+    scorecard convention (500+ words is article). Shorter output is article
+    prose only when short standalone lines are <=10% and median sentence
+    length is >=12 words; otherwise it is a post.
+    """
+    values = _metadata_strings(metadata)
+    for key in ("source_type", "channel"):
+        value = values.get(key, "")
+        if value in {"article", "articles", "longform", "long"}:
+            return "article"
+        if value in {"linkedin", "post", "posts", "li", "short"}:
+            return "post"
+
+    section_role = values.get("section_role", "")
+    if section_role in {"opener", "middle", "closer"}:
+        return "article"
+
+    locator = " ".join(
+        values.get(key, "")
+        for key in (
+            "id",
+            "source_id",
+            "path",
+            "source_path",
+            "file",
+            "filename",
+        )
+    )
+    if re.search(r"(?:^|[/_.-])articles?(?:$|[/_.-])", locator):
+        return "article"
+    if re.search(r"(?:^|[/_.-])(?:linkedin|posts?|li)(?:$|[/_.-])", locator):
+        return "post"
+
+    out = text_axes(output_text)
+    if int(out["words"]) >= AUTO_ARTICLE_WORDS:
+        return "article"
+    if (
+        float(out["short_line_ratio"]) <= AUTO_ARTICLE_MAX_SHORT_LINE_RATIO
+        and float(out["median_sentence_words"])
+        >= AUTO_ARTICLE_MIN_MEDIAN_SENTENCE_WORDS
+    ):
+        return "article"
+    return "post"
+
+
 def gate_pair(
     input_text: str,
     output_text: str,
     *,
+    channel: str = "auto",
+    metadata: dict[str, Any] | None = None,
     max_input_proper_1k: float = MAX_INPUT_PROPER_PER_1K,
     min_frag_gap_ratio: float = MIN_FRAG_GAP_RATIO,
     min_median_sentence_gap: float = MIN_MEDIAN_SENTENCE_GAP,
 ) -> dict[str, Any]:
-    """Return pass/fail plus reasons. Fail closed on contamination signals."""
+    """Return pass/fail plus reasons. Fail closed on contamination signals.
+
+    ``post`` applies all four checks. ``article`` intentionally skips only the
+    post-specific fragment-rhythm check and retains the input proper-density,
+    input you>I, and median-sentence-gap contamination checks. ``auto`` uses
+    :func:`infer_pair_channel`, preferring pair metadata over text shape.
+    """
+    requested_channel = (channel or "auto").strip().lower()
+    if requested_channel not in {"post", "article", "auto"}:
+        raise ValueError("channel must be one of: post, article, auto")
+    resolved_channel = (
+        infer_pair_channel(input_text, output_text, metadata=metadata)
+        if requested_channel == "auto"
+        else requested_channel
+    )
     inp = text_axes(input_text)
     out = text_axes(output_text)
     failed: list[str] = []
     reasons: dict[str, str] = {}
+    applied_checks = [
+        "max_input_proper_1k",
+        "input_you_gt_i",
+        "min_median_sentence_gap",
+    ]
+    skipped_checks: list[str] = []
+    if resolved_channel == "post":
+        applied_checks.insert(1, "min_frag_gap_ratio")
+    else:
+        skipped_checks.append("min_frag_gap_ratio")
 
     if not (input_text or "").strip():
         failed.append("empty_input")
@@ -108,7 +210,10 @@ def gate_pair(
         )
 
     frag_gap = float(out["short_line_ratio"]) - float(inp["short_line_ratio"])
-    if frag_gap < float(min_frag_gap_ratio):
+    if (
+        resolved_channel == "post"
+        and frag_gap < float(min_frag_gap_ratio)
+    ):
         failed.append("min_frag_gap_ratio")
         reasons["min_frag_gap_ratio"] = (
             f"frag_gap={round(frag_gap, 4)} < {min_frag_gap_ratio} "
@@ -136,6 +241,10 @@ def gate_pair(
 
     return {
         "pass": not failed,
+        "requested_channel": requested_channel,
+        "resolved_channel": resolved_channel,
+        "applied_checks": applied_checks,
+        "skipped_checks": skipped_checks,
         "failed": failed,
         "reasons": reasons,
         "input": inp,
@@ -144,7 +253,9 @@ def gate_pair(
         "median_sentence_gap": round(median_gap, 2),
         "thresholds": {
             "max_input_proper_1k": max_input_proper_1k,
-            "min_frag_gap_ratio": min_frag_gap_ratio,
+            "min_frag_gap_ratio": (
+                min_frag_gap_ratio if resolved_channel == "post" else None
+            ),
             "min_median_sentence_gap": min_median_sentence_gap,
         },
     }
@@ -245,6 +356,7 @@ def iter_jsonl_pairs(path: Path) -> Iterator[tuple[int, dict[str, Any], str, str
 def gate_jsonl(
     path: Path,
     *,
+    channel: str = "auto",
     max_input_proper_1k: float = MAX_INPUT_PROPER_PER_1K,
     min_frag_gap_ratio: float = MIN_FRAG_GAP_RATIO,
     min_median_sentence_gap: float = MIN_MEDIAN_SENTENCE_GAP,
@@ -256,6 +368,8 @@ def gate_jsonl(
         result = gate_pair(
             inp,
             out,
+            channel=channel,
+            metadata=row,
             max_input_proper_1k=max_input_proper_1k,
             min_frag_gap_ratio=min_frag_gap_ratio,
             min_median_sentence_gap=min_median_sentence_gap,
@@ -263,6 +377,11 @@ def gate_jsonl(
         entry = {
             "line": line_no,
             "pass": result["pass"],
+            "requested_channel": result["requested_channel"],
+            "resolved_channel": result["resolved_channel"],
+            "applied_checks": result["applied_checks"],
+            "skipped_checks": result["skipped_checks"],
+            "thresholds": result["thresholds"],
             "failed": result["failed"],
             "reasons": result["reasons"],
             "row": row,
@@ -277,8 +396,13 @@ def gate_jsonl(
             kept.append(entry)
         else:
             dropped.append(entry)
+    resolved_channels = {"post": 0, "article": 0}
+    for entry in [*kept, *dropped]:
+        resolved_channels[entry["resolved_channel"]] += 1
     return {
         "path": str(path),
+        "requested_channel": channel,
+        "resolved_channels": resolved_channels,
         "total": len(kept) + len(dropped),
         "kept": len(kept),
         "dropped": len(dropped),
@@ -286,7 +410,8 @@ def gate_jsonl(
         "dropped_rows": dropped,
         "thresholds": {
             "max_input_proper_1k": max_input_proper_1k,
-            "min_frag_gap_ratio": min_frag_gap_ratio,
+            "post_min_frag_gap_ratio": min_frag_gap_ratio,
+            "article_min_frag_gap_ratio": None,
             "min_median_sentence_gap": min_median_sentence_gap,
         },
     }

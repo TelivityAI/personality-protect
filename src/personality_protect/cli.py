@@ -1166,6 +1166,11 @@ def pair_gate_cmd(
         "--drop-log",
         help="Write dropped rows + reasons as JSON here (batch mode).",
     ),
+    channel: str = typer.Option(
+        "auto",
+        "--channel",
+        help="Gate channel: post, article, or auto (metadata first).",
+    ),
     max_input_proper_1k: float = typer.Option(
         MAX_INPUT_PROPER_PER_1K,
         "--max-input-proper-1k",
@@ -1185,12 +1190,17 @@ def pair_gate_cmd(
 ) -> None:
     """Drop poisoned flatten→voice pairs before training.
 
-    Automated checks (no eyeballing): input proper/1k ceiling, fragment-gap
-    floor, input you>i must be false, input median sentence meaningfully
-    longer than output. Dropped pairs are logged with reasons.
+    Both channels enforce input proper/1k, input you>i false, and input median
+    sentence meaningfully longer than output. Post also enforces fragment-gap;
+    article explicitly skips that post-specific rhythm check.
     """
     _banner_from_ctx(ctx, json_mode=as_json)
+    channel = channel.strip().lower()
+    if channel not in {"post", "article", "auto"}:
+        console.print("[red]--channel must be post, article, or auto[/red]")
+        raise typer.Exit(2)
     kwargs = {
+        "channel": channel,
         "max_input_proper_1k": max_input_proper_1k,
         "min_frag_gap_ratio": min_frag_gap_ratio,
         "min_median_sentence_gap": min_median_sentence_gap,
@@ -1215,6 +1225,10 @@ def pair_gate_cmd(
                         "rows": [
                             {
                                 "line": r["line"],
+                                "resolved_channel": r["resolved_channel"],
+                                "applied_checks": r["applied_checks"],
+                                "skipped_checks": r["skipped_checks"],
+                                "thresholds": r["thresholds"],
                                 "failed": r["failed"],
                                 "reasons": r["reasons"],
                                 "axes": r["axes"],
@@ -1233,6 +1247,8 @@ def pair_gate_cmd(
             "total": report["total"],
             "kept": report["kept"],
             "dropped": report["dropped"],
+            "requested_channel": report["requested_channel"],
+            "resolved_channels": report["resolved_channels"],
             "thresholds": report["thresholds"],
             "drop_reasons": {},
         }
@@ -1275,7 +1291,8 @@ def pair_gate_cmd(
     else:
         console.print(
             f"[bold]Pair gate[/bold] "
-            f"{'PASS' if result['pass'] else 'FAIL'}"
+            f"{'PASS' if result['pass'] else 'FAIL'} "
+            f"channel={result['resolved_channel']}"
         )
         console.print(
             f"input proper/1k={result['input']['proper_per_1k']} "
