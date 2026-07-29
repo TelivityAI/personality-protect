@@ -349,11 +349,11 @@ _EVIDENCE_NUMBER = re.compile(
     + r"|\b\d+(?:[.,]\d+)?\+?\s*-?\s*"
     + _EVIDENCE_UNIT
     # Spelled-out counts with a unit ("twelve … flights", "seven years").
+    # Bare calendar years (2019) and version ids are not evidence — need a unit.
     + r"|(?:\ba\s+)?"
     + _WORD_NUMERAL
     + r"(?:\s+[A-Za-z]+){0,3}\s+"
     + _EVIDENCE_UNIT
-    + r"|\b(?:19|20)\d{2}\b"
 )
 
 

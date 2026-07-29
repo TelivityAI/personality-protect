@@ -84,9 +84,11 @@ def test_count_numbers_evidence_not_labels_or_timeline():
     assert count_numbers("Waiting at position 12, then position 1,100.") == 0
     evidence = (
         "75% of participants. 93.1% vs 91.1%. After 12 years. "
-        "3,000 invoices in 2024. $2.5m at risk."
+        "3,000 invoices cleared. $2.5m at risk."
     )
     assert count_numbers(evidence) >= 6
+    # Bare calendar years / version ids are not evidence without a unit.
+    assert count_numbers("Shipped Contoso Ledger in 2024. Version 21.") == 0
     # Identifiers mixed with one real claim — only the claim counts.
     mixed = "A Contoso Category 12 rule broke settlement for 180 cases."
     assert count_numbers(mixed) == 1
