@@ -60,7 +60,7 @@ def test_build_mlx_lora_argv_is_memory_safe():
     assert "--batch-size" in argv and argv[argv.index("--batch-size") + 1] == "1"
     assert "--grad-checkpoint" in argv
     assert argv[argv.index("--max-seq-length") + 1] == str(DEFAULT_MAX_SEQ_LENGTH)
-    assert DEFAULT_MAX_SEQ_LENGTH <= 512
+    assert DEFAULT_MAX_SEQ_LENGTH == 1024
     assert argv[argv.index("--iters") + 1] == "50"
     # Train loss on assistant rewrite only — otherwise LoRA memorizes the draft.
     assert "--mask-prompt" in argv
@@ -222,6 +222,7 @@ def test_run_train_mlx_uses_chunks_and_progress(tmp_path: Path):
             force=True,
             chunk_steps=50,
             memory_gb=16.0,
+            max_seq_length=2048,
             progress_callback=on_progress,
             force_rebuild_sft=True,
         )
@@ -230,6 +231,7 @@ def test_run_train_mlx_uses_chunks_and_progress(tmp_path: Path):
     assert result.backend == "mlx"
     assert result.steps == 120
     assert mock_chunk.call_count == 3  # 50+50+20
+    assert all(call.kwargs["max_seq_length"] == 2048 for call in mock_chunk.call_args_list)
     assert any(e.get("kind") == "chunk_start" for e in progress_events)
     assert any(e.get("kind") == "done" for e in progress_events)
 

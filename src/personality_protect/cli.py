@@ -62,7 +62,11 @@ from personality_protect.logo import (
     print_logo,
     should_show_logo,
 )
-from personality_protect.mlx_train import DEFAULT_CHUNK_STEPS, PROOF_MAX_STEPS
+from personality_protect.mlx_train import (
+    DEFAULT_CHUNK_STEPS,
+    DEFAULT_MAX_SEQ_LENGTH,
+    PROOF_MAX_STEPS,
+)
 from personality_protect.models import load_index, summarize_by_source_year
 from personality_protect.pair_gate import (
     MAX_INPUT_PROPER_PER_1K,
@@ -466,6 +470,15 @@ def train_cmd(
         "--memory-gb",
         help="MLX: cap Metal wired memory in GB (default: ~40% of RAM, max 20 GB).",
     ),
+    max_seq_length: int = typer.Option(
+        DEFAULT_MAX_SEQ_LENGTH,
+        "--max-seq-length",
+        min=128,
+        help=(
+            "MLX: prompt+input+target token window. Default 1024 for post pairs; "
+            "use 2048 with a higher --memory-gb cap for article sections."
+        ),
+    ),
     proof: bool = typer.Option(
         False,
         "--proof",
@@ -562,6 +575,7 @@ def train_cmd(
             )
         if memory_gb is not None:
             console.print(f"Metal wired memory cap: {memory_gb} GB")
+        console.print(f"MLX max sequence length: {max_seq_length}")
         if resume and force_retrain:
             console.print("[red]Pass only one of --resume or --force-retrain[/red]")
             raise typer.Exit(2)
@@ -748,6 +762,7 @@ def train_cmd(
             sft_only=sft_only,
             chunk_steps=chunk_steps,
             memory_gb=memory_gb,
+            max_seq_length=max_seq_length,
             proof=proof,
             resume=resume,
             force_retrain=force_retrain,
