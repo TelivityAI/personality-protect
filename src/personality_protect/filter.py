@@ -252,6 +252,42 @@ def novelty_guard(draft: str, rewrite: str) -> str:
     return r
 
 
+def invented_proper_nouns(draft: str, rewrite: str) -> set[str]:
+    """Proper-noun keys present in rewrite but not in draft."""
+    from personality_protect.eval_compare import extract_proper_noun_keys
+
+    return extract_proper_noun_keys(rewrite) - extract_proper_noun_keys(draft)
+
+
+def invented_evidence_numbers(draft: str, rewrite: str) -> set[str]:
+    """Evidence-figure keys present in rewrite but not in draft."""
+    from personality_protect.eval_compare import extract_evidence_number_keys
+
+    return extract_evidence_number_keys(rewrite) - extract_evidence_number_keys(draft)
+
+
+def entity_invention_too_high(draft: str, rewrite: str) -> bool:
+    """True when rewrite invents named entities or evidence figures.
+
+    Translator mode allows new diction; it must not invent Contoso→Fabrikam
+    swaps or fabricated percentages/counts absent from the source.
+    """
+    draft = (draft or "").strip()
+    rewrite = (rewrite or "").strip()
+    if not draft or not rewrite or draft == rewrite:
+        return False
+    return bool(invented_proper_nouns(draft, rewrite) or invented_evidence_numbers(draft, rewrite))
+
+
+def entity_invention_guard(draft: str, rewrite: str) -> str:
+    """Keep draft when rewrite invents proper nouns or evidence figures."""
+    d = (draft or "").strip()
+    r = (rewrite or "").strip()
+    if entity_invention_too_high(d, r):
+        return d
+    return r
+
+
 def restore_structural_openers(draft: str, rewrite: str) -> str:
     """Put back load-bearing openers the model dropped (quote premise / didn't-see hinge)."""
     draft = (draft or "").strip()
@@ -312,6 +348,10 @@ def apply_voice_postprocess(
     Novelty ignores vocabulary introduced by deterministic ``strip_ai_tells`` /
     scaffolding cleanup. The opt-in novelty guard is retained for diagnostics and
     legacy callers, but translator inference permits fresh diction.
+
+    Entity / evidence-figure invention is **detected** via
+    ``rewrite_quality_flags`` / ``entity_invention_too_high`` and hard-failed by
+    the CLI — not silently reverted here (revert would look like an echo).
     """
     out = (text or "").strip()
     if draft is not None and enforce_novelty:
@@ -826,7 +866,7 @@ def finalize_rewrite(
 
 
 def rewrite_quality_flags(draft: str, rewrite: str) -> dict[str, bool | float | int]:
-    """Detect no-op / likely-truncated / substance-loss / novelty filter output."""
+    """Detect no-op / likely-truncated / substance-loss / novelty / invent flags."""
     draft = (draft or "").strip()
     rewrite = (rewrite or "").strip()
     unchanged = bool(draft) and draft == rewrite
@@ -839,6 +879,8 @@ def rewrite_quality_flags(draft: str, rewrite: str) -> dict[str, bool | float | 
     )
     substance_ok = substance_guard(draft, rewrite) == rewrite if rewrite else False
     new_words = introduced_vocabulary(draft, rewrite)
+    new_proper = invented_proper_nouns(draft, rewrite)
+    new_numbers = invented_evidence_numbers(draft, rewrite)
     return {
         "unchanged": unchanged,
         "likely_truncated": likely_truncated,
@@ -846,6 +888,9 @@ def rewrite_quality_flags(draft: str, rewrite: str) -> dict[str, bool | float | 
         "length_ratio": round(ratio, 3),
         "new_word_count": len(new_words),
         "novelty_high": novelty_too_high(draft, rewrite),
+        "invented_facts": bool(new_proper or new_numbers),
+        "invented_proper_count": len(new_proper),
+        "invented_number_count": len(new_numbers),
     }
 
 

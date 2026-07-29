@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import patch
 
 from personality_protect.filter import (
@@ -827,6 +828,93 @@ def test_novelty_guard_rejects_invented_vocabulary():
     assert novelty_applies(specific) is False
     assert novelty_too_high(specific, voiced) is False
     assert novelty_guard(specific, voiced) == voiced.strip()
+
+
+def test_entity_invention_rejects_new_proper_nouns_and_figures():
+    """Translator may invent diction; not entities or evidence figures."""
+    from personality_protect.filter import (
+        entity_invention_guard,
+        entity_invention_too_high,
+        invented_evidence_numbers,
+        invented_proper_nouns,
+        rewrite_quality_flags,
+    )
+
+    draft = (
+        "Contoso Ledger ships Category 12 reconciliation to enterprise customers. "
+        "Partners wait on the roadmap."
+    )
+    # New diction only — same Contoso entity, no new figures.
+    voiced = (
+        "Contoso Ledger.\n"
+        "Category 12 is not a feature.\n"
+        "Partners already know.\n"
+        "Stop pretending the roadmap is the work.\n"
+    )
+    assert invented_proper_nouns(draft, voiced) == set()
+    assert invented_evidence_numbers(draft, voiced) == set()
+    assert entity_invention_too_high(draft, voiced) is False
+    assert entity_invention_guard(draft, voiced) == voiced.strip()
+    assert rewrite_quality_flags(draft, voiced)["invented_facts"] is False
+
+    # Invented org name (multi-word Title Case — heuristic catches it).
+    with_fabrikam = voiced + "\nStop pretending Fabrikam Industries owns this.\n"
+    assert "fabrikam industries" in invented_proper_nouns(draft, with_fabrikam)
+    assert entity_invention_too_high(draft, with_fabrikam) is True
+    assert entity_invention_guard(draft, with_fabrikam) == draft.strip()
+    assert rewrite_quality_flags(draft, with_fabrikam)["invented_facts"] is True
+
+    # Invented evidence figure absent from source.
+    with_pct = voiced + "\nThat is 90% of the failure mode.\n"
+    assert invented_evidence_numbers(draft, with_pct)
+    assert entity_invention_too_high(draft, with_pct) is True
+    assert rewrite_quality_flags(draft, with_pct)["invented_number_count"] >= 1
+
+
+def test_cli_filter_rejects_invented_facts(tmp_path):
+    from typer.testing import CliRunner
+
+    from personality_protect.cli import app
+
+    runner = CliRunner()
+    home = str(tmp_path / "pp")
+    assert (
+        runner.invoke(
+            app, ["--logo", "off", "init", "--home", home, "--json"]
+        ).exit_code
+        == 0
+    )
+    draft = "Contoso publishes a formal quarterly operations memo."
+    rewrite = (
+        "Contoso ships the memo. Clean.\n"
+        "Fabrikam Industries already owns 90% of the blame.\n"
+    )
+    out = tmp_path / "voiced.md"
+
+    with patch(
+        "personality_protect.cli.filter_draft",
+        return_value=(rewrite, "mock"),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "--logo",
+                "off",
+                "filter",
+                "--text",
+                draft,
+                "--out",
+                str(out),
+                "--home",
+                home,
+                "--json",
+            ],
+        )
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    assert payload["invented_facts"] is True
+    assert payload["invent_reject"] is True
+    assert not out.exists()
 
 
 def test_strip_capitalizes_orphan_after_problem_cut():
