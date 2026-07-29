@@ -872,8 +872,9 @@ def test_entity_invention_rejects_new_proper_nouns_and_figures():
 
 
 def test_cli_filter_rejects_invented_facts(tmp_path):
-    from personality_protect.cli import app
     from typer.testing import CliRunner
+
+    from personality_protect.cli import app
 
     runner = CliRunner()
     home = str(tmp_path / "pp")
