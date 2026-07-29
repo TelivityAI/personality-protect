@@ -888,14 +888,14 @@ def scorecard_cmd(
         None,
         "--channel",
         help="linkedin|article — floors: proper 20 vs 42; numbers "
-        "advisory(0) vs 6.6. Default: infer from word count (<500 → linkedin).",
+        "advisory(0) on both. Default: infer from word count (<500 → linkedin).",
     ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Gate a draft on specificity before voicing (no model call).
 
-    Hard FAIL: proper nouns /1k (channel p10); numbers /1k on articles only.
-    Advisory: post numbers, median sentence, short-line ratio, you vs I.
+    Hard FAIL: proper nouns /1k (channel p10). Numbers /1k are advisory only.
+    Advisory: numbers, median sentence, short-line ratio, you vs I.
     """
     _banner_from_ctx(ctx, json_mode=as_json)
     try:
@@ -915,7 +915,7 @@ def scorecard_cmd(
     num_note = (
         f"(need ≥{num_need})"
         if float(num_need) > 0
-        else "(advisory — no hard gate on posts)"
+        else "(advisory — no hard gate)"
     )
     console.print(
         f"proper_nouns/1k={card['proper_nouns_per_1k']} "

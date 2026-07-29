@@ -73,7 +73,7 @@ FILTER_USER_TEMPLATE_INFER = (
 FILTER_SYSTEM_PROMPT_FORCE = (
     "Personal voice rewriter. Prefer a light rewrite over a copy — but NEVER delete "
     "arguments, claims, evidence, or context callbacks "
-    "(e.g. 'In a previous piece', 'Last time I said'). "
+    "(e.g. 'Last time I said', 'I've argued before', 'In a previous piece'). "
     "First-sentence self-references are voice, not scaffolding — keep them. "
     "A pass that removes substance is worse than leaving the draft unchanged. "
     "Throat-clearing lines ('Here's what X…:') are stripped by a separate deterministic "
@@ -90,7 +90,8 @@ FILTER_SYSTEM_PROMPT_FORCE = (
 FILTER_USER_TEMPLATE_FORCE = (
     "Light rewrite in my voice. Keep every argument and context beat. Do not drop "
     "load-bearing sentences or first-person callbacks ('Last time I said', "
-    "'In a previous piece'). Do not reparagraph just to insert blank lines. "
+    "'I've argued before', 'In a previous piece'). "
+    "Do not reparagraph just to insert blank lines. "
     "Same meaning; full draft. (Scaffolding like 'Here's what X…:' is removed "
     "elsewhere — do not rewrite those lines into weaker fragments.)\n\n"
     "### Draft\n{draft}\n\n"
@@ -132,8 +133,16 @@ _DIDNT_SEE_HINGE_RE = re.compile(
     r"(?im)^((?:Here's|Here is) what\b[^\n]*\bdidn't see:|The commenter didn't see:)\s*$",
 )
 # First-person context callbacks — voice, not throat-clearing.
-_LAST_TIME_I_SAID_RE = re.compile(
-    r"(?im)^(Last time I said\b[^.!?\n]*[.!?]?)",
+# Keep the full opening sentence so orphaned follow-ons stay grounded.
+_CALLBACK_OPENERS = re.compile(
+    r"(?im)^("
+    r"Last time I (?:said|argued|wrote|posted)\b[^.!?\n]*[.!]?"
+    r"|Earlier,?\s+I (?:said|argued|wrote|posted)\b[^.!?\n]*[.!]?"
+    r"|Previously,?\s+I (?:said|argued|wrote|posted)\b[^.!?\n]*[.!]?"
+    r"|In a previous (?:piece|post|article),?\s*I\s+(?:said|argued|wrote|posted)\b[^.!?\n]*[.!]?"
+    r"|I(?:'ve| have) (?:said|argued|written|posted) before\b[^.!?\n]*[.!]?"
+    r"|Wrote an entire article about\b[^.!?\n]*[.!]?"
+    r")",
 )
 
 
@@ -276,8 +285,8 @@ def restore_structural_openers(draft: str, rewrite: str) -> str:
                 else:
                     out = hinge + "\n\n" + out
 
-    # Protect "Last time I said…" — model often strips it as fake scaffolding.
-    lm = _LAST_TIME_I_SAID_RE.search(draft)
+    # Protect first-person callbacks — model often strips them as scaffolding.
+    lm = _CALLBACK_OPENERS.search(draft)
     if lm:
         callback = lm.group(1).strip()
         if callback and not re.search(re.escape(callback), out, re.IGNORECASE):

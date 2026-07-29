@@ -63,13 +63,13 @@ def test_resolve_proper_floor_channel_p10s():
     assert resolve_proper_floor(None, words=1100) == 42.0
 
 
-def test_resolve_numbers_floor_posts_advisory():
+def test_resolve_numbers_floor_advisory_both_channels():
     assert resolve_numbers_floor("linkedin") == SCORECARD_MIN_NUMBERS_PER_1K_POST
     assert resolve_numbers_floor("linkedin") == 0.0
     assert resolve_numbers_floor("article") == SCORECARD_MIN_NUMBERS_PER_1K_ARTICLE
-    assert resolve_numbers_floor("article") == 6.6
+    assert resolve_numbers_floor("article") == 0.0
     assert resolve_numbers_floor(None, words=180) == 0.0
-    assert resolve_numbers_floor(None, words=1100) == 6.6
+    assert resolve_numbers_floor(None, words=1100) == 0.0
 
 
 def test_count_numbers_evidence_not_labels_or_timeline():
@@ -116,17 +116,39 @@ def test_count_numbers_word_numerals_and_distinct_values():
 
 
 def test_specificity_scorecard_gates_parable_vs_named():
-    parable = next(p for p in list_synthetic_drafts() if p.stem == "clean_article")
-    card = specificity_scorecard(parable.read_text(encoding="utf-8"), channel="article")
+    # Soft Contoso-free article: proper-noun floor is the only hard gate.
+    soft = (
+        "Meetings and decks aren't neutral overhead. They're how companies avoid "
+        "committing. You screen for culture fit and filter out operators. "
+        "Ask for a decision. Decode what it tests. Process narratives pass. "
+        "The curve is years of judgment, not weeks of polish. You staff for it "
+        "or you don't. Outcomes live outside the deck. Tell the truth about "
+        "constraints nobody approved. Can the room kill a bad call early? "
+        "Can it own the follow-through? Here is the part that matters: names "
+        "and numbers are optional only when the argument stays generic. "
+    ) * 4
+    card = specificity_scorecard(soft, channel="article")
     assert card["pass"] is False
-    assert "numbers_per_1k" in card["failed"]
+    assert "proper_nouns_per_1k" in card["failed"]
+    assert "numbers_per_1k" not in card["failed"]
     assert card["thresholds"]["min_proper_per_1k"] == 42.0
-    assert card["thresholds"]["min_numbers_per_1k"] == 6.6
-    # Formatting / you>I are advisory — never hard-fail.
+    assert card["thresholds"]["min_numbers_per_1k"] == 0.0
+    # Numbers / formatting / you>I are advisory — never hard-fail.
     assert "median_sentence" not in card["failed"]
     assert "short_line_ratio" not in card["failed"]
     assert "you_gt_i" not in card["failed"]
     assert "advisory" in card
+    assert card["advisory"]["numbers_hard_gate"] is False
+
+    # Named article with zero numbers still passes (numbers advisory).
+    named_article = next(p for p in list_synthetic_drafts() if p.stem == "clean_article")
+    named = specificity_scorecard(
+        named_article.read_text(encoding="utf-8"), channel="article"
+    )
+    assert named["thresholds"]["min_numbers_per_1k"] == 0.0
+    assert "numbers_per_1k" not in named["checks"]
+    assert named["proper_nouns_per_1k"] >= 42.0
+    assert named["pass"] is True
 
     # Named LinkedIn post with zero numbers still passes (numbers advisory).
     named_no_nums = (
@@ -172,7 +194,38 @@ def test_specificity_scorecard_gates_parable_vs_named():
     assert "numbers_per_1k" not in thin_card["failed"]
 
 
-def test_cli_scorecard_fails_parable(tmp_path: Path):
+def test_cli_scorecard_fails_soft_article(tmp_path: Path):
+    soft = tmp_path / "soft.md"
+    soft.write_text(
+        (
+            "Meetings and decks aren't neutral overhead. They're how companies avoid "
+            "committing. You screen for culture fit and filter out operators. "
+            "Ask for a decision. Decode what it tests. Process narratives pass.\n\n"
+        )
+        * 8,
+        encoding="utf-8",
+    )
+    res = runner.invoke(
+        app,
+        [
+            "--logo",
+            "off",
+            "scorecard",
+            "--file",
+            str(soft),
+            "--channel",
+            "article",
+            "--json",
+        ],
+    )
+    assert res.exit_code == 1, res.output
+    data = json.loads(res.output)
+    assert data["pass"] is False
+    assert data["failed"] == ["proper_nouns_per_1k"]
+    assert data["thresholds"]["min_numbers_per_1k"] == 0.0
+
+
+def test_cli_scorecard_named_article_passes_with_zero_number_floor():
     article = next(p for p in list_synthetic_drafts() if p.stem == "clean_article")
     res = runner.invoke(
         app,
@@ -187,11 +240,11 @@ def test_cli_scorecard_fails_parable(tmp_path: Path):
             "--json",
         ],
     )
-    assert res.exit_code == 1, res.output
+    assert res.exit_code == 0, res.output
     data = json.loads(res.output)
-    assert data["pass"] is False
-    assert set(data["failed"]) <= {"proper_nouns_per_1k", "numbers_per_1k"}
-    assert data["thresholds"]["min_numbers_per_1k"] == 6.6
+    assert data["pass"] is True
+    assert data["thresholds"]["min_numbers_per_1k"] == 0.0
+    assert "numbers_per_1k" not in data["checks"]
 
 
 def test_longform_metrics_flags_near_copy_and_scaffolding():

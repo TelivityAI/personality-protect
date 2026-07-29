@@ -246,7 +246,7 @@ def test_restore_last_time_i_said_callback():
     from personality_protect.filter import apply_voice_postprocess
 
     draft = (
-        "Last time I said hotel and air aren't the same game. "
+        "Last time I said Contoso Ledger and Northwind aren't the same game. "
         "Fair question I got: what actually transfers?\n\n"
         "Connectivity discipline. Contoso Ledger ops. Northwind supply."
     )
@@ -259,6 +259,51 @@ def test_restore_last_time_i_said_callback():
     assert out.startswith("Last time I said")
     assert "Fair question I got" in out
     assert "Contoso Ledger" in out
+
+
+def test_restore_callback_openers_family():
+    from personality_protect.filter import apply_voice_postprocess, strip_voice_scaffolding
+
+    cases = [
+        (
+            "I've argued before that Contoso recovery is a commercial product. "
+            "Northwind still treats it as a cost center.",
+            "Northwind still treats it as a cost center.",
+            "I've argued before",
+        ),
+        (
+            "In a previous piece, I argued that Fabrikam mislabels dense thinking. "
+            "Contoso keeps shipping the same audit.",
+            "Contoso keeps shipping the same audit.",
+            "In a previous piece, I argued",
+        ),
+        (
+            "Previously, I wrote that Northwind decks bury the constraint. "
+            "Fabrikam owns the follow-through.",
+            "Fabrikam owns the follow-through.",
+            "Previously, I wrote",
+        ),
+        (
+            "Wrote an entire article about Contoso Ledger settlement. "
+            "Northwind still asks for a slide.",
+            "Northwind still asks for a slide.",
+            "Wrote an entire article about",
+        ),
+    ]
+    for draft, model_out, needle in cases:
+        out = apply_voice_postprocess(model_out, draft=draft)
+        assert needle.lower() in out.lower(), needle
+        assert "Contoso" in out or "Northwind" in out or "Fabrikam" in out
+
+    # Throat-clearers still strip; callbacks must not match that path.
+    cleared = strip_voice_scaffolding(
+        "Here's what those 6 weeks actually looked like:\n\n"
+        "Here's the problem: Contoso delayed the close.\n\n"
+        "Northwind kept the rest."
+    )
+    assert "Here's what" not in cleared
+    assert "Here's the problem:" not in cleared
+    assert "Contoso delayed" in cleared or "Contoso Delayed" in cleared
 
 
 def test_substance_guard_rejects_catastrophic_drops_only():
