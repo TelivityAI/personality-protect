@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from personality_protect.cli import app
@@ -110,6 +111,53 @@ def test_train_pairs_mode_writes_translator_sft_only(tmp_path: Path):
     assert "do not leave unchanged" in system
 
 
+def test_translator_pair_preserves_post_closer_at_1024():
+    """The target tail must survive; closers are high-signal voice."""
+    from personality_protect.sft import pair_to_translator_example
+
+    flat = " ".join(["Neutral professional sentence about Contoso operations."] * 25)
+    closer = "That is the point. Stop calling the roadmap the work."
+    target = (
+        "\n\n".join(
+            ["Contoso shipped the memo. The operators already know."] * 18
+        )
+        + "\n\n"
+        + closer
+    )
+    ex = pair_to_translator_example(flat, target, max_seq_length=1024)
+    assert ex is not None
+    assert ex["messages"][-1]["content"].endswith(closer)
+    assert ex["messages"][-1]["content"] == target
+
+
+def test_translator_pair_rejects_oversize_instead_of_cutting_target():
+    """Oversized article pairs require sections / 2048, never prefix truncation."""
+    from personality_protect.sft import pair_to_translator_example
+
+    huge = " ".join(["Contoso operations sentence."] * 1500)
+    with pytest.raises(ValueError, match="exceeds max_seq_length=1024"):
+        pair_to_translator_example(huge, huge, max_seq_length=1024)
+
+
+def test_split_translator_sections_preserves_every_word_and_closer():
+    from personality_protect.sft import split_translator_source_sections
+
+    closer = "Stop calling the roadmap the work."
+    original = "\n\n".join(
+        ["Contoso operations require a complete sentence with evidence."] * 40
+        + [closer]
+    )
+    chunks = split_translator_source_sections(original, max_seq_length=1024)
+
+    def normalize(text: str) -> str:
+        return " ".join(text.split())
+
+    assert len(chunks) > 1
+    assert normalize(" ".join(chunks)) == normalize(original)
+    assert chunks[-1].endswith(closer)
+    assert all(len(chunk) <= int(1024 * 0.9) for chunk in chunks)
+
+
 def test_cli_train_pairs_sft_only(tmp_path: Path):
     home = str(tmp_path)
     pairs = tmp_path / "pairs.kept.jsonl"
@@ -152,6 +200,46 @@ def test_cli_train_pairs_sft_only(tmp_path: Path):
     ]
     assert all(r["meta"]["pair_kind"] == "translator" for r in rows)
     assert not any(r["meta"]["pair_kind"] == "leave_alone" for r in rows)
+
+
+def test_cli_train_exposes_max_seq_length(tmp_path: Path):
+    """Article-section pairs can request 2048 without changing code."""
+    from unittest.mock import patch
+
+    home = str(tmp_path)
+    pairs = tmp_path / "pairs.kept.jsonl"
+    pairs.write_text(
+        json.dumps({"input": FLAT_CONTOSO, "output": VOICED_CONTOSO}) + "\n",
+        encoding="utf-8",
+    )
+    runner.invoke(
+        app,
+        ["--logo", "off", "init", "--home", home, "--profile", "t", "--json"],
+    )
+    with (
+        patch("personality_protect.cli.detect_backend", return_value="mock"),
+        patch("personality_protect.cli.run_train") as run_train,
+    ):
+        run_train.return_value.to_dict.return_value = {"status": "ok"}
+        r = runner.invoke(
+            app,
+            [
+                "--logo",
+                "off",
+                "train",
+                "--home",
+                home,
+                "--profile",
+                "t",
+                "--pairs",
+                str(pairs),
+                "--max-seq-length",
+                "2048",
+                "--json",
+            ],
+        )
+    assert r.exit_code == 0, r.output
+    assert run_train.call_args.kwargs["max_seq_length"] == 2048
 
 
 def test_default_train_path_still_mints_leave_alone_without_pairs():

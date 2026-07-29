@@ -24,6 +24,7 @@ from personality_protect.config import (
 )
 from personality_protect.mlx_train import (
     DEFAULT_CHUNK_STEPS,
+    DEFAULT_MAX_SEQ_LENGTH,
     PROOF_MAX_STEPS,
     ProgressCallback,
     run_chunked_mlx_train,
@@ -231,6 +232,7 @@ def run_train(
     force_rebuild_sft: bool = True,
     chunk_steps: int = DEFAULT_CHUNK_STEPS,
     memory_gb: float | None = None,
+    max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     proof: bool = False,
     resume: bool = False,
     force_retrain: bool = False,
@@ -250,7 +252,11 @@ def run_train(
 
     if voice_pair_mode:
         assert pairs is not None  # for type checkers
-        sft_path, n = build_sft_from_pairs(pairs, paths.sft_jsonl)
+        sft_path, n = build_sft_from_pairs(
+            pairs,
+            paths.sft_jsonl,
+            max_seq_length=max_seq_length,
+        )
     elif force_rebuild_sft or not paths.sft_jsonl.is_file():
         sft_path, n = build_sft_from_profile(paths)
     else:
@@ -336,6 +342,7 @@ def run_train(
             allow_mock=allow_mock,
             chunk_steps=chunk_steps,
             memory_gb=memory_gb,
+            max_seq_length=max_seq_length,
             progress_callback=progress_callback,
             proof=proof,
             resume=resume,
@@ -467,6 +474,7 @@ def _train_mlx(
     allow_mock: bool = False,
     chunk_steps: int = DEFAULT_CHUNK_STEPS,
     memory_gb: float | None = None,
+    max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     progress_callback: ProgressCallback | None = None,
     proof: bool = False,
     resume: bool = False,
@@ -512,6 +520,7 @@ def _train_mlx(
             total_steps=max(1, max_steps),
             chunk_steps=chunk_steps,
             memory_gb=memory_gb,
+            max_seq_length=max_seq_length,
             resume=resume,
             force_retrain=force_retrain,
             progress_callback=progress_callback,

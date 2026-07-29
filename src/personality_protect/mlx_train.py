@@ -25,8 +25,10 @@ from typing import Any, Callable
 
 # Digests that finish without melting a 48 GB unified-memory Mac.
 DEFAULT_CHUNK_STEPS = 50
-# 512 keeps peak ~14 GB on Qwen3.5-9B-4bit; 1024 can push past a 16–20 GB wired cap.
-DEFAULT_MAX_SEQ_LENGTH = 512
+# Translation sequences contain prompt + flattened input + full author target.
+# 1024 preserves typical post closers; use 2048 explicitly for article sections
+# with a higher --memory-gb cap on 48 GB machines.
+DEFAULT_MAX_SEQ_LENGTH = 1024
 DEFAULT_NUM_LAYERS = 8
 # Cap wired Metal memory: leave OS/apps breathing room.
 DEFAULT_WIRED_FRACTION = 0.40

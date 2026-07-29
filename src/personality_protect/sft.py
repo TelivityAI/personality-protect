@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 from personality_protect.config import ProfilePaths
+from personality_protect.mlx_train import DEFAULT_MAX_SEQ_LENGTH
 from personality_protect.models import Piece
 from personality_protect.select import selected_pieces
 
@@ -1210,38 +1211,32 @@ def pair_to_translator_example(
     source: str = "voice_pair",
     year: int | None = None,
     line_no: int | None = None,
+    max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
 ) -> dict | None:
     """Build one translator SFT row from a gated flatten→author pair.
 
-    Uses TRANSLATOR_SYSTEM_PROMPT (always rewrite; never leave-alone). Returns
-    None if the row cannot fit the MLX seq budget after truncation.
+    Uses TRANSLATOR_SYSTEM_PROMPT (always rewrite; never leave-alone). Unlike
+    legacy synthetic examples, translator targets are never prefix-truncated:
+    that would systematically erase post closers. Oversized pairs must be
+    sectioned or trained with a larger ``max_seq_length``.
     """
-    draft = _truncate_for_seq_budget((draft or "").strip(), MAX_SFT_DRAFT_CHARS)
-    target = _truncate_for_seq_budget((target or "").strip(), MAX_SFT_TARGET_CHARS)
+    draft = (draft or "").strip()
+    target = (target or "").strip()
     if not draft or not target:
         return None
-    for _ in range(6):
-        user = TRANSLATOR_USER_TEMPLATE.format(draft=draft)
-        total = len(TRANSLATOR_SYSTEM_PROMPT) + len(user) + len(target)
-        if total <= MAX_SFT_EXAMPLE_CHARS:
-            break
-        overflow = total - MAX_SFT_EXAMPLE_CHARS
-        if len(draft) > 96:
-            draft = _truncate_for_seq_budget(
-                draft, max(96, len(draft) - overflow - 8)
-            )
-            continue
-        if len(target) > 96:
-            target = _truncate_for_seq_budget(
-                target, max(96, len(target) - overflow - 8)
-            )
-            continue
-        return None
-    else:
-        return None
     user = TRANSLATOR_USER_TEMPLATE.format(draft=draft)
-    if len(TRANSLATOR_SYSTEM_PROMPT) + len(user) + len(target) > MAX_SFT_EXAMPLE_CHARS:
-        return None
+    total_chars = len(TRANSLATOR_SYSTEM_PROMPT) + len(user) + len(target)
+    # Conservative English estimate plus room for chat-template control tokens.
+    # Qwen prose averages roughly 3.5–4 chars/token; 3.5 keeps margin without
+    # rejecting ordinary ~350-word post pairs at seq=1024.
+    char_budget = int(max(1, int(max_seq_length)) * 3.5) - 128
+    if total_chars > char_budget:
+        label = piece_id if line_no is None else f"{piece_id}:{line_no}"
+        raise ValueError(
+            f"Translator pair {label} exceeds max_seq_length={max_seq_length} "
+            f"(estimated {total_chars} chars > {char_budget}). "
+            "Section the pair or pass a larger --max-seq-length; target was not cut."
+        )
     meta: dict = {
         "piece_id": piece_id if line_no is None else f"{piece_id}:{line_no}",
         "source": source,
@@ -1261,7 +1256,60 @@ def pair_to_translator_example(
     }
 
 
-def examples_from_pairs_jsonl(pairs_path: Path) -> list[dict]:
+def split_translator_source_sections(
+    text: str, *, max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH
+) -> list[str]:
+    """Split an original into lossless sections before sterile flattening.
+
+    A row contains flat input + original target + prompt, so reserve most of
+    the sequence for both text sides. Paragraph/sentence/word boundaries are
+    preserved, including the final closer.
+    """
+    body = (text or "").strip()
+    if not body:
+        return []
+    limit = max(320, int(max_seq_length * 0.9))
+    if len(body) <= limit:
+        return [body]
+
+    units: list[str] = []
+    for para in re.split(r"\n\s*\n", body):
+        para = para.strip()
+        if not para:
+            continue
+        if len(para) <= limit:
+            units.append(para)
+            continue
+        for sentence in re.split(r"(?<=[.!?…])\s+", para):
+            sentence = sentence.strip()
+            while len(sentence) > limit:
+                cut = sentence.rfind(" ", 0, limit + 1)
+                if cut < limit // 2:
+                    cut = limit
+                units.append(sentence[:cut].strip())
+                sentence = sentence[cut:].strip()
+            if sentence:
+                units.append(sentence)
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for unit in units:
+        separator_len = 2 if current else 0
+        if current and current_len + separator_len + len(unit) > limit:
+            chunks.append("\n\n".join(current))
+            current = []
+            current_len = 0
+        current.append(unit)
+        current_len += (2 if current_len else 0) + len(unit)
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
+
+
+def examples_from_pairs_jsonl(
+    pairs_path: Path, *, max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH
+) -> list[dict]:
     """Load gated JSONL pairs into translator chat examples (no leave-alone)."""
     # Lazy import: pair_gate → eval_compare → filter → sft.
     from personality_protect.pair_gate import iter_jsonl_pairs
@@ -1269,7 +1317,11 @@ def examples_from_pairs_jsonl(pairs_path: Path) -> list[dict]:
     out: list[dict] = []
     for line_no, _row, inp, target in iter_jsonl_pairs(pairs_path):
         ex = pair_to_translator_example(
-            inp, target, piece_id="voice_pair", line_no=line_no
+            inp,
+            target,
+            piece_id="voice_pair",
+            line_no=line_no,
+            max_seq_length=max_seq_length,
         )
         if ex is not None:
             out.append(ex)
@@ -1277,7 +1329,10 @@ def examples_from_pairs_jsonl(pairs_path: Path) -> list[dict]:
 
 
 def build_sft_from_pairs(
-    pairs_path: Path, out_path: Path
+    pairs_path: Path,
+    out_path: Path,
+    *,
+    max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
 ) -> tuple[Path, int]:
     """Write translator-only SFT JSONL from gated flatten→author pairs.
 
@@ -1285,7 +1340,9 @@ def build_sft_from_pairs(
     """
     if not pairs_path.is_file():
         raise FileNotFoundError(f"pairs file not found: {pairs_path}")
-    examples = examples_from_pairs_jsonl(pairs_path)
+    examples = examples_from_pairs_jsonl(
+        pairs_path, max_seq_length=max_seq_length
+    )
     if not examples:
         raise RuntimeError(
             f"No usable translator examples from {pairs_path}. "
