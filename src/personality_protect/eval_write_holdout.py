@@ -22,10 +22,12 @@ from typing import Any
 from personality_protect.chat_prompt import flatten_chat_messages
 from personality_protect.config import ProfilePaths, load_config
 from personality_protect.corpus_text import normalize_corpus_text
+from personality_protect.draft_trim import trim_draft
 from personality_protect.eval_compare import extract_evidence_number_keys
 from personality_protect.models import Piece, load_index
 from personality_protect.pair_gate import text_axes
 from personality_protect.prompt_write import build_write_messages
+from personality_protect.style_profile import DEFAULT_DRAFT_WORD_TARGET
 from personality_protect.voice_index import VECTORS_FILENAME
 from personality_protect.write import (
     DEFAULT_WRITE_K,
@@ -42,8 +44,6 @@ from personality_protect.writer_guards import (
     extract_named_entity_keys,
     parrot_reject,
 )
-from personality_protect.draft_trim import trim_draft
-from personality_protect.style_profile import DEFAULT_DRAFT_WORD_TARGET
 
 TIE_EPSILON = 0.05
 BARE_BASE_EXAMPLES: tuple[str, ...] = ()
