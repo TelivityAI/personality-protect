@@ -37,7 +37,9 @@ from personality_protect.writer_guards import (
 DEFAULT_WRITE_K = 2
 MIN_WRITE_K = 0
 MAX_WRITE_K = 5
-DEFAULT_WRITE_MAX_TOKENS = 768
+# Long LinkedIn posts (~500 words) need headroom past the trim target so the
+# model can finish the last paragraph before draft_trim cuts.
+DEFAULT_WRITE_MAX_TOKENS = 1536
 MAX_WRITE_ATTEMPTS = 2
 MAX_EXEMPLAR_WORDS = 60
 
@@ -47,17 +49,28 @@ GenerateFn = Callable[..., str]
 PromptSink = MutableSequence[str]
 
 
+def resolve_writer_adapter(paths: ProfilePaths) -> str | None:
+    """Return an adapter directory when a writer LoRA is present on disk."""
+    adapters = paths.adapters_dir
+    weights = adapters / "adapters.safetensors"
+    if weights.is_file():
+        return str(adapters)
+    return None
+
+
 def mlx_generate_no_adapter(
     messages: Sequence[Message],
     *,
     base_model: str,
     max_tokens: int = DEFAULT_WRITE_MAX_TOKENS,
+    adapter_path: str | None = None,
     prompt_sink: PromptSink | None = None,
 ) -> str:
-    """Generate from MLX base weights with ``adapter_path=None``.
+    """Generate from MLX weights, optionally with a writer LoRA.
 
-    The write path is RAG-only: a LoRA adapter is never loaded, even when one
-    exists on disk. Tests inject ``generate_fn`` instead of calling this.
+    ``adapter_path=None`` keeps the Camp A RAG default (base only). When a
+    gated writer adapter directory is supplied, MLX loads it for the call.
+    Tests inject ``generate_fn`` instead of calling this.
 
     ``messages`` are rendered through the tokenizer's chat template. Skipping
     that step makes the instruct model continue the prompt as a document and
@@ -75,7 +88,7 @@ def mlx_generate_no_adapter(
     try:
         from mlx_lm import generate, load
 
-        model, tokenizer = load(base_model, adapter_path=None)
+        model, tokenizer = load(base_model, adapter_path=adapter_path)
         prompt = render_chat_prompt(
             tokenizer,
             messages,
@@ -159,10 +172,32 @@ def run_write(
     *,
     k: int = DEFAULT_WRITE_K,
     max_tokens: int = DEFAULT_WRITE_MAX_TOKENS,
+    channel: str = "post",
+    use_adapter: bool = False,
     generate_fn: GenerateFn | None = None,
     prompt_sink: PromptSink | None = None,
 ) -> dict[str, Any]:
-    """Retrieve exemplars, generate a draft, regenerate once on guard failure."""
+    """Retrieve exemplars, generate a draft, regenerate once on guard failure.
+
+    ``channel='article'`` delegates to the article outline→section→stitch path.
+    ``use_adapter`` loads a local writer LoRA when ``adapters.safetensors`` exists.
+    """
+    resolved = (channel or "post").strip().lower()
+    if resolved == "article":
+        from personality_protect.write_article import run_write_article
+
+        return run_write_article(
+            topic,
+            points,
+            paths,
+            k=k,
+            max_tokens=max_tokens,
+            generate_fn=generate_fn,
+            prompt_sink=prompt_sink,
+        )
+    if resolved != "post":
+        raise ValueError("channel must be one of: post, article")
+
     topic = topic.strip()
     points = points.strip()
     if not topic:
@@ -193,6 +228,13 @@ def run_write(
         style_directives=directives,
     )
 
+    adapter_path = resolve_writer_adapter(paths) if use_adapter else None
+    if use_adapter and adapter_path is None:
+        raise FileNotFoundError(
+            f"No writer adapter at {paths.adapters_dir}/adapters.safetensors. "
+            "Train one with: personality-protect train --writer"
+        )
+
     generator = generate_fn or mlx_generate_no_adapter
     model_id = config.base_model or DEFAULT_MLX_MODEL
 
@@ -205,6 +247,7 @@ def run_write(
                 messages,
                 base_model=model_id,
                 max_tokens=max_tokens,
+                adapter_path=adapter_path,
                 prompt_sink=prompt_sink,
             )
         ).strip()
@@ -217,9 +260,10 @@ def run_write(
 
     return {
         "text": draft,
+        "channel": "post",
         "voice_mode": config.voice_mode,
-        "adapter": "none",
-        "write_adapter": None,
+        "adapter": "writer" if adapter_path else "none",
+        "write_adapter": adapter_path,
         "model": model_id,
         "k": len(matches),
         "exemplar_ids": [str(match["id"]) for match in matches],

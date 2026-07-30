@@ -238,11 +238,16 @@ def run_train(
     force_retrain: bool = False,
     progress_callback: ProgressCallback | None = None,
     pairs: Path | None = None,
+    writer: bool = False,
 ) -> TrainResult:
     config = load_config(paths)
+    if writer and pairs is not None:
+        raise ValueError("Pass only one of --writer or --pairs")
     voice_pair_mode = pairs is not None
     if voice_pair_mode:
         # Gated flatten→author pairs are the data floor; skip selected-piece gate.
+        corpus_note = None
+    elif writer:
         corpus_note = None
     else:
         n_selected = len(selected_pieces(paths))
@@ -250,7 +255,20 @@ def run_train(
             n_selected, force=force or sft_only, smoke=smoke or mock
         )
 
-    if voice_pair_mode:
+    if writer:
+        from personality_protect.writer_sft import run_build_writer_sft, writer_sft_path
+
+        receipt = run_build_writer_sft(paths)
+        sft_path = writer_sft_path(paths)
+        # Train pipeline expects train.jsonl under sft/; copy writer rows there.
+        paths.sft_jsonl.write_text(sft_path.read_text(encoding="utf-8"), encoding="utf-8")
+        sft_path = paths.sft_jsonl
+        n = int(receipt["examples"])
+        if n < 1:
+            raise FileNotFoundError(
+                "Writer SFT produced 0 examples. Need longer linkedin_post pieces."
+            )
+    elif voice_pair_mode:
         assert pairs is not None  # for type checkers
         sft_path, n = build_sft_from_pairs(
             pairs,

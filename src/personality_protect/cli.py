@@ -504,11 +504,42 @@ def build_style_profile_cmd(
     console.print(f"Saved: {out_path}")
 
 
+@app.command("build-writer-sft")
+def build_writer_sft_cmd(
+    ctx: typer.Context,
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Build brief→post SFT JSONL for the writer LoRA (holdouts excluded)."""
+    from personality_protect.writer_sft import run_build_writer_sft
+
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    try:
+        receipt = run_build_writer_sft(paths)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    if as_json:
+        typer.echo(json.dumps(receipt, indent=2, ensure_ascii=False))
+        return
+    console.print(
+        f"writer SFT: {receipt['examples']} examples "
+        f"(skipped {receipt['skipped']}) → {receipt['path']}"
+    )
+
+
 @app.command("write")
 def write_cmd(
     ctx: typer.Context,
     topic: str = typer.Option(..., "--topic", help="What the post is about."),
     points: str = typer.Option(..., "--points", help="Facts/claims the post may use."),
+    channel: str = typer.Option(
+        "post",
+        "--channel",
+        help="post (default LinkedIn post) or article (outline→sections→stitch).",
+    ),
     k: int = typer.Option(
         DEFAULT_WRITE_K,
         "--k",
@@ -517,38 +548,27 @@ def write_cmd(
     max_tokens: int = typer.Option(
         DEFAULT_WRITE_MAX_TOKENS,
         "--max-tokens",
-        help="Generation budget for the draft.",
+        help="Generation budget for the draft (per section when --channel article).",
     ),
     no_adapter: bool = typer.Option(
         True,
         "--no-adapter/--adapter",
-        help="RAG write runs on base weights only; --adapter is unsupported.",
+        help="Default: base weights. --adapter loads a local writer LoRA when present.",
     ),
     out: Optional[Path] = typer.Option(None, "--out", help="Write draft to file."),
     profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
     home: Optional[Path] = typer.Option(None, "--home"),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Draft a post from retrieved exemplars on base weights (no adapter)."""
+    """Draft a post or article from retrieved exemplars (optional writer LoRA)."""
     _banner_from_ctx(ctx, json_mode=as_json)
-    if not no_adapter:
-        console.print(
-            "[red]--adapter is not supported: the RAG write path always runs "
-            "base weights with adapter=none.[/red]"
-        )
-        raise typer.Exit(2)
 
     paths = get_paths(profile, home=home)
     try:
-        config = load_config(paths)
+        load_config(paths)
     except FileNotFoundError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
-    if config.write_adapter is not None and not as_json:
-        console.print(
-            f"[yellow]Ignoring profile write_adapter={config.write_adapter} — "
-            "write is RAG-only.[/yellow]"
-        )
 
     try:
         result = run_write(
@@ -557,6 +577,8 @@ def write_cmd(
             paths,
             k=k,
             max_tokens=max_tokens,
+            channel=channel,
+            use_adapter=not no_adapter,
         )
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -818,6 +840,11 @@ def train_cmd(
             "Voice-pair mode: translator SFT only; skips leave_alone/identity minting."
         ),
     ),
+    writer: bool = typer.Option(
+        False,
+        "--writer",
+        help="Build brief→post writer SFT and train a writer LoRA (RAG write path).",
+    ),
     profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
     home: Optional[Path] = typer.Option(None, "--home"),
     as_json: bool = typer.Option(False, "--json"),
@@ -829,6 +856,9 @@ def train_cmd(
         console.print(f"[red]Unknown backend: {backend}[/red]")
         raise typer.Exit(2)
 
+    if pairs is not None and writer:
+        console.print("[red]Pass only one of --writer or --pairs.[/red]")
+        raise typer.Exit(2)
     if pairs is not None and not pairs.is_file():
         console.print(f"[red]pairs file not found: {pairs}[/red]")
         raise typer.Exit(2)
@@ -1055,8 +1085,9 @@ def train_cmd(
             force_retrain=force_retrain,
             progress_callback=callback,
             pairs=pairs,
+            writer=writer,
         )
-    except (FileNotFoundError, RuntimeError, MockFallbackError) as exc:
+    except (FileNotFoundError, RuntimeError, MockFallbackError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
     finally:
