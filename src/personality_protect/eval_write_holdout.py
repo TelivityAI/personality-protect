@@ -334,15 +334,25 @@ def score_draft_against_holdout(
     holdout_text: str,
     draft: str,
     brief: str,
+    exemplars: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """g4: axis distance + invent flags (counts + keys; no draft body)."""
+    """g4: axis distance + guard flags (counts + keys; no draft body).
+
+    ``disqualified`` marks a draft that failed a guard. Axis distance measures
+    rhythm, and an exemplar dump has perfect rhythm because it *is* the author's
+    text — so distance alone once crowned a draft that was a copy of its own
+    prompt. A disqualified draft cannot win, whatever its distance.
+    """
     ref_axes = text_axes(holdout_text)
     draft_axes = text_axes(draft)
     invention = check_invention(brief, normalize_sentence_case(draft))
+    parroted = parrot_reject(draft, list(exemplars))
     return {
         "distance": _axes_distance(ref_axes, draft_axes),
         "axes": draft_axes,
+        "parrot_reject": parroted,
         "invent_reject": not invention.passed,
+        "disqualified": bool(parroted or not invention.passed),
         "invented_entities": sorted(invention.invented_entities),
         "invented_numbers": sorted(invention.invented_numbers),
         "invented_entities_count": len(invention.invented_entities),
@@ -356,14 +366,21 @@ def score_rag_vs_base(
     base_draft: str,
     brief: str,
     *,
+    rag_exemplars: Sequence[str] = (),
     tie_epsilon: float = TIE_EPSILON,
 ) -> dict[str, Any]:
     """Three-way score: holdout reference vs RAG draft vs bare-base draft."""
     holdout_axes = text_axes(holdout_text)
-    rag = score_draft_against_holdout(holdout_text, rag_draft, brief)
+    rag = score_draft_against_holdout(holdout_text, rag_draft, brief, rag_exemplars)
     base = score_draft_against_holdout(holdout_text, base_draft, brief)
     delta = float(base["distance"]) - float(rag["distance"])
-    if delta > float(tie_epsilon):
+    if rag["disqualified"] and base["disqualified"]:
+        winner = "tie"
+    elif rag["disqualified"]:
+        winner = "base"
+    elif base["disqualified"]:
+        winner = "rag"
+    elif delta > float(tie_epsilon):
         winner = "rag"
     elif delta < -float(tie_epsilon):
         winner = "base"
@@ -429,6 +446,10 @@ def _item_receipt(
         "base_distance": score["base"]["distance"],
         "rag_invent_reject": score["rag"]["invent_reject"],
         "base_invent_reject": score["base"]["invent_reject"],
+        "rag_parrot_reject": score["rag"]["parrot_reject"],
+        "base_parrot_reject": score["base"]["parrot_reject"],
+        "rag_disqualified": score["rag"]["disqualified"],
+        "base_disqualified": score["base"]["disqualified"],
         "rag_invented_entities_count": score["rag"]["invented_entities_count"],
         "base_invented_entities_count": score["base"]["invented_entities_count"],
         "rag_invented_numbers_count": score["rag"]["invented_numbers_count"],
@@ -526,6 +547,7 @@ def run_eval_write_holdout(
             rag_result["text"],
             base_result["text"],
             brief["guard_facts"],
+            rag_exemplars=list(rag_result.get("exemplar_texts") or []),
             tie_epsilon=tie_epsilon,
         )
         wins[score["winner"]] = wins.get(score["winner"], 0) + 1

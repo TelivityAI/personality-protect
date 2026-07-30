@@ -22,8 +22,17 @@ from typing import Iterable
 
 from personality_protect.eval_compare import extract_evidence_number_keys
 
-DEFAULT_ENTITY_MASK = "[ENTITY]"
+# Redaction removes the name instead of substituting a token. A visible
+# placeholder like ``[ENTITY]`` is an instruction the model happily follows: a
+# dogfood run produced a draft that copied whole exemplars back with dozens of
+# literal ``[ENTITY]`` markers in place of the names.
+DEFAULT_ENTITY_MASK = ""
 DEFAULT_PARROT_NGRAM = 8
+# Shorter windows catch reworded copying; only applied to drafts long enough for
+# the ratio to mean something, so a single shared phrase never trips it.
+PARROT_COVERAGE_NGRAM = 5
+PARROT_COVERAGE_LIMIT = 0.3
+PARROT_COVERAGE_MIN_TOKENS = 40
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
 _ENTITY_RE = re.compile(
@@ -31,6 +40,33 @@ _ENTITY_RE = re.compile(
     r"[A-Z][a-z][a-zA-Z0-9'-]*(?:\s+[A-Z][a-z][a-zA-Z0-9'-]*)*)\b"
 )
 _POSSESSIVE_RE = re.compile(r"['’]s$")
+_TRAILING_POSSESSIVE_RE = re.compile(r"^['’]s\b")
+
+# Cleanups after a name is cut out, so the exemplar still reads as prose rather
+# than as a form with blanks to fill in.
+_TIDY_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"[ \t]*['’]s\b"), ""),
+    (re.compile(r"[ \t]{2,}"), " "),
+    (re.compile(r"[ \t]+([,.;:!?%)\]])"), r"\1"),
+    (re.compile(r"([(\[#@])[ \t]+"), r"\1"),
+    (re.compile(r"\(\s*\)|\[\s*\]"), ""),
+    (re.compile(r"(?m)^[ \t]+|[ \t]+$"), ""),
+    # Lines left holding only hashtag/mention symbols or bare punctuation.
+    (re.compile(r"(?m)^[#@][#@ \t]*$\n?"), ""),
+    (re.compile(r"(?m)^[-—–:,.!?][-—–:,.!? \t]*$\n?"), ""),
+    (re.compile(r"\n{3,}"), "\n\n"),
+)
+
+# Bracketed all-caps tokens: our own former mask, and anything shaped like it.
+# A draft containing one is echoing scaffolding, not writing a post.
+_PLACEHOLDER_RE = re.compile(r"\[[A-Z][A-Z0-9_ /-]{2,}\]|<[A-Z][A-Z0-9_ /-]{2,}>")
+# Section labels and block separators from the prompt itself.
+_SCAFFOLD_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("examples_header", re.compile(r"(?im)^\s*EXAMPLES\b.*:")),
+    ("brief_header", re.compile(r"(?im)^\s*BRIEF\s*:")),
+    ("write_instruction", re.compile(r"(?i)write the post now")),
+    ("block_separator", re.compile(r"(?m)^\s*(?:-{3,}|\*{3,}|={3,}|—{2,})\s*$")),
+)
 
 # Sentence-initial words are syntactically capitalized, not necessarily names.
 # Keep this deliberately small and generic; unknown capitalized words are safer
@@ -275,7 +311,14 @@ def mask_exemplar_entities(
     *,
     mask: str = DEFAULT_ENTITY_MASK,
 ) -> str:
-    """Mask exemplar proper names that are not explicitly present in the brief."""
+    """Redact exemplar proper names that are not explicitly present in the brief.
+
+    The default ``mask`` is empty: the name is cut out and the surrounding
+    whitespace and punctuation tidied, so the exemplar keeps its rhythm and
+    lineation without advertising a slot to fill. Passing a visible token is
+    still possible for diagnostics, but never for text handed to a model —
+    ``[ENTITY]`` in a prompt reliably comes back out in the draft.
+    """
 
     if not exemplar:
         return ""
@@ -283,13 +326,21 @@ def mask_exemplar_entities(
     pieces: list[str] = []
     cursor = 0
     for start, end, key in _entity_spans(exemplar):
-        if key in allowed:
+        if key in allowed or start < cursor:
             continue
         pieces.append(exemplar[cursor:start])
         pieces.append(mask)
         cursor = end
+        possessive = _TRAILING_POSSESSIVE_RE.match(exemplar[cursor:])
+        if possessive:
+            cursor += possessive.end()
     pieces.append(exemplar[cursor:])
-    return "".join(pieces)
+    redacted = "".join(pieces)
+    if mask:
+        return redacted
+    for pattern, replacement in _TIDY_RULES:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted.strip()
 
 
 def _word_tokens(text: str) -> list[str]:
@@ -301,6 +352,25 @@ def _ngrams(text: str, n: int) -> set[tuple[str, ...]]:
         raise ValueError("n must be at least 1")
     tokens = _word_tokens(text)
     return {tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)}
+
+
+def _comparison_texts(exemplars: Iterable[str]) -> list[str]:
+    """Each exemplar plus its fully redacted form.
+
+    The model is shown redacted exemplars, so a copied chunk matches the
+    redacted text, not the original: comparing against the original alone lets
+    any window containing a removed name slip through.
+    """
+
+    texts: list[str] = []
+    seen: set[str] = set()
+    for exemplar in exemplars:
+        redacted = mask_exemplar_entities(exemplar, "")
+        for text in (exemplar, redacted):
+            if text and text not in seen:
+                seen.add(text)
+                texts.append(text)
+    return texts
 
 
 def find_parroted_ngrams(
@@ -315,9 +385,50 @@ def find_parroted_ngrams(
     if not draft_ngrams:
         return set()
     exemplar_ngrams: set[tuple[str, ...]] = set()
-    for exemplar in exemplars:
+    for exemplar in _comparison_texts(exemplars):
         exemplar_ngrams.update(_ngrams(exemplar, n))
     return {" ".join(ngram) for ngram in draft_ngrams & exemplar_ngrams}
+
+
+def find_scaffold_markers(draft: str) -> set[str]:
+    """Prompt scaffolding a finished post never contains.
+
+    Bracketed placeholders, section headers, the write instruction, and block
+    separators all mean the draft is reproducing its own prompt.
+    """
+
+    text = draft or ""
+    markers = {name for name, pattern in _SCAFFOLD_RES if pattern.search(text)}
+    if _PLACEHOLDER_RE.search(text):
+        markers.add("placeholder")
+    return markers
+
+
+def copied_token_ratio(
+    draft: str,
+    exemplars: Iterable[str],
+    *,
+    n: int = PARROT_COVERAGE_NGRAM,
+) -> float:
+    """Share of draft words sitting inside an exemplar n-gram.
+
+    An exact-match check on long windows misses a dump that drifts every few
+    lines; coverage does not. Near 1.0 means the draft *is* the exemplars.
+    """
+
+    tokens = _word_tokens(draft)
+    if len(tokens) < n:
+        return 0.0
+    exemplar_ngrams: set[tuple[str, ...]] = set()
+    for exemplar in _comparison_texts(exemplars):
+        exemplar_ngrams.update(_ngrams(exemplar, n))
+    if not exemplar_ngrams:
+        return 0.0
+    covered: set[int] = set()
+    for index in range(len(tokens) - n + 1):
+        if tuple(tokens[index : index + n]) in exemplar_ngrams:
+            covered.update(range(index, index + n))
+    return round(len(covered) / len(tokens), 4)
 
 
 def parrot_reject(
@@ -325,10 +436,26 @@ def parrot_reject(
     exemplars: Iterable[str],
     *,
     n: int = DEFAULT_PARROT_NGRAM,
+    coverage_limit: float = PARROT_COVERAGE_LIMIT,
+    coverage_min_tokens: int = PARROT_COVERAGE_MIN_TOKENS,
 ) -> bool:
-    """Reject a draft containing an exact normalized exemplar n-gram."""
+    """Reject a draft that copies its exemplars or echoes its own prompt.
 
-    return bool(find_parroted_ngrams(draft, exemplars, n=n))
+    Three independent signals: prompt scaffolding in the output, one exact
+    ``n``-token window shared with an exemplar, or — for drafts long enough to
+    measure — more than ``coverage_limit`` of the draft sitting inside exemplar
+    5-grams. The last one is what catches an exemplar dump, which reproduces
+    many separate passages rather than one long contiguous run.
+    """
+
+    if find_scaffold_markers(draft):
+        return True
+    pool = list(exemplars)
+    if find_parroted_ngrams(draft, pool, n=n):
+        return True
+    if len(_word_tokens(draft)) < coverage_min_tokens:
+        return False
+    return copied_token_ratio(draft, pool) >= coverage_limit
 
 
 def check_invention(brief: str, draft: str) -> InventionResult:

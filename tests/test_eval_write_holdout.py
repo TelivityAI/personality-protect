@@ -273,7 +273,7 @@ def test_g5_run_eval_write_holdout_receipt_contoso_safe(tmp_path: Path):
 
     def rag_generate(messages, **_kwargs: object) -> str:
         user = messages[1]["content"]
-        assert "EXAMPLES (voice reference only" in user
+        assert "EXAMPLES (rhythm reference only" in user
         examples_section = user.split("EXAMPLES", 1)[1].split("\n\nBRIEF:", 1)[0]
         # Holdout body must never appear as an exemplar.
         assert "private holdout" not in examples_section
@@ -383,3 +383,55 @@ def test_cli_eval_write_holdout_json_receipt(tmp_path: Path):
     assert payload["carve"]["ok"] is True
     assert "private holdout" not in result.output.lower()
     assert len(calls) >= 2
+
+
+def test_dumped_rag_draft_is_disqualified_and_cannot_win():
+    """Axis distance alone once crowned a draft that was a copy of its prompt.
+
+    A dump scores a near-perfect rhythm match because it *is* the author's
+    text, so the guard result — not the distance — has to decide the arm.
+    """
+    holdout = (
+        "Contoso named one owner per queue.\n"
+        "\n"
+        "The backlog stopped growing the same week.\n"
+        "\n"
+        "Boring beats clever."
+    )
+    exemplar = (
+        "Fabrikam is testing queue ads right now.\n"
+        "\n"
+        "The industry is drowning in noise and starving for owners.\n"
+        "\n"
+        "So we named one owner per queue and shipped it."
+    )
+    brief = "Topic: Contoso queues\nPoints: - Name one owner"
+    base_draft = (
+        "Contoso decided that a single accountable owner should be assigned to "
+        "every operational queue, which the leadership team reviewed at length "
+        "before agreeing that the arrangement was sensible for the quarter."
+    )
+
+    score = score_rag_vs_base(
+        holdout,
+        exemplar,
+        base_draft,
+        brief,
+        rag_exemplars=[exemplar],
+    )
+
+    assert score["rag"]["parrot_reject"] is True
+    assert score["rag"]["disqualified"] is True
+    assert score["rag"]["distance"] < score["base"]["distance"]
+    assert score["winner"] == "base"
+
+
+def test_clip_exemplar_bounds_prompt_size_and_keeps_lineation():
+    from personality_protect.write import MAX_EXEMPLAR_WORDS, clip_exemplar
+
+    long_exemplar = "Contoso shipped it.\n\n" + " ".join(["word"] * 500)
+    clipped = clip_exemplar(long_exemplar)
+
+    assert len(clipped.split()) <= MAX_EXEMPLAR_WORDS
+    assert clipped.startswith("Contoso shipped it.\n\n")
+    assert clip_exemplar("Short line.\n\nSecond line.") == "Short line.\n\nSecond line."

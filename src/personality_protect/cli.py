@@ -569,7 +569,11 @@ def write_cmd(
     if as_json:
         # Prompt/messages carry the retrieved exemplars (personal text) and are
         # for local debugging only — never part of the emitted receipt.
-        payload = {key: value for key, value in result.items() if key not in {"prompt", "messages"}}
+        payload = {
+            key: value
+            for key, value in result.items()
+            if key not in {"prompt", "messages", "exemplar_texts"}
+        }
         typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
         if out and not guard_failed:
             out.write_text(result["text"] + "\n", encoding="utf-8")

@@ -160,7 +160,7 @@ def test_run_write_retrieves_masks_and_returns_adapter_none_receipt(tmp_path: Pa
     def fake_generate(messages, **_kwargs: object) -> str:
         assert [message["role"] for message in messages] == ["system", "user"]
         user = messages[1]["content"]
-        assert "EXAMPLES (voice reference only" in user
+        assert "EXAMPLES (rhythm reference only" in user
         assert "BRIEF:" in user
         assert "Topic: Contoso pricing" in user
         assert "Fabrikam" not in user  # nothing to invent from fixtures

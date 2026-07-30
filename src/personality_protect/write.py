@@ -29,6 +29,10 @@ MIN_WRITE_K = 3
 MAX_WRITE_K = 5
 DEFAULT_WRITE_MAX_TOKENS = 768
 MAX_WRITE_ATTEMPTS = 2
+# A retrieved piece can be thousands of words (pasted articles, HTML). Five of
+# them filled a 60 KB prompt and the model answered by continuing the exemplars
+# instead of writing. A short excerpt carries the rhythm the prompt asks for.
+MAX_EXEMPLAR_WORDS = 120
 
 # Generators take chat messages, not a flat string: the chat template can only
 # be applied where the tokenizer lives.
@@ -110,6 +114,22 @@ def normalize_sentence_case(draft: str) -> str:
     )
 
 
+def clip_exemplar(text: str, *, max_words: int = MAX_EXEMPLAR_WORDS) -> str:
+    """First ``max_words`` words of an exemplar, keeping its line breaks."""
+    kept: list[str] = []
+    used = 0
+    for line in (text or "").splitlines():
+        words = line.split()
+        if used + len(words) > max_words:
+            remaining = max_words - used
+            if remaining > 0:
+                kept.append(" ".join(words[:remaining]))
+            break
+        kept.append(line)
+        used += len(words)
+    return "\n".join(kept).strip()
+
+
 def _guard_flags(brief: str, draft: str, exemplars: list[str]) -> dict[str, Any]:
     invention = check_invention(brief, normalize_sentence_case(draft))
     return {
@@ -155,7 +175,7 @@ def run_write(
         )
 
     exemplars = [str(match["text"]) for match in matches]
-    masked = [mask_exemplar_entities(exemplar, brief) for exemplar in exemplars]
+    masked = [mask_exemplar_entities(clip_exemplar(exemplar), brief) for exemplar in exemplars]
     messages = build_write_messages(topic=topic, points=points, examples=masked)
 
     generator = generate_fn or mlx_generate_no_adapter
@@ -188,6 +208,7 @@ def run_write(
         "attempts": attempts,
         **guards,
         # Local-only debugging aids; CLI/receipts strip these (personal text).
+        "exemplar_texts": exemplars,
         "messages": messages,
         "prompt": flatten_chat_messages(messages),
     }
