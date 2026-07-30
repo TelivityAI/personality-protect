@@ -211,7 +211,7 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 | `init` | Create profile under `~/.personality-protect/` |
 | `download` | Prefetch quantized MLX or GGUF base |
 | `ingest` | Index LinkedIn export and/or local paths |
-| `select` | Gate corpus by length / year — required before `build-style-profile` |
+| `dedupe-index` | Report pieces repeating another piece's text; `--apply` backs up then rewrites the index |
 | `index-voice` | Build local voice retrieval index |
 | `build-style-profile` | Build cadence / length / banned-filler style card |
 | `write` | Draft a post or article (`--channel post\|article`) |
