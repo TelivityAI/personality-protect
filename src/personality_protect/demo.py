@@ -9,9 +9,30 @@ from personality_protect.config import init_profile
 from personality_protect.filter import filter_draft
 from personality_protect.ingest import run_ingest
 from personality_protect.select import run_select
+from personality_protect.style_profile import run_build_style_profile
 from personality_protect.train import run_train
+from personality_protect.voice_index import build_voice_index
+from personality_protect.write import run_write
 
 DEMO_PROFILE = "demo"
+
+# Synthetic brief for the demo's write step. Contoso only — never personal text.
+DEMO_TOPIC = "Contoso Ledger exceptions queue"
+DEMO_POINTS = "- Name one owner\n- Keep the rollout boring"
+
+# The demo never downloads weights, so the model call is stubbed. Everything
+# around it — retrieval, style card, trim, guards — is the real write path.
+_DEMO_STUB_DRAFT = (
+    "The Contoso Ledger exceptions queue is not a tooling problem.\n\n"
+    "Name one owner.\n\n"
+    "Keep the rollout boring. Boring is what survives contact with a Monday."
+)
+
+
+def _demo_generate(_messages, **_kwargs) -> str:
+    """Canned generator for the demo — no model, no download."""
+    return _DEMO_STUB_DRAFT
+
 
 # Inline fallback if package data missing
 _FALLBACK_DOCS = {
@@ -98,7 +119,7 @@ def run_demo(
     home: Path | None = None,
     draft: str | None = None,
 ) -> dict:
-    """Full synthetic pipeline: init → ingest → select → mock train → filter."""
+    """Full synthetic pipeline: init → ingest → select → write path → mock train/filter."""
     paths, config, _ = init_profile(DEMO_PROFILE, home=home, force=True)
     corpus = ensure_demo_corpus(paths.cache_dir / "demo_corpus")
     added, _ = run_ingest(paths, local=[corpus], source_hint="demo")
@@ -107,6 +128,17 @@ def run_demo(
         min_words=20,  # synthetic pieces are shorter; demo overrides default
         through_year=2024,
         include_undated=True,
+    )
+    voice = build_voice_index(paths)
+    style, _style_path = run_build_style_profile(paths)
+    written = run_write(
+        DEMO_TOPIC,
+        DEMO_POINTS,
+        paths,
+        k=2,
+        channel="post",
+        use_adapter=False,
+        generate_fn=_demo_generate,
     )
     train = run_train(
         paths,
@@ -129,6 +161,15 @@ def run_demo(
         "ingested": added,
         "selected": len(selected),
         "selection_summary": selection.summary,
+        "indexed": voice["indexed"],
+        "style_pieces": style["stats"]["pieces"],
+        "banned_ai_filler": len(style["banned_ai_filler"]),
+        "write_topic": DEMO_TOPIC,
+        "write_channel": written["channel"],
+        "write_adapter": written["adapter"],
+        "write_exemplars": written["exemplar_ids"],
+        "write_stubbed_model": True,
+        "written": written["text"],
         "train_status": train.status,
         "train_backend": train.backend,
         "adapter_dir": train.adapter_dir,

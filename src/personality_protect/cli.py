@@ -546,7 +546,8 @@ def select_cmd(
         console.print(f"[red]{gate_error}[/red]")
         raise typer.Exit(2)
     console.print(f"Saved: {paths.selection_path}")
-    console.print("Next: personality-protect train")
+    console.print("Next: personality-protect index-voice")
+    console.print("Then: personality-protect build-style-profile")
 
 
 @app.command("build-style-profile")
@@ -1191,8 +1192,8 @@ def train_cmd(
     if result.notes:
         console.print(result.notes)
     if result.status == "ok":
-        console.print("Next: personality-protect filter --text '…'")
-        console.print("Or: personality-protect compare --synthetic slop_branding")
+        console.print("Next: personality-protect eval-write-holdout --out receipt.json")
+        console.print("[dim]Keep this adapter only if it beats RAG-alone on the holdout.[/dim]")
 
 
 @app.command("filter")
@@ -1501,20 +1502,42 @@ def demo_cmd(
     ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Optional synthetic mock tour (not the shipped mlx/llama path)."""
+    """Optional synthetic smoke tour of the write path (no model download)."""
     _banner_from_ctx(ctx, json_mode=as_json)
     result = run_demo(home=home, draft=draft)
     if as_json:
         typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
         return
     console.print(
-        "[bold]Mock tour complete[/bold] "
-        "(synthetic data + mock adapter only — not the shipped product path)."
+        "[bold]Smoke tour complete[/bold] "
+        "(synthetic Contoso corpus; the model call inside write is stubbed)."
     )
     console.print(
-        "[dim]Shipped path: train --backend mlx|cuda → filter/compare with llama|mlx.[/dim]"
+        "[dim]Product path: ingest → select → index-voice → "
+        "build-style-profile → write.[/dim]"
     )
-    console.print(f"Ingested: {result['ingested']}  Selected: {result['selected']}")
+    console.print(
+        "[dim]For a real draft: download --format mlx, then "
+        "write --topic … --points … on Apple Silicon.[/dim]"
+    )
+    console.print(
+        f"Ingested: {result['ingested']}  Selected: {result['selected']}  "
+        f"Indexed: {result['indexed']}"
+    )
+    console.print(
+        f"Style card: {result['style_pieces']} pieces, "
+        f"{result['banned_ai_filler']} banned filler phrases"
+    )
+    console.print("")
+    exemplars = result.get("write_exemplars") or []
+    console.print(
+        f"write channel={result['write_channel']} "
+        f"adapter={result['write_adapter']} model=stub "
+        f"exemplars={len(exemplars)}"
+    )
+    console.print(result["written"])
+    console.print("")
+    console.print("[dim]Legacy mock train/filter (not the drafting path):[/dim]")
     console.print(f"Train: {result['train_status']} via {result['train_backend']}")
     console.print("")
     console.print("[bold]Draft[/bold]")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,14 @@ FULL_PRECISION_BASE_MODEL = "Qwen/Qwen3.5-9B"
 DEFAULT_BASE_MODEL = DEFAULT_MLX_MODEL
 
 DEFAULT_MIN_WORDS = 50
-DEFAULT_THROUGH_YEAR = 2024
+
+# `select` caps the corpus at this year. It must NOT exclude current writing:
+# a fixed past year silently selects zero pieces for anyone whose corpus is
+# recent, and the style profile is built from the selection. The writer SFT
+# path already bypasses the year gate for exactly this reason
+# (see run_build_writer_sft). Use --through-year to narrow deliberately.
+# Holdouts are a separate, explicit mechanism (--holdout-id).
+DEFAULT_THROUGH_YEAR = datetime.now(timezone.utc).year
 DEFAULT_PROFILE = "default"
 DEFAULT_VOICE_MODE = "rag"
 DEFAULT_WRITE_ADAPTER: str | None = None
