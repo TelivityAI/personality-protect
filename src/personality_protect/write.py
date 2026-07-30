@@ -50,11 +50,14 @@ PromptSink = MutableSequence[str]
 
 
 def resolve_writer_adapter(paths: ProfilePaths) -> str | None:
-    """Return an adapter directory when a writer LoRA is present on disk."""
-    adapters = paths.adapters_dir
-    weights = adapters / "adapters.safetensors"
-    if weights.is_file():
-        return str(adapters)
+    """Return an adapter directory when a writer LoRA is present on disk.
+
+    MLX train writes under ``adapters/latest/``; prefer that, then the profile
+    adapters root.
+    """
+    for directory in (paths.adapters_dir / "latest", paths.adapters_dir):
+        if (directory / "adapters.safetensors").is_file():
+            return str(directory)
     return None
 
 
@@ -231,7 +234,7 @@ def run_write(
     adapter_path = resolve_writer_adapter(paths) if use_adapter else None
     if use_adapter and adapter_path is None:
         raise FileNotFoundError(
-            f"No writer adapter at {paths.adapters_dir}/adapters.safetensors. "
+            f"No writer adapter at {paths.adapters_dir}/latest/adapters.safetensors. "
             "Train one with: personality-protect train --writer"
         )
 
