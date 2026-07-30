@@ -31,11 +31,12 @@ PersonalityProtect keeps the corpus on disk, measures your cadence, retrieves sh
 ## How you get voice
 
 1. **Ingest** your LinkedIn export and/or local notes (stays on disk).
-2. **`index-voice`** builds a local retrieval index.
-3. **`build-style-profile`** measures cadence (sentence length, short lines, post length band, banned filler).
-4. **`write --topic --points`** drafts from the brief only; retrieved pieces are rhythm reference.
+2. **`select`** gates the corpus by length (`--min-words`, default 50) and an optional year cap (`--through-year`, default: current year).
+3. **`index-voice`** builds a local retrieval index.
+4. **`build-style-profile`** measures cadence from the selection (sentence length, short lines, post length band, banned filler).
+5. **`write --topic --points`** drafts from the brief only; retrieved pieces are rhythm reference.
 
-Two channels come out of step 4:
+Two channels come out of step 5:
 
 - **`--channel post`** (default) targets your long-post band, up to the LinkedIn ~3000-character limit (~550 words).
 - **`--channel article`** runs outline → sections → stitch, and needs at least five `linkedin_article` pieces in the corpus.
@@ -61,6 +62,7 @@ personality-protect download --format mlx    # ~6 GB, once
 personality-protect ingest --linkedin ~/path/to/linkedin-export
 personality-protect ingest --path ~/path/to/notes --source note
 
+personality-protect select
 personality-protect index-voice
 personality-protect build-style-profile
 
@@ -94,18 +96,23 @@ pip install -e ".[cuda]"     # NVIDIA path (optional)
 
 Public docs use **synthetic Contoso / synergy-slop text only**. No personal corpus.
 
-| `write` (post + article) | `status` | Mark |
+| `write` (post + article) | `status` | Setup |
 | --- | --- | --- |
-| <img src="docs/images/cli-shipped.png" alt="write drafting a Contoso post with adapter=none" width="360" /> | <img src="docs/images/cli-status.png" alt="status output for the synthetic demo profile" width="280" /> | <img src="docs/images/cli-logo.png" alt="Telivity CLI logo" width="280" /> |
+| <img src="docs/images/cli-shipped.png" alt="write drafting a Contoso post with adapter=none" width="360" /> | <img src="docs/images/cli-status.png" alt="status output for the synthetic demo profile" width="280" /> | <img src="docs/images/cli-setup.png" alt="personality-protect setup / logo" width="280" /> |
 
 ```bash
+personality-protect select
 personality-protect index-voice
 personality-protect build-style-profile
 personality-protect write --topic "Contoso pricing" --points "Name one owner."
 personality-protect status
 ```
 
-Optional smoke tour (no model download; synthetic only):
+Optional smoke tour — runs the write path with a stubbed model call (no download; synthetic Contoso only):
+
+| Smoke tour (`demo`) | Mark |
+| --- | --- |
+| <img src="docs/images/cli-demo.png" alt="personality-protect demo smoke tour of the write path" width="360" /> | <img src="docs/images/cli-logo.png" alt="Telivity CLI logo" width="280" /> |
 
 ```bash
 personality-protect demo
@@ -160,12 +167,19 @@ personality-protect ingest --linkedin ~/path/to/linkedin-export.zip
 personality-protect ingest --path ~/path/to/notes --source note
 ```
 
-### Index and style
+### Select, index and style
+
+`select` is required before `build-style-profile` (the style card reads `selection.json`). It is a length gate plus an optional year cap:
 
 ```bash
+personality-protect select
+personality-protect select --min-words 75 --include-undated
+personality-protect select --through-year 2024   # deliberate narrowing only
 personality-protect index-voice
 personality-protect build-style-profile
 ```
+
+Defaults: **≥50 words**, dates through the **current year**. Use `--through-year` when you intentionally want an older slice. Corpus gates: **warn** below 50 selected pieces; **block** below 20 unless `--force`. Holding pieces back from retrieval is separate — `index-voice --holdout-id`, scored by `eval-write-holdout`.
 
 Post length targets come from `linkedin_post` pieces (p75/p90), clamped to the LinkedIn ~3000-character band (~550 words).
 
@@ -197,12 +211,13 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 | `init` | Create profile under `~/.personality-protect/` |
 | `download` | Prefetch quantized MLX or GGUF base |
 | `ingest` | Index LinkedIn export and/or local paths |
+| `select` | Gate corpus by length / year — required before `build-style-profile` |
 | `index-voice` | Build local voice retrieval index |
 | `build-style-profile` | Build cadence / length / banned-filler style card |
 | `write` | Draft a post or article (`--channel post\|article`) |
 | `eval-write-holdout` | Score write quality on held-out pieces (local receipt) |
 | `status` | Show profile state |
-| `demo` | Optional synthetic smoke tour (no download) |
+| `demo` | Optional synthetic smoke tour of the write path (no download) |
 | `api` | Loopback HTTP stub |
 | `logo` | Print Telivity CLI mark |
 | `build-writer-sft`, `train` | Optional LoRA experiments — see [Advanced](#advanced-optional) |
@@ -247,7 +262,7 @@ Keep an adapter only if `eval-write-holdout` shows it beating RAG-alone on held-
 
 ### Other experiment commands
 
-`select`, `filter`, `compare`, `eval`, and the translator-pair commands remain available. They score or rewrite existing text and are not part of the drafting path above.
+`filter`, `compare`, `eval`, and the translator-pair commands remain available. They score or rewrite existing text and are not part of the drafting path above. (`select` *is* part of the drafting path — see [Select, index and style](#select-index-and-style).)
 
 ### Operator script
 
@@ -268,10 +283,25 @@ Operator checklist: [docs/LAUNCH.md](docs/LAUNCH.md).
 ```bash
 pip install -e ".[dev]"
 pytest
-ruff check src tests
+ruff check src tests scripts
 ```
 
 CI (`.github/workflows/ci.yml`) required checks: `lint`, `test (3.11)`, `test (3.12)`, `sanitize`, `cli-smoke`.
+
+### Regenerating screenshots
+
+`scripts/shot.py` renders captured ANSI terminal bytes to PNG on a fixed character grid (so Rich box-drawing lines up). Needs `pillow`.
+
+```bash
+export PERSONALITY_PROTECT_HOME=/tmp/shots COLUMNS=94 TERM=xterm-256color
+pip install pillow
+script -qec "personality-protect --logo off demo" /dev/null \
+  | python3 scripts/shot.py docs/images/cli-demo.png "personality-protect demo"
+script -qec "personality-protect --logo off status" /dev/null \
+  | python3 scripts/shot.py docs/images/cli-status.png "personality-protect status"
+```
+
+Do not regenerate `docs/images/cli-shipped.png` off Apple Silicon — it shows a real `write` against MLX weights.
 
 ---
 
