@@ -109,6 +109,45 @@ def _median(values: list[float]) -> float:
     return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
+def _percentile(values: list[float], fraction: float) -> float:
+    """Nearest-rank percentile; deterministic and dependency-free."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))
+    return float(ordered[index])
+
+
+def sentence_length_spread(texts: Iterable[str]) -> dict[str, float]:
+    """Quartiles of sentence length across the corpus.
+
+    A single median told the model to make every sentence that length, which
+    reads as a caricature. The spread is what lets it vary deliberately.
+    """
+    lengths: list[float] = []
+    for text in texts:
+        lengths.extend(float(n) for n in _sentence_word_counts(text or "") if n)
+    return {
+        "sentence_words_p25": round(_percentile(lengths, 0.25), 1),
+        "sentence_words_p75": round(_percentile(lengths, 0.75), 1),
+    }
+
+
+def multi_sentence_paragraph_ratio(texts: Iterable[str]) -> float:
+    """Share of paragraphs carrying more than one sentence."""
+    total = 0
+    multi = 0
+    for text in texts:
+        for block in re.split(r"\n\s*\n+", text or ""):
+            stripped = block.strip()
+            if not stripped:
+                continue
+            total += 1
+            if len(_sentence_word_counts(stripped)) > 1:
+                multi += 1
+    return round(multi / total, 4) if total else 0.0
+
+
 def corpus_style_stats(texts: Iterable[str]) -> dict[str, Any]:
     """Aggregate deterministic stats across corpus texts."""
     axes = [text_style_axes(t) for t in texts if (t or "").strip()]
@@ -159,8 +198,11 @@ def build_style_profile(
     piece_list = list(pieces)
     stats = corpus_style_stats(p.text for p in piece_list)
     banned = list(banned_phrases) if banned_phrases is not None else list(BANNED_AI_FILLER)
-    lengths = [len(_word_tokens(p.text)) for p in piece_list if (p.text or "").strip()]
+    texts = [p.text for p in piece_list if (p.text or "").strip()]
+    lengths = [len(_word_tokens(text)) for text in texts]
     stats["median_post_words"] = round(_median([float(n) for n in lengths]), 1)
+    stats.update(sentence_length_spread(texts))
+    stats["multi_sentence_paragraph_ratio"] = multi_sentence_paragraph_ratio(texts)
     return {
         "version": 1,
         "built_at": datetime.now(timezone.utc).isoformat(),
@@ -195,8 +237,15 @@ def style_directives(profile: dict[str, Any]) -> list[str]:
     stats = profile.get("stats") or {}
     directives: list[str] = []
 
+    low = float(stats.get("sentence_words_p25") or 0)
+    high = float(stats.get("sentence_words_p75") or 0)
     median_sentence = float(stats.get("median_sentence_words") or 0)
-    if median_sentence:
+    if low and high and high > low:
+        directives.append(
+            f"Sentence length varies: most run {low:.0f}–{high:.0f} words. "
+            "Do not write every sentence the same length."
+        )
+    elif median_sentence:
         directives.append(
             f"Sentences average about {median_sentence:.0f} words. Vary them, "
             "but do not write long academic sentences."
@@ -207,6 +256,13 @@ def style_directives(profile: dict[str, Any]) -> list[str]:
         directives.append(
             f"About {short_ratio * 100:.0f}% of lines are 8 words or fewer. "
             "Use short standalone lines and frequent paragraph breaks."
+        )
+
+    multi_ratio = float(stats.get("multi_sentence_paragraph_ratio") or 0)
+    if multi_ratio:
+        directives.append(
+            f"About {multi_ratio * 100:.0f}% of paragraphs carry two or more "
+            "sentences. Do not write the whole post as single short lines."
         )
 
     median_post = float(stats.get("median_post_words") or 0)

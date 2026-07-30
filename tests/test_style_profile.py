@@ -130,6 +130,22 @@ def test_style_directives_empty_profile_is_safe():
     assert style_directives({}) == []
 
 
+def test_style_directives_ask_for_varied_sentence_length():
+    """A lone median told the model to make every sentence that length."""
+    pieces = [
+        Piece(id="c1", source="linkedin_post", text=CONTOSO_VOICED, year=2024),
+        Piece(id="c2", source="linkedin_article", text=CONTOSO_ARTICLE, year=2024),
+    ]
+    profile = build_style_profile(pieces)
+    stats = profile["stats"]
+    assert stats["sentence_words_p75"] > stats["sentence_words_p25"]
+    assert 0.0 < stats["multi_sentence_paragraph_ratio"] <= 1.0
+
+    directives = style_directives(profile)
+    assert any("Sentence length varies" in line for line in directives)
+    assert any("two or more" in line for line in directives)
+
+
 def test_run_build_style_profile_writes_json(tmp_path: Path):
     paths, _, _ = init_profile("style", home=tmp_path)
     pieces = [
