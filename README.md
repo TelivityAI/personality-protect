@@ -2,17 +2,18 @@
 
 **Stop sounding like everyone else's AI.**
 
-Draft LinkedIn posts and articles in *your* voice on your machine. Index your writing, measure cadence, retrieve short rhythm references, and generate with a local quantized model (~5–7 GB). Optional writer LoRA deepens voice after it beats RAG-alone on holdouts. Your corpus never leaves this Mac.
+Draft LinkedIn posts and articles in *your* voice on your machine. Index your writing, measure your cadence, retrieve short rhythm references from your own pieces, and generate with a local quantized model (~5–7 GB). Your corpus never leaves this Mac.
 
 Built by [Telivity](https://telivity.com). Apache-2.0.
 
 ```text
-your writing ──► ingest ──► index-voice ──► build-style-profile ──► write
-                                      └── optional: train --writer ──► write --adapter
+your writing ──► ingest ──► index-voice ──► build-style-profile ──► write [--channel post|article]
 ```
 
+No fine-tune is required to get a draft. `write` runs the local base model with your retrieval index plus your measured style card (`adapter=none`).
+
 <p align="center">
-  <img src="docs/images/cli-shipped.png" alt="personality-protect write path" width="760" />
+  <img src="docs/images/cli-shipped.png" alt="personality-protect write drafting a Contoso post locally with adapter=none" width="800" />
 </p>
 
 ---
@@ -32,19 +33,20 @@ PersonalityProtect keeps the corpus on disk, measures your cadence, retrieves sh
 1. **Ingest** your LinkedIn export and/or local notes (stays on disk).
 2. **`index-voice`** builds a local retrieval index.
 3. **`build-style-profile`** measures cadence (sentence length, short lines, post length band, banned filler).
-4. **`write --topic --points`** drafts from the brief only; retrieved posts are rhythm reference.
+4. **`write --topic --points`** drafts from the brief only; retrieved pieces are rhythm reference.
 
-Optional:
+Two channels come out of step 4:
 
-- **`train --writer`** trains a brief→post LoRA from your posts (holdouts excluded).
-- **`write --adapter`** loads that LoRA when `adapters.safetensors` is present.
-- **`write --channel article`** runs outline → sections → stitch (needs enough `linkedin_article` pieces).
+- **`--channel post`** (default) targets your long-post band, up to the LinkedIn ~3000-character limit (~550 words).
+- **`--channel article`** runs outline → sections → stitch, and needs at least five `linkedin_article` pieces in the corpus.
+
+Local LoRA training stays in the CLI as an experiment, not as the path to a first draft — see [Advanced](#advanced-optional).
 
 ---
 
 ## Quick start
 
-Requires Python 3.10+ and an Apple Silicon Mac for the happy path.
+Requires Python 3.10+ and an Apple Silicon Mac: `write` runs on MLX and needs Metal.
 
 ```bash
 git clone https://github.com/TelivityAI/personality-protect.git
@@ -76,13 +78,7 @@ personality-protect write \
 personality-protect status
 ```
 
-Optional writer LoRA:
-
-```bash
-personality-protect build-writer-sft
-personality-protect train --writer --backend mlx
-personality-protect write --adapter --topic "…" --points "…"
-```
+That is the whole path to a draft — no training step.
 
 Optional extras:
 
@@ -98,9 +94,9 @@ pip install -e ".[cuda]"     # NVIDIA path (optional)
 
 Public docs use **synthetic Contoso / synergy-slop text only**. No personal corpus.
 
-| Write path | Status | Mark |
+| `write` (post + article) | `status` | Mark |
 | --- | --- | --- |
-| <img src="docs/images/cli-shipped.png" alt="write path" width="360" /> | <img src="docs/images/cli-status.png" alt="status" width="280" /> | <img src="docs/images/cli-logo.png" alt="Telivity CLI logo" width="280" /> |
+| <img src="docs/images/cli-shipped.png" alt="write drafting a Contoso post with adapter=none" width="360" /> | <img src="docs/images/cli-status.png" alt="status output for the synthetic demo profile" width="280" /> | <img src="docs/images/cli-logo.png" alt="Telivity CLI logo" width="280" /> |
 
 ```bash
 personality-protect index-voice
@@ -138,14 +134,14 @@ This README uses synthetic examples only (e.g. Contoso, “leverage synergies”
 
 ## Hardware
 
-**Happy path: Apple Silicon Mac** (MLX).
+**`write` requires an Apple Silicon Mac.** Drafting runs Qwen3.5-9B 4-bit through MLX/Metal; there is no cloud fallback.
 
 | What | Size / note |
 | --- | --- |
-| MLX 4-bit base (default write) | ~6 GB download |
-| GGUF Q4_K_M (optional) | ~5.6 GB download |
-| Writer LoRA | Small (MBs) under the profile |
-| Peak RAM while writing / training | Memory-capped; 16 GB+ recommended |
+| MLX 4-bit base (what `write` loads) | ~6 GB download, once |
+| Peak RAM while writing | Memory-capped; 16 GB+ recommended |
+| GGUF Q4_K_M (optional, for `filter`) | ~5.6 GB download |
+| Writer LoRA (optional) | Small (MBs) under the profile |
 
 MLX applies a wired-memory cap so Metal does not jetsam-kill Python on mid-size Macs.
 
@@ -178,20 +174,10 @@ Post length targets come from `linkedin_post` pieces (p75/p90), clamped to the L
 ```bash
 personality-protect write --topic "…" --points "…"
 personality-protect write --channel article --topic "…" --points "…"
-personality-protect write --adapter --topic "…" --points "…"
 personality-protect write --topic "…" --points "…" --json
 ```
 
-`--topic` and `--points` are the only content the draft may use. Article channel requires at least five `linkedin_article` pieces in the corpus.
-
-### Writer LoRA
-
-```bash
-personality-protect build-writer-sft
-personality-protect train --writer --backend mlx
-```
-
-Keep the adapter only if it improves holdout drafts vs RAG-alone (`eval-write-holdout`). Delete it if it does not.
+`--topic` and `--points` are the only content the draft may use; retrieved pieces supply rhythm, not facts. Every `write` above runs base weights (`adapter=none`). Article channel requires at least five `linkedin_article` pieces in the corpus.
 
 ### Status / API
 
@@ -213,14 +199,13 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 | `ingest` | Index LinkedIn export and/or local paths |
 | `index-voice` | Build local voice retrieval index |
 | `build-style-profile` | Build cadence / length / banned-filler style card |
-| `build-writer-sft` | Build brief→post SFT for writer LoRA |
-| `write` | Draft a post or article (`--channel`, optional `--adapter`) |
-| `train` | Local LoRA train (`--writer` for writer LoRA) |
+| `write` | Draft a post or article (`--channel post\|article`) |
 | `eval-write-holdout` | Score write quality on held-out pieces (local receipt) |
 | `status` | Show profile state |
 | `demo` | Optional synthetic smoke tour (no download) |
 | `api` | Loopback HTTP stub |
 | `logo` | Print Telivity CLI mark |
+| `build-writer-sft`, `train` | Optional LoRA experiments — see [Advanced](#advanced-optional) |
 
 ### `write` flags
 
@@ -230,7 +215,7 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 | `--points` | Facts/claims the draft may use |
 | `--channel post\|article` | Post (default) or article outline→sections→stitch |
 | `--k` | Rhythm exemplars to retrieve |
-| `--adapter` / `--no-adapter` | Load writer LoRA when present (default off) |
+| `--adapter` / `--no-adapter` | Default `--no-adapter` (base weights); `--adapter` needs a trained LoRA |
 | `--json` | Machine-readable receipt |
 
 ### `eval-write-holdout` flags
@@ -245,19 +230,36 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 
 ## Advanced (optional)
 
-Other experiment commands (`select`, `filter`, `compare`, translator pairs) remain in the CLI. The shipped path above does not require them.
+Nothing here is needed for a draft. These commands stay in the CLI for local experiments and receipts.
 
----
+### Writer LoRA (experimental plumbing)
 
-## Launch script
+`write` defaults to base weights. The adapter path exists so a trained LoRA *can* be loaded, and `--adapter` errors out when no adapter is present:
 
-Operator checklist: [docs/LAUNCH.md](docs/LAUNCH.md).
+```bash
+personality-protect build-writer-sft
+personality-protect train --writer --backend mlx
+personality-protect eval-write-holdout --out receipt.json
+personality-protect write --adapter --topic "…" --points "…"
+```
+
+Keep an adapter only if `eval-write-holdout` shows it beating RAG-alone on held-out pieces. Otherwise delete it and stay on the default. Training is not a prerequisite for `write`, and an untested adapter is not an upgrade.
+
+### Other experiment commands
+
+`select`, `filter`, `compare`, `eval`, and the translator-pair commands remain available. They score or rewrite existing text and are not part of the drafting path above.
+
+### Operator script
+
+`scripts/beast_demo.sh` drives the older `select` → `train` → `compare` → `eval` sequence, not `write`. Use it for train/compare runs only:
 
 ```bash
 chmod +x scripts/beast_demo.sh
 ./scripts/beast_demo.sh --linkedin ~/path/to/linkedin-export
 ./scripts/beast_demo.sh --skip-download   # synthetic smoke
 ```
+
+Operator checklist: [docs/LAUNCH.md](docs/LAUNCH.md).
 
 ---
 
