@@ -31,6 +31,31 @@ from personality_protect.voice_index import build_voice_index
 
 runner = CliRunner()
 
+# Lossy brief mining needs enough source words that topic + 2 bullets stay
+# under the overlap cap. Short Contoso stubs fail that by construction.
+CONTOSO_HOLDOUT_TEXT = (
+    "Customer pricing and packaging lessons belong in the private holdout.\n"
+    "\n"
+    "You name one owner before Contoso Ledger starts the next packaging change.\n"
+    "\n"
+    "Keep the test boring on purpose so the renewal signal stays readable.\n"
+    "\n"
+    "Cut exceptions by twelve percent over seven weeks or stop pretending "
+    "the roadmap is the work.\n"
+    "\n"
+    "Every packaging change needs a person who answers for it in writing.\n"
+    "\n"
+    "The review took three weeks and removed two tiers nobody used.\n"
+    "\n"
+    "You ship the simpler price list or you keep the escalations forever.\n"
+    "\n"
+    "Write down what Contoso learned before the next experiment starts.\n"
+    "\n"
+    "Stop when customer value moves the wrong way and reopen the old package.\n"
+    "\n"
+    "A narrow question beats a wide deck every single quarter."
+)
+
 
 def _contoso_pieces() -> list[Piece]:
     return [
@@ -39,18 +64,22 @@ def _contoso_pieces() -> list[Piece]:
             source="linkedin_post",
             text=(
                 "Pricing experiments work when teams compare customer value "
-                "and renewal signals.\n"
+                "and renewal signals before Contoso changes anything.\n"
                 "\n"
-                "Contoso kept the test boring on purpose."
+                "Contoso kept the test boring on purpose and named one owner.\n"
+                "\n"
+                "Write the result down before the next packaging change starts."
             ),
         ),
         Piece(
             id="contoso-platform",
             source="linkedin_post",
             text=(
-                "Platform migrations need careful service boundaries.\n"
+                "Platform migrations need careful service boundaries before launch.\n"
                 "\n"
-                "Name one owner before you start."
+                "Name one owner before you start Contoso Ledger work.\n"
+                "\n"
+                "Keep rollback plans small enough to explain in one page."
             ),
         ),
         Piece(
@@ -59,31 +88,15 @@ def _contoso_pieces() -> list[Piece]:
             text=(
                 "Operations queues improve when Contoso picks one metric.\n"
                 "\n"
-                "Ignore the rest for a week."
+                "Ignore the rest for a week and watch the queue length.\n"
+                "\n"
+                "Bring the other metrics back only after the first one moves."
             ),
         ),
         Piece(
             id="contoso-holdout",
             source="linkedin_post",
-            # Long enough to brief realistically. The miner fits topic + bullets
-            # into a share of the post, so a three-line fixture would only ever
-            # exercise the degenerate short-post path.
-            text=(
-                "Customer pricing and packaging lessons belong in the private holdout.\n"
-                "\n"
-                "You name one owner.\n"
-                "\n"
-                "Keep Contoso Ledger boring.\n"
-                "\n"
-                "Cut exceptions by 12% over seven weeks or stop pretending "
-                "the roadmap is the work.\n"
-                "\n"
-                "Every packaging change needs a person who answers for it.\n"
-                "\n"
-                "The review took three weeks and removed two tiers nobody used.\n"
-                "\n"
-                "You ship the simpler price list or you keep the escalations."
-            ),
+            text=CONTOSO_HOLDOUT_TEXT,
         ),
     ]
 
@@ -142,22 +155,7 @@ def test_g1_fails_when_holdout_leaked_into_index(tmp_path: Path):
 
 
 def test_g2_mine_brief_is_terse_bullets_not_the_post():
-    text = (
-        "Customer pricing and packaging lessons belong in the private holdout.\n"
-        "\n"
-        "You name one owner.\n"
-        "\n"
-        "Keep Contoso Ledger boring.\n"
-        "\n"
-        "Cut exceptions by 12% over seven weeks or stop pretending "
-        "the roadmap is the work.\n"
-        "\n"
-        "Every packaging change needs a person who answers for it.\n"
-        "\n"
-        "The review took three weeks and removed two tiers nobody used.\n"
-        "\n"
-        "You ship the simpler price list or you keep the escalations."
-    )
+    text = CONTOSO_HOLDOUT_TEXT
     brief = mine_brief_from_holdout(text, holdout_id="contoso-holdout")
 
     assert brief["holdout_id"] == "contoso-holdout"
@@ -182,36 +180,18 @@ def test_g2_mine_brief_is_terse_bullets_not_the_post():
 
 
 def test_g2_mine_brief_is_deterministic():
-    text = (
-        "Platform migrations need careful service boundaries.\n"
-        "\n"
-        "Name one owner before you start Contoso Ledger.\n"
-        "\n"
-        "Keep rollback plans small enough to explain.\n"
-        "\n"
-        "Stop the migration when the boundary blurs.\n"
-        "\n"
-        "Write down the recovery path before launch.\n"
-        "\n"
-        "Review it again with the owner."
-    )
+    text = CONTOSO_HOLDOUT_TEXT
     a = mine_brief_from_holdout(text, holdout_id="x")
     b = mine_brief_from_holdout(text, holdout_id="x")
     assert a == b
 
 
 def test_g2_rejects_brief_when_word_overlap_is_not_lossy():
-    text = (
-        "Pricing experiments need a clear owner and a narrow question.\n\n"
-        "Compare customer value before changing the package.\n\n"
-        "Keep the first rollout small and reversible.\n\n"
-        "Stop when renewal signals move the wrong way.\n\n"
-        "Write down what the team learned before the next test."
-    )
+    text = CONTOSO_HOLDOUT_TEXT
 
     leaky = {
-        "topic": "Pricing experiments need a clear owner",
-        "points": "- " + text.replace("\n", " "),
+        "topic": "Customer pricing and packaging lessons",
+        "points": "- " + " ".join(text.split()),
     }
     with pytest.raises(ValueError, match="mined brief returns"):
         assert_brief_is_not_the_post(leaky, text)
