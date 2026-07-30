@@ -8,7 +8,10 @@ from personality_protect.config import (
     DEFAULT_BASE_MODEL,
     DEFAULT_GGUF_FILE,
     DEFAULT_MLX_MODEL,
+    DEFAULT_VOICE_MODE,
+    DEFAULT_WRITE_ADAPTER,
     FULL_PRECISION_BASE_MODEL,
+    ProfileConfig,
     init_profile,
 )
 from personality_protect.download import resolve_gguf_path, run_download
@@ -29,6 +32,23 @@ def test_init_profile_stores_gguf_fields(tmp_path: Path):
     assert config.base_model == DEFAULT_MLX_MODEL
     assert config.gguf_file == DEFAULT_GGUF_FILE
     assert paths.models_dir.is_dir()
+
+
+def test_profile_defaults_to_rag_writes_without_adapter(tmp_path: Path):
+    _, config, created = init_profile("contoso", home=tmp_path)
+
+    assert created
+    assert DEFAULT_VOICE_MODE == "rag"
+    assert config.voice_mode == "rag"
+    assert DEFAULT_WRITE_ADAPTER is None
+    assert config.write_adapter is None
+
+
+def test_legacy_profile_defaults_to_rag_writes_without_adapter():
+    config = ProfileConfig.from_dict({"name": "contoso"})
+
+    assert config.voice_mode == "rag"
+    assert config.write_adapter is None
 
 
 def test_resolve_gguf_path(tmp_path: Path):

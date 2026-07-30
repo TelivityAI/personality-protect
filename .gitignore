@@ -12,6 +12,7 @@ build/
 .venv/
 venv/
 .env/
+tmp/
 *.egg
 
 # Personal / local runtime — NEVER commit

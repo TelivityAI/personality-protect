@@ -28,6 +28,8 @@ DEFAULT_BASE_MODEL = DEFAULT_MLX_MODEL
 DEFAULT_MIN_WORDS = 50
 DEFAULT_THROUGH_YEAR = 2024
 DEFAULT_PROFILE = "default"
+DEFAULT_VOICE_MODE = "rag"
+DEFAULT_WRITE_ADAPTER: str | None = None
 
 # Corpus size gates for credible full train (bypass with --force / --smoke)
 CORPUS_WARN_BELOW = 50
@@ -51,6 +53,8 @@ class ProfileConfig:
     base_model: str = DEFAULT_BASE_MODEL
     gguf_repo: str = DEFAULT_GGUF_REPO
     gguf_file: str = DEFAULT_GGUF_FILE
+    voice_mode: str = DEFAULT_VOICE_MODE
+    write_adapter: str | None = DEFAULT_WRITE_ADAPTER
     min_words: int = DEFAULT_MIN_WORDS
     through_year: int = DEFAULT_THROUGH_YEAR
     created_at: str = ""
@@ -66,6 +70,10 @@ class ProfileConfig:
             base_model=str(data.get("base_model", DEFAULT_BASE_MODEL)),
             gguf_repo=str(data.get("gguf_repo", DEFAULT_GGUF_REPO)),
             gguf_file=str(data.get("gguf_file", DEFAULT_GGUF_FILE)),
+            voice_mode=str(data.get("voice_mode", DEFAULT_VOICE_MODE)),
+            write_adapter=(
+                str(data["write_adapter"]) if data.get("write_adapter") is not None else None
+            ),
             min_words=int(data.get("min_words", DEFAULT_MIN_WORDS)),
             through_year=int(data.get("through_year", DEFAULT_THROUGH_YEAR)),
             created_at=str(data.get("created_at", "")),
