@@ -241,3 +241,10 @@ def test_invention_guard_ignores_sentence_initial_verbs():
     draft = "Stop pretending the roadmap is the work.\nKeep Contoso boring."
 
     assert check_invention(brief, draft).passed is True
+
+
+def test_mask_exemplar_entities_keeps_ordinary_possessives():
+    """Only a redacted name loses its ``'s``; ordinary contractions survive."""
+    exemplar = "That's it. The industry's habit is confusing noise with progress."
+
+    assert mask_exemplar_entities(exemplar, "") == exemplar

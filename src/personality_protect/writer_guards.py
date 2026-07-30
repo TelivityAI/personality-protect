@@ -45,7 +45,6 @@ _TRAILING_POSSESSIVE_RE = re.compile(r"^['’]s\b")
 # Cleanups after a name is cut out, so the exemplar still reads as prose rather
 # than as a form with blanks to fill in.
 _TIDY_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"[ \t]*['’]s\b"), ""),
     (re.compile(r"[ \t]{2,}"), " "),
     (re.compile(r"[ \t]+([,.;:!?%)\]])"), r"\1"),
     (re.compile(r"([(\[#@])[ \t]+"), r"\1"),

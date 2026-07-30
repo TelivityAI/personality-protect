@@ -435,3 +435,31 @@ def test_clip_exemplar_bounds_prompt_size_and_keeps_lineation():
     assert len(clipped.split()) <= MAX_EXEMPLAR_WORDS
     assert clipped.startswith("Contoso shipped it.\n\n")
     assert clip_exemplar("Short line.\n\nSecond line.") == "Short line.\n\nSecond line."
+
+
+def test_draft_that_echoes_the_brief_is_disqualified():
+    """Handing the mined bullets back scores well on rhythm and says nothing."""
+    holdout = (
+        "If your AI engineer quits, breathe first.\n"
+        "\n"
+        "Then call finance and ask what the budget really covers.\n"
+        "\n"
+        "Then start hiring."
+    )
+    brief = (
+        "Topic: If your AI engineer quits\n"
+        "Points: - Run and find a safe place to do so first\n"
+        "- Contact your finance team and see how much of the budget is left\n"
+        "- Now do a breathing exercise"
+    )
+    echo = (
+        "Run and find a safe place to do so first\n"
+        "Contact your finance team and see how much of the budget is left\n"
+        "Now do a breathing exercise"
+    )
+
+    score = score_rag_vs_base(holdout, echo, echo, brief)
+
+    assert score["rag"]["parrot_reject"] is True
+    assert score["rag"]["disqualified"] is True
+    assert score["winner"] == "tie"

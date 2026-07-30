@@ -346,7 +346,10 @@ def score_draft_against_holdout(
     ref_axes = text_axes(holdout_text)
     draft_axes = text_axes(draft)
     invention = check_invention(brief, normalize_sentence_case(draft))
-    parroted = parrot_reject(draft, list(exemplars))
+    # The brief joins the copy-check pool: handing the mined bullets back is the
+    # other way to score a flattering distance without writing anything, and it
+    # is what the winning draft did on one holdout.
+    parroted = parrot_reject(draft, [*exemplars, brief])
     return {
         "distance": _axes_distance(ref_axes, draft_axes),
         "axes": draft_axes,
