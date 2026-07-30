@@ -134,11 +134,16 @@ def sentence_length_spread(texts: Iterable[str]) -> dict[str, float]:
 
 
 def multi_sentence_paragraph_ratio(texts: Iterable[str]) -> float:
-    """Share of paragraphs carrying more than one sentence."""
+    """Share of paragraphs carrying more than one sentence.
+
+    Paragraphs are split on any run of newlines. The corpus separates them with
+    a single newline while generated drafts use a blank line; splitting only on
+    blank lines counted each stored post as one paragraph and reported 100%.
+    """
     total = 0
     multi = 0
     for text in texts:
-        for block in re.split(r"\n\s*\n+", text or ""):
+        for block in re.split(r"\n+", text or ""):
             stripped = block.strip()
             if not stripped:
                 continue
