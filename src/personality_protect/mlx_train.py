@@ -418,8 +418,8 @@ def run_mlx_chunk_subprocess(
 def detect_device_memory() -> tuple[int, int]:
     """Return (memory_size, max_recommended_working_set_size) from MLX if possible.
 
-    Never import ``mlx`` when ``PP_MLX_DISABLE`` is set — sandboxed Cursor shells
-    SIGABRT on ``metal::load_device`` (~80ms) and take Python down with them.
+    Never import ``mlx`` unless ``PP_MLX_ALLOW=1`` opts in — sandboxed Cursor
+    shells SIGABRT on ``metal::load_device`` (~80ms) and take Python with them.
     """
     try:
         from personality_protect.mlx_runtime import assert_mlx_import_allowed

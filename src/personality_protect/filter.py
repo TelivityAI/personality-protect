@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Literal
 
+from personality_protect.chat_prompt import render_chat_prompt
 from personality_protect.config import (
     DEFAULT_MLX_MODEL,
     ProfilePaths,
@@ -1400,21 +1401,13 @@ def _filter_mlx_chunks(
             messages = build_filter_messages(
                 draft, reference=None, few_shot=few_shot, force=force
             )
-            if getattr(tokenizer, "has_chat_template", False) or getattr(
-                tokenizer, "chat_template", None
-            ):
-                # Qwen3 defaults enable_thinking=True; that burns tokens on meta
-                # "Thinking Process" and never returns a clean rewrite.
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
-            else:
-                prompt = build_filter_prompt(
+            prompt = render_chat_prompt(
+                tokenizer,
+                messages,
+                fallback=build_filter_prompt(
                     draft, reference=None, few_shot=few_shot, force=force
-                )
+                ),
+            )
 
             draft_s = draft
             best = ""

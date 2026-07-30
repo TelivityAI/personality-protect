@@ -32,6 +32,8 @@ from personality_protect.config import (
     DEFAULT_MLX_SIZE_HINT,
     DEFAULT_PROFILE,
     DEFAULT_THROUGH_YEAR,
+    DEFAULT_VOICE_MODE,
+    DEFAULT_WRITE_ADAPTER,
     default_home,
     get_paths,
     init_profile,
@@ -45,6 +47,10 @@ from personality_protect.eval_compare import (
     run_compare,
     run_eval,
     specificity_scorecard,
+)
+from personality_protect.eval_write_holdout import (
+    run_eval_write_holdout,
+    write_receipt,
 )
 from personality_protect.filter import (
     filter_draft,
@@ -81,6 +87,7 @@ from personality_protect.pair_gate import (
     write_kept_jsonl,
 )
 from personality_protect.select import run_select
+from personality_protect.style_profile import run_build_style_profile
 from personality_protect.train import (
     MockFallbackError,
     auto_max_steps,
@@ -92,6 +99,14 @@ from personality_protect.translator_eval import (
     load_packaged_author_holdout,
     load_packaged_foreign_holdout,
     score_translator_holdout,
+)
+from personality_protect.voice_index import build_voice_index
+from personality_protect.write import (
+    DEFAULT_WRITE_K,
+    DEFAULT_WRITE_MAX_TOKENS,
+    MAX_WRITE_K,
+    MIN_WRITE_K,
+    run_write,
 )
 
 app = typer.Typer(
@@ -177,7 +192,8 @@ def main(
         typer.echo("Run with --help for commands. Data never leaves this machine.")
         typer.echo("")
         typer.echo(
-            "Commands: init | download | ingest | select | train | filter | "
+            "Commands: init | download | ingest | index-voice | build-style-profile | "
+            "select | write | eval-write-holdout | train | filter | "
             "eval | compare | scorecard | pair-gate | sterile-check | "
             "translator-eval | demo | api | logo | status"
         )
@@ -314,6 +330,38 @@ def ingest_cmd(
     _print_summary(summary, title="Index")
 
 
+@app.command("index-voice")
+def index_voice_cmd(
+    ctx: typer.Context,
+    holdout_id: Optional[list[str]] = typer.Option(
+        None,
+        "--holdout-id",
+        help="Piece id to exclude from retrieval (repeatable).",
+    ),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Rebuild the local voice retrieval index from the current corpus."""
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    try:
+        load_config(paths)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    result = build_voice_index(paths, holdout_ids=holdout_id or ())
+    if as_json:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    console.print(
+        f"Indexed [bold]{result['indexed']}[/bold] voice exemplars "
+        f"(skipped holdout: {result['skipped_holdout']})."
+    )
+    console.print(f"Voice index: {result['voice_index']}")
+
+
 @app.command("select")
 def select_cmd(
     ctx: typer.Context,
@@ -412,6 +460,245 @@ def select_cmd(
         raise typer.Exit(2)
     console.print(f"Saved: {paths.selection_path}")
     console.print("Next: personality-protect train")
+
+
+@app.command("build-style-profile")
+def build_style_profile_cmd(
+    ctx: typer.Context,
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Compute corpus style stats + banned AI-filler list into style_profile.json."""
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    try:
+        style, out_path = run_build_style_profile(paths)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    payload = {
+        "path": str(out_path),
+        "pieces": style["stats"]["pieces"],
+        "words": style["stats"]["words"],
+        "stats": style["stats"],
+        "banned_ai_filler": style["banned_ai_filler"],
+        "piece_ids": style["piece_ids"],
+    }
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2))
+        return
+    console.print(
+        f"Style profile from [bold]{style['stats']['pieces']}[/bold] pieces "
+        f"({style['stats']['words']} words)."
+    )
+    stats = style["stats"]
+    console.print(
+        f"median_sentence={stats['median_sentence_words']} "
+        f"short_line_ratio={stats['short_line_ratio']} "
+        f"contraction_rate={stats['contraction_rate']} "
+        f"you_gt_i={stats['you_gt_i']}"
+    )
+    console.print(f"banned_ai_filler: {len(style['banned_ai_filler'])} phrases")
+    console.print(f"Saved: {out_path}")
+
+
+@app.command("write")
+def write_cmd(
+    ctx: typer.Context,
+    topic: str = typer.Option(..., "--topic", help="What the post is about."),
+    points: str = typer.Option(..., "--points", help="Facts/claims the post may use."),
+    k: int = typer.Option(
+        DEFAULT_WRITE_K,
+        "--k",
+        help=f"Exemplars to retrieve ({MIN_WRITE_K}–{MAX_WRITE_K}).",
+    ),
+    max_tokens: int = typer.Option(
+        DEFAULT_WRITE_MAX_TOKENS,
+        "--max-tokens",
+        help="Generation budget for the draft.",
+    ),
+    no_adapter: bool = typer.Option(
+        True,
+        "--no-adapter/--adapter",
+        help="RAG write runs on base weights only; --adapter is unsupported.",
+    ),
+    out: Optional[Path] = typer.Option(None, "--out", help="Write draft to file."),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Draft a post from retrieved exemplars on base weights (no adapter)."""
+    _banner_from_ctx(ctx, json_mode=as_json)
+    if not no_adapter:
+        console.print(
+            "[red]--adapter is not supported: the RAG write path always runs "
+            "base weights with adapter=none.[/red]"
+        )
+        raise typer.Exit(2)
+
+    paths = get_paths(profile, home=home)
+    try:
+        config = load_config(paths)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    if config.write_adapter is not None and not as_json:
+        console.print(
+            f"[yellow]Ignoring profile write_adapter={config.write_adapter} — "
+            "write is RAG-only.[/yellow]"
+        )
+
+    try:
+        result = run_write(
+            topic,
+            points,
+            paths,
+            k=k,
+            max_tokens=max_tokens,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+    except (FileNotFoundError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    guard_failed = bool(result["parrot_reject"] or result["invent_reject"])
+    if as_json:
+        # Prompt/messages carry the retrieved exemplars (personal text) and are
+        # for local debugging only — never part of the emitted receipt.
+        payload = {
+            key: value
+            for key, value in result.items()
+            if key not in {"prompt", "messages", "exemplar_texts"}
+        }
+        typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+        if out and not guard_failed:
+            out.write_text(result["text"] + "\n", encoding="utf-8")
+        if guard_failed:
+            raise typer.Exit(1)
+        return
+
+    console.print(
+        f"[dim]voice_mode={result['voice_mode']} adapter={result['adapter']} "
+        f"model={result['model']} k={result['k']} attempts={result['attempts']}[/dim]"
+    )
+    console.print(f"[dim]exemplars: {', '.join(result['exemplar_ids'])}[/dim]")
+    if guard_failed:
+        console.print(
+            "[red]Guards still failing after one regen "
+            f"(parrot={result['parrot_reject']} invent={result['invent_reject']} "
+            f"entities+{len(result['invented_entities'])} "
+            f"numbers+{len(result['invented_numbers'])}). "
+            "Not saving draft — tighten --points or re-run.[/red]"
+        )
+        console.print(result["text"])
+        raise typer.Exit(1)
+    if out:
+        out.write_text(result["text"] + "\n", encoding="utf-8")
+        console.print(f"[dim]wrote {out}[/dim]")
+    console.print(result["text"])
+
+
+@app.command("eval-write-holdout")
+def eval_write_holdout_cmd(
+    ctx: typer.Context,
+    holdout_id: Optional[list[str]] = typer.Option(
+        None,
+        "--holdout-id",
+        help="Holdout piece id never indexed (repeatable).",
+    ),
+    k: int = typer.Option(
+        DEFAULT_WRITE_K,
+        "--k",
+        help=f"Exemplars to retrieve for RAG drafts ({MIN_WRITE_K}–{MAX_WRITE_K}).",
+    ),
+    max_tokens: int = typer.Option(
+        DEFAULT_WRITE_MAX_TOKENS,
+        "--max-tokens",
+        help="Generation budget per draft.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None,
+        "--out",
+        help="Write Contoso-safe receipt JSON (no draft bodies).",
+    ),
+    save_raw: bool = typer.Option(
+        False,
+        "--save-raw/--no-save-raw",
+        help="Dump exact prompts and raw drafts under the profile's "
+        "gitignored dogfood/raw dir (personal text; never commit).",
+    ),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Score RAG write vs bare-base on never-indexed holdouts.
+
+    Receipts omit draft/holdout bodies (ids + scores + invent counts only).
+    Generation uses injectable MLX behind PP_MLX_ALLOW; tests mock generate.
+    """
+    _banner_from_ctx(ctx, json_mode=as_json)
+    ids = [str(piece_id) for piece_id in (holdout_id or []) if str(piece_id).strip()]
+    if not ids:
+        console.print("[red]Provide at least one --holdout-id.[/red]")
+        raise typer.Exit(2)
+
+    paths = get_paths(profile, home=home)
+    try:
+        load_config(paths)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    try:
+        receipt = run_eval_write_holdout(
+            paths,
+            ids,
+            k=k,
+            max_tokens=max_tokens,
+            save_raw=save_raw,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+    except (FileNotFoundError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    if out:
+        write_receipt(receipt, out)
+
+    if as_json:
+        typer.echo(json.dumps(receipt, indent=2, ensure_ascii=False))
+        return
+
+    wins = receipt["wins"]
+    console.print(
+        f"[bold]eval-write-holdout[/bold] n={receipt['n_holdouts']} "
+        f"adapter={receipt['adapter']} model={receipt['model']}"
+    )
+    console.print(
+        f"carve_ok={receipt['carve']['ok']} "
+        f"wins rag={wins['rag']} base={wins['base']} tie={wins['tie']} "
+        f"rag_beats_base={receipt['rag_beats_base']}"
+    )
+    for item in receipt["items"]:
+        console.print(
+            f"  {item['holdout_id']}: winner={item['winner']} "
+            f"Δ={item['delta_base_minus_rag']} "
+            f"rag_dist={item['rag_distance']} base_dist={item['base_distance']} "
+            f"invent rag={item['rag_invent_reject']} base={item['base_invent_reject']} "
+            f"brief_leak={item['brief_leakage_ratio']}"
+        )
+    if out:
+        console.print(f"[dim]wrote receipt {out}[/dim]")
+    if save_raw:
+        console.print(
+            "[dim]raw prompts/drafts under profile dogfood/raw (personal text — never commit)[/dim]"
+        )
 
 
 @app.command("download")
@@ -1478,6 +1765,9 @@ def status_cmd(
         "profile": profile,
         "root": str(paths.root),
         "exists": paths.config_path.is_file(),
+        "voice_mode": DEFAULT_VOICE_MODE,
+        "adapter": "none",
+        "write_adapter": DEFAULT_WRITE_ADAPTER,
         "index_pieces": 0,
         "has_selection": paths.selection_path.is_file(),
         "has_sft": paths.sft_jsonl.is_file(),
@@ -1490,6 +1780,10 @@ def status_cmd(
         cfg = load_config(paths)
         info["base_model"] = cfg.base_model
         info["gguf_file"] = cfg.gguf_file
+        info["voice_mode"] = cfg.voice_mode
+        info["write_adapter"] = cfg.write_adapter
+        # Camp A RAG write path always runs base weights (adapter=none).
+        info["adapter"] = "none"
         pieces = load_index(paths.index_path)
         info["index_pieces"] = len(pieces)
         info["summary"] = summarize_by_source_year(pieces)
@@ -1499,7 +1793,8 @@ def status_cmd(
     for k, v in info.items():
         if k == "summary":
             continue
-        console.print(f"{k}: {v}")
+        display = "none" if v is None and k == "write_adapter" else v
+        console.print(f"{k}: {display}")
     if info.get("summary"):
         _print_summary(info["summary"], title="Index")
 

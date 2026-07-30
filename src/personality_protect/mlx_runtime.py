@@ -6,8 +6,9 @@ Mac). That jetsam-kills Python ("quit unexpectedly"). Every MLX entrypoint
 must install this cap before load/generate/train.
 
 Importing ``mlx`` / ``mlx_lm`` inside Cursor's sandboxed shell also SIGABRTs
-(Metal unavailable → uncaught C++ terminate). Call ``assert_mlx_import_allowed``
-before any ``import mlx*``.
+(Metal unavailable → uncaught C++ terminate). MLX is therefore blocked by
+default: call ``assert_mlx_import_allowed`` before any ``import mlx*``, and set
+``PP_MLX_ALLOW=1`` only in a shell that has a real Metal device.
 """
 
 from __future__ import annotations
@@ -25,18 +26,39 @@ from personality_protect.mlx_train import (
 _CAP_INSTALLED_FOR: int | None = None
 
 
-def assert_mlx_import_allowed() -> None:
-    """Raise before ``import mlx*`` when Metal/GPU use is explicitly disabled.
+MLX_ALLOW_ENV = "PP_MLX_ALLOW"
+MLX_DISABLE_ENV = "PP_MLX_DISABLE"
+_TRUTHY = {"1", "true", "yes", "on"}
 
-    Set ``PP_MLX_DISABLE=1`` in agent sandboxes / CI so a stray import fails
-    cleanly instead of SIGABRT via ``metal::load_device``.
+
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in _TRUTHY
+
+
+def mlx_import_allowed() -> bool:
+    """True only when MLX use is explicitly opted into and not force-disabled."""
+    return _env_flag(MLX_ALLOW_ENV) and not _env_flag(MLX_DISABLE_ENV)
+
+
+def assert_mlx_import_allowed() -> None:
+    """Raise before ``import mlx*`` unless MLX was explicitly opted into.
+
+    Fails closed: importing ``mlx`` in a sandboxed shell has no Metal device and
+    SIGABRTs via ``metal::load_device``, killing Python with a crash dialog
+    instead of an exception. Callers must set ``PP_MLX_ALLOW=1`` in a real
+    GPU-capable shell; ``PP_MLX_DISABLE=1`` still overrides and blocks.
     """
-    flag = (os.environ.get("PP_MLX_DISABLE") or "").strip().lower()
-    if flag in {"1", "true", "yes", "on"}:
+    if _env_flag(MLX_DISABLE_ENV):
         raise RuntimeError(
-            "MLX import blocked (PP_MLX_DISABLE=1). "
+            f"MLX import blocked ({MLX_DISABLE_ENV}=1). "
             "Do not load mlx/mlx_lm in sandboxed or headless sessions — "
             "Metal abort kills Python. Use mock backend or a full-GPU shell."
+        )
+    if not _env_flag(MLX_ALLOW_ENV):
+        raise RuntimeError(
+            f"MLX import blocked by default. Set {MLX_ALLOW_ENV}=1 in a shell with "
+            "a real Metal device to load mlx/mlx_lm. Sandboxed or headless "
+            "sessions SIGABRT on metal::load_device — use the mock backend there."
         )
 
 
