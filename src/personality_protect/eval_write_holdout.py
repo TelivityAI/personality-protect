@@ -42,6 +42,8 @@ from personality_protect.writer_guards import (
     extract_named_entity_keys,
     parrot_reject,
 )
+from personality_protect.draft_trim import trim_draft
+from personality_protect.style_profile import DEFAULT_DRAFT_WORD_TARGET
 
 TIE_EPSILON = 0.05
 BARE_BASE_EXAMPLES: tuple[str, ...] = ()
@@ -384,22 +386,30 @@ def run_bare_base_write(
     generate_fn: GenerateFn,
     base_model: str,
     max_tokens: int = DEFAULT_WRITE_MAX_TOKENS,
+    word_target: int = DEFAULT_DRAFT_WORD_TARGET,
     prompt_sink: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Generate from the locked prompt with no retrieved exemplars."""
+    """Generate from the locked prompt with no retrieved exemplars.
+
+    The same tail trim as the RAG arm: a length edit applied to only one side
+    would decide the comparison by itself.
+    """
     topic = topic.strip()
     points = points.strip()
     if not topic or not points:
         raise ValueError("topic and points must not be empty")
     messages = build_write_messages(topic=topic, points=points, examples=BARE_BASE_EXAMPLES)
-    draft = str(
-        generate_fn(
-            messages,
-            base_model=base_model,
-            max_tokens=max_tokens,
-            prompt_sink=prompt_sink,
-        )
-    ).strip()
+    draft = trim_draft(
+        str(
+            generate_fn(
+                messages,
+                base_model=base_model,
+                max_tokens=max_tokens,
+                prompt_sink=prompt_sink,
+            )
+        ).strip(),
+        max_words=word_target,
+    )
     brief = build_brief(topic, points)
     invention = check_invention(brief, normalize_sentence_case(draft))
     return {
@@ -684,6 +694,7 @@ def run_eval_write_holdout(
             generate_fn=base_generator,
             base_model=model_id,
             max_tokens=max_tokens,
+            word_target=int(rag_result["word_target"]),
             prompt_sink=base_prompts,
         )
         # The guard scores drafts against the same brief the model saw.

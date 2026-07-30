@@ -16,8 +16,13 @@ from personality_protect.chat_prompt import (
     render_chat_prompt,
 )
 from personality_protect.config import DEFAULT_MLX_MODEL, ProfilePaths, load_config
+from personality_protect.draft_trim import trim_draft
 from personality_protect.prompt_write import build_write_messages
-from personality_protect.style_profile import load_style_profile, style_directives
+from personality_protect.style_profile import (
+    draft_word_target,
+    load_style_profile,
+    style_directives,
+)
 from personality_protect.voice_index import retrieve
 from personality_protect.writer_guards import (
     check_invention,
@@ -178,7 +183,9 @@ def run_write(
 
     exemplars = [str(match["text"]) for match in matches]
     masked = [mask_exemplar_entities(clip_exemplar(exemplar), brief) for exemplar in exemplars]
-    directives = style_directives(load_style_profile(paths))
+    style = load_style_profile(paths)
+    directives = style_directives(style)
+    word_target = draft_word_target(style)
     messages = build_write_messages(
         topic=topic,
         points=points,
@@ -193,7 +200,7 @@ def run_write(
     guards: dict[str, Any] = {}
     attempts = 0
     for attempts in range(1, MAX_WRITE_ATTEMPTS + 1):
-        draft = str(
+        raw = str(
             generator(
                 messages,
                 base_model=model_id,
@@ -201,6 +208,9 @@ def run_write(
                 prompt_sink=prompt_sink,
             )
         ).strip()
+        # Guards score the edited draft, not the raw stream: the trimmed tail is
+        # not part of the post, so letting it drive a rejection would be noise.
+        draft = trim_draft(raw, max_words=word_target)
         guards = _guard_flags(brief, draft, exemplars)
         if not guards["parrot_reject"] and not guards["invent_reject"]:
             break
@@ -214,6 +224,7 @@ def run_write(
         "k": len(matches),
         "exemplar_ids": [str(match["id"]) for match in matches],
         "attempts": attempts,
+        "word_target": word_target,
         **guards,
         # Local-only debugging aids; CLI/receipts strip these (personal text).
         "exemplar_texts": exemplars,

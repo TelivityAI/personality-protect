@@ -170,6 +170,20 @@ def build_style_profile(
     }
 
 
+# Headroom over the author's median so a slightly long post is kept whole, while
+# a runaway generation still gets cut. Mirrors the cap stated in the prompt.
+_LENGTH_HEADROOM = 1.5
+DEFAULT_DRAFT_WORD_TARGET = 300
+
+
+def draft_word_target(profile: dict[str, Any]) -> int:
+    """Word ceiling for a finished draft, measured from the author's posts."""
+    median = float((profile.get("stats") or {}).get("median_post_words") or 0)
+    if median <= 0:
+        return DEFAULT_DRAFT_WORD_TARGET
+    return int(round(median * _LENGTH_HEADROOM))
+
+
 def style_directives(profile: dict[str, Any]) -> list[str]:
     """Render the style card as prompt directives.
 
@@ -198,7 +212,7 @@ def style_directives(profile: dict[str, Any]) -> list[str]:
     if median_post:
         directives.append(
             f"Target roughly {median_post:.0f} words total. Never exceed "
-            f"{median_post * 1.5:.0f} words."
+            f"{draft_word_target(profile)} words. Stop when the point is made."
         )
 
     # Absent counts must stay silent: an empty profile asserting a pronoun lean
