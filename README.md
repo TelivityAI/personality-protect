@@ -2,9 +2,9 @@
 
 **Stop sounding like everyone else's AI.**
 
-v1 CLI — shipped and working. Train a small LoRA on *your* writing. Filter AI drafts so they carry your cadence — not LinkedIn-style mush. Runs locally on quantized Qwen3.5-9B (~5–7 GB). Your corpus, SFT JSONL, and adapters **never leave this machine**.
+v1 CLI — shipped and working. **Camp A RAG** is the product path: index your local writing, retrieve a few exemplars, and draft on quantized Qwen3.5-9B **with no LoRA adapter**. Runs locally (~5–7 GB). Your corpus and voice index **never leave this machine**.
 
-Built by [Telivity](https://telivity.com). Apache-2.0. The on-device pipe is real: ingest → select → chunked train → filter → compare. Voice fidelity (leave-alone + cadence) is what we're sharpening next — not “does the product work?”
+Built by [Telivity](https://telivity.com). Apache-2.0. The on-device pipe is real: ingest → index-voice → build-style-profile → write. The flat→voice **translator** / LoRA `train`+`filter` path is **not** the product path (legacy CLI only).
 
 ---
 
@@ -12,17 +12,18 @@ Built by [Telivity](https://telivity.com). Apache-2.0. The on-device pipe is rea
 
 | | What it is | What it is **not** |
 | --- | --- | --- |
-| **`personality-protect demo`** | Optional **synthetic mock tour** — ingest fake docs → mock train → mock filter. No model download. | Not the product. Not a real LoRA. Ending on “Mock tour complete” does **not** mean PersonalityProtect is only a demo. |
-| **Shipped path** | `init` → `download` → `ingest` → `select` → **`train` (mlx/cuda)** → **`filter` / `compare` (llama/mlx)** | Not `demo`. Real quantized weights + your adapter on disk. |
+| **`personality-protect demo`** | Optional **synthetic mock tour** — ingest fake docs → mock train → mock filter. No model download. | Not the product. Ending on “Mock tour complete” does **not** mean PersonalityProtect is only a demo. |
+| **Shipped path (Camp A RAG)** | `init` → `download` → `ingest` → **`index-voice`** → **`build-style-profile`** → **`write --topic --points`** | Not `demo`. Not LoRA. Not the translator. Base weights with `adapter=none`. |
+| **Translator / `train` / `filter`** | Legacy experiment commands still in the CLI | **Not** the product path |
 
 ```text
-your writing ──► ingest ──► select ──► train (local LoRA) ──► filter / compare ──► your voice
+your writing ──► ingest ──► index-voice ──► build-style-profile ──► write (Qwen, no adapter)
                                          ▲
-                    demo (optional mock tour; synthetic only)
+                    demo / translator / train+filter (not the product path)
 ```
 
 <p align="center">
-  <img src="docs/images/cli-shipped.png" alt="personality-protect shipped path: train --backend mlx --proof then filter with llama" width="760" />
+  <img src="docs/images/cli-shipped.png" alt="personality-protect shipped path: Camp A RAG write on base weights" width="760" />
 </p>
 
 ---
@@ -33,9 +34,9 @@ The feed is drowning in AI writing that all sounds the same — *“In today’s
 
 Cloud fine-tunes are a non-option for personal writing. Notes, emails, and posts are biometric-adjacent. Shipping them to a rented GPU farm so someone else's stack can imitate you is a strange bargain.
 
-PersonalityProtect is the other path: keep the corpus on disk, train a small adapter on a quantized base (MLX on Apple Silicon, or CUDA), then rewrite drafts *before* they go public. The weights that carry your voice stay under your profile directory. Nothing leaves the machine.
+PersonalityProtect is the other path: keep the corpus on disk, retrieve a few of your own posts as exemplars, and draft on a local quantized base (MLX on Apple Silicon) **without** loading a voice LoRA. Nothing leaves the machine.
 
-Honest about the hard part: the pipeline ships; sounding *exactly* like you is the ongoing craft. More (and better) personal writing → better leave-alone and cadence. Treat outputs as drafts you still own — we are not claiming “indistinguishable from your LinkedIn” as a solved problem.
+Honest about the hard part: RAG drafting ships; sounding *exactly* like you is the ongoing craft. Treat outputs as drafts you still own — we are not claiming “indistinguishable from your LinkedIn” as a solved problem.
 
 ---
 
@@ -56,10 +57,11 @@ Optional mock tour (window title says *demo tour*, not the product name):
 | <img src="docs/images/cli-demo.png" alt="optional mock demo tour" width="360" /> | <img src="docs/images/cli-logo.png" alt="Telivity CLI logo" width="280" /> | <img src="docs/images/cli-status.png" alt="status on synthetic demo profile" width="280" /> |
 
 ```bash
-# Shipped path (real adapters)
-personality-protect train --backend mlx --proof
-personality-protect filter --text "In today's fast-paced world…"
-personality-protect compare --synthetic slop_branding
+# Shipped path (Camp A RAG — no adapter)
+personality-protect index-voice
+personality-protect build-style-profile
+personality-protect write --topic "Contoso pricing" --points "Name one owner."
+personality-protect status
 
 # Optional mock tour only (no download)
 personality-protect demo
@@ -71,9 +73,9 @@ personality-protect demo
 
 | Shipped (v1 CLI) | Sharpening |
 | --- | --- |
-| End-to-end local pipeline | Voice fidelity (leave-alone + cadence) |
-| Quantized download (~5–7 GB) | Eval metrics / automatic quality gates |
-| Chunked, resumable MLX train | CUDA path polish |
+| Camp A RAG write (`voice_mode=rag`, `adapter=none`) | Holdout ear vs bare base |
+| Local voice index + style profile | Eval metrics / automatic quality gates |
+| Quantized download (~5–7 GB) | CUDA path polish |
 | Privacy defaults + sanitize CI | Browser extension (API stub only) |
 
 ---
@@ -139,31 +141,26 @@ pip install -e ".[cuda]"     # NVIDIA QLoRA train
 
 ## Quick start
 
-### 1. Shipped local path (real train + filter)
+### 1. Shipped write path (Camp A RAG)
 
 ```bash
 personality-protect init
-personality-protect download                 # GGUF Q4_K_M ~5.6 GB
-# Apple Silicon trainers also want:
 personality-protect download --format mlx    # MLX 4-bit ~6 GB
 
 # Point at your own local export / notes (paths stay on your machine)
 personality-protect ingest --linkedin ~/path/to/linkedin-export
 personality-protect ingest --path ~/path/to/notes --source note
 
-personality-protect select
-personality-protect train --backend mlx
-# Useful flags:
-#   --proof              bounded real train for receipts
-#   --resume             continue after a crash / interrupt
-#   --chunk-steps 50     smaller Metal chunks
-#   --memory-gb 16       tighter wired-memory cap
+personality-protect index-voice
+personality-protect build-style-profile
+personality-protect write \
+  --topic "Contoso Ledger exceptions" \
+  --points "Name one owner. Keep the rollout boring."
 
-personality-protect filter --text "In today's fast-paced world we must leverage synergies."
-personality-protect compare --synthetic slop_branding
+personality-protect status   # shows voice_mode=rag adapter=none
 ```
 
-Filter auto-prefers local GGUF when present (`llama`), then MLX, then requires an explicit mock.
+`write` always runs base weights with **adapter=none** (RAG-only). The flat→voice **translator** and LoRA `train`/`filter` commands remain in the CLI for experiments — they are **not** the product path.
 
 ### 2. Optional mock tour (no download)
 
@@ -172,7 +169,7 @@ personality-protect demo
 personality-protect demo --json    # machine-readable; no logo
 ```
 
-Runs: init → ingest synthetic docs → select → **mock** train → **mock** filter. Useful for a smoke walkthrough. **This is not the shipped mlx/llama path.**
+Runs: init → ingest synthetic docs → select → **mock** train → **mock** filter. Useful for a smoke walkthrough. **This is not the shipped Camp A RAG path.**
 
 ---
 
@@ -293,13 +290,16 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 | `init` | Create profile under `~/.personality-protect/` |
 | `download` | Prefetch quantized GGUF or MLX base |
 | `ingest` | Index LinkedIn export and/or local paths |
+| `index-voice` | Build local retrieval index (Camp A RAG) |
+| `build-style-profile` | Corpus style stats + banned filler list |
+| `write` | Draft from retrieved exemplars (`adapter=none`) |
 | `select` | Gate corpus by length / year / source |
-| `train` | Build SFT JSONL + local LoRA |
-| `filter` | Rewrite a draft through the adapter |
+| `train` | Legacy LoRA train (**not** product path) |
+| `filter` | Legacy translator rewrite (**not** product path) |
 | `compare` | Raw vs few-shot vs adapter |
 | `eval` | Score a draft (synthetic or yours) |
 | `demo` | Optional synthetic **mock tour** (not the shipped path) |
-| `status` | Show profile / artifact state |
+| `status` | Show profile state (`voice_mode`, `adapter`) |
 | `api` | Loopback HTTP filter stub |
 | `logo` | Print Telivity CLI mark |
 
@@ -344,7 +344,7 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 | `--sft-only` | Build JSONL only; skip weight train |
 | `--force` | Allow train below corpus block threshold |
 
-**`filter` / `compare` / `eval`**
+**`filter` / `compare` / `eval`** (legacy — not the Camp A product path)
 
 | Flag | Meaning |
 | --- | --- |
@@ -353,6 +353,15 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 | `--backend` | `auto`, `llama`, `mlx`, `mock`, … |
 | `--synthetic NAME` | Packaged eval draft (`compare` / `eval`) |
 | `--gguf PATH` | Override GGUF path (`filter`) |
+
+**`write`** (Camp A RAG — product path)
+
+| Flag | Meaning |
+| --- | --- |
+| `--topic` | What the post is about |
+| `--points` | Facts/claims the draft may use |
+| `--k` | Exemplars to retrieve |
+| `--json` | Machine-readable receipt (`adapter=none`) |
 
 ---
 

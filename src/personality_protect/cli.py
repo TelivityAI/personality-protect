@@ -32,6 +32,8 @@ from personality_protect.config import (
     DEFAULT_MLX_SIZE_HINT,
     DEFAULT_PROFILE,
     DEFAULT_THROUGH_YEAR,
+    DEFAULT_VOICE_MODE,
+    DEFAULT_WRITE_ADAPTER,
     default_home,
     get_paths,
     init_profile,
@@ -1653,6 +1655,9 @@ def status_cmd(
         "profile": profile,
         "root": str(paths.root),
         "exists": paths.config_path.is_file(),
+        "voice_mode": DEFAULT_VOICE_MODE,
+        "adapter": "none",
+        "write_adapter": DEFAULT_WRITE_ADAPTER,
         "index_pieces": 0,
         "has_selection": paths.selection_path.is_file(),
         "has_sft": paths.sft_jsonl.is_file(),
@@ -1665,6 +1670,10 @@ def status_cmd(
         cfg = load_config(paths)
         info["base_model"] = cfg.base_model
         info["gguf_file"] = cfg.gguf_file
+        info["voice_mode"] = cfg.voice_mode
+        info["write_adapter"] = cfg.write_adapter
+        # Camp A RAG write path always runs base weights (adapter=none).
+        info["adapter"] = "none"
         pieces = load_index(paths.index_path)
         info["index_pieces"] = len(pieces)
         info["summary"] = summarize_by_source_year(pieces)
@@ -1674,7 +1683,8 @@ def status_cmd(
     for k, v in info.items():
         if k == "summary":
             continue
-        console.print(f"{k}: {v}")
+        display = "none" if v is None and k == "write_adapter" else v
+        console.print(f"{k}: {display}")
     if info.get("summary"):
         _print_summary(info["summary"], title="Index")
 
