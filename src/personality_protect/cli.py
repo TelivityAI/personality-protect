@@ -81,6 +81,7 @@ from personality_protect.pair_gate import (
     write_kept_jsonl,
 )
 from personality_protect.select import run_select
+from personality_protect.style_profile import run_build_style_profile
 from personality_protect.train import (
     MockFallbackError,
     auto_max_steps,
@@ -412,6 +413,48 @@ def select_cmd(
         raise typer.Exit(2)
     console.print(f"Saved: {paths.selection_path}")
     console.print("Next: personality-protect train")
+
+
+@app.command("build-style-profile")
+def build_style_profile_cmd(
+    ctx: typer.Context,
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Compute corpus style stats + banned AI-filler list into style_profile.json."""
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    try:
+        style, out_path = run_build_style_profile(paths)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    payload = {
+        "path": str(out_path),
+        "pieces": style["stats"]["pieces"],
+        "words": style["stats"]["words"],
+        "stats": style["stats"],
+        "banned_ai_filler": style["banned_ai_filler"],
+        "piece_ids": style["piece_ids"],
+    }
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2))
+        return
+    console.print(
+        f"Style profile from [bold]{style['stats']['pieces']}[/bold] pieces "
+        f"({style['stats']['words']} words)."
+    )
+    stats = style["stats"]
+    console.print(
+        f"median_sentence={stats['median_sentence_words']} "
+        f"short_line_ratio={stats['short_line_ratio']} "
+        f"contraction_rate={stats['contraction_rate']} "
+        f"you_gt_i={stats['you_gt_i']}"
+    )
+    console.print(f"banned_ai_filler: {len(style['banned_ai_filler'])} phrases")
+    console.print(f"Saved: {out_path}")
 
 
 @app.command("download")
