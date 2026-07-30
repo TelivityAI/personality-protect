@@ -64,7 +64,8 @@ def test_rebuild_is_idempotent_skips_holdouts_and_drops_stale_vectors(tmp_path: 
 
     assert result["indexed"] == 2
     assert result["skipped_holdout"] == 1
-    assert json.loads(first_manifest)["schema_version"] == 1
+    assert json.loads(first_manifest)["schema_version"] == 2
+    assert json.loads(first_manifest)["text_cleaner"] == "normalize_corpus_text"
     assert {
         json.loads(line)["piece"]["id"]
         for line in first_vectors.decode().splitlines()
@@ -78,6 +79,31 @@ def test_rebuild_is_idempotent_skips_holdouts_and_drops_stale_vectors(tmp_path: 
     build_voice_index(paths, holdout_ids={"contoso-holdout"})
     rows = [json.loads(line) for line in vectors_path.read_text().splitlines()]
     assert [row["piece"]["id"] for row in rows] == ["contoso-pricing"]
+
+
+def test_build_cleans_text_before_embedding_and_storage(tmp_path: Path):
+    paths, _, _ = init_profile("contoso", home=tmp_path)
+    dirty = Piece(
+        id="contoso-article",
+        source="linkedin_article",
+        text=(
+            ".article { margin: 0 auto; width: 744px; }\n"
+            "<article><p>Pricing should stay boring.</p>"
+            "<p>Ship one clear test.</p></article>"
+        ),
+    )
+    save_index(paths.index_path, [dirty])
+    embedder = LocalEmbedder(dimensions=128)
+
+    build_voice_index(paths, embedder=embedder)
+    vectors_path = paths.root / "voice_index" / "vectors.jsonl"
+    row = json.loads(vectors_path.read_text(encoding="utf-8"))
+
+    assert row["piece"]["text"] == "Pricing should stay boring.\n\nShip one clear test."
+    assert row["piece"]["word_count"] == 8
+    assert row["vector"] == embedder.embed(row["piece"]["text"])
+    assert "margin" not in row["piece"]["text"]
+    assert "<article>" not in row["piece"]["text"]
 
 
 def test_retrieve_returns_ranked_non_holdout_contoso_pieces(tmp_path: Path):

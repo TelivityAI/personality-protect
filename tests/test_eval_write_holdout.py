@@ -17,6 +17,7 @@ from personality_protect.eval_write_holdout import (
     assert_brief_is_not_the_post,
     assert_receipt_contoso_safe,
     brief_leakage_ratio,
+    brief_word_overlap_ratio,
     load_holdout_pieces,
     mine_brief_from_holdout,
     raw_artifacts_dir,
@@ -164,17 +165,16 @@ def test_g2_mine_brief_is_terse_bullets_not_the_post():
     # Points are bullets, not the body.
     assert brief["points"] != text
     assert brief["points"].startswith("- ")
-    assert "\n- " in brief["points"] or brief["points"].count("\n") >= 1
+    assert 2 <= len(brief["points"].splitlines()) <= 3
     # Cap: a brief that hands back the whole post is an answer key.
     assert_brief_is_not_the_post(brief, text)
     # The miner fits the brief to a budget, so it may sit on the cap but the
     # guard must never have to reject its own output.
-    assert brief_leakage_ratio(brief, text) <= 0.6
-    # Guard facts are the same brief the model sees — never the raw body.
-    assert brief["guard_facts"] == (
-        f"Topic: {brief['topic']}\nPoints: {brief['points']}"
-    )
-    assert text not in brief["guard_facts"]
+    assert brief_leakage_ratio(brief, text) <= 0.25
+    assert len((brief["topic"] + " " + brief["points"].replace("- ", "")).split()) <= 28
+    # The internal invention allowlist is not model-visible; it can retain
+    # source facts without turning the generation brief into an answer key.
+    assert brief["guard_facts"] == text
     # Contoso-safe: no personal markers in mined brief.
     blob = (brief["topic"] + "\n" + brief["points"]).lower()
     for token in ("linkedin.com", "@gmail", "dusan"):
@@ -185,11 +185,39 @@ def test_g2_mine_brief_is_deterministic():
     text = (
         "Platform migrations need careful service boundaries.\n"
         "\n"
-        "Name one owner before you start Contoso Ledger."
+        "Name one owner before you start Contoso Ledger.\n"
+        "\n"
+        "Keep rollback plans small enough to explain.\n"
+        "\n"
+        "Stop the migration when the boundary blurs.\n"
+        "\n"
+        "Write down the recovery path before launch.\n"
+        "\n"
+        "Review it again with the owner."
     )
     a = mine_brief_from_holdout(text, holdout_id="x")
     b = mine_brief_from_holdout(text, holdout_id="x")
     assert a == b
+
+
+def test_g2_rejects_brief_when_word_overlap_is_not_lossy():
+    text = (
+        "Pricing experiments need a clear owner and a narrow question.\n\n"
+        "Compare customer value before changing the package.\n\n"
+        "Keep the first rollout small and reversible.\n\n"
+        "Stop when renewal signals move the wrong way.\n\n"
+        "Write down what the team learned before the next test."
+    )
+
+    leaky = {
+        "topic": "Pricing experiments need a clear owner",
+        "points": "- " + text.replace("\n", " "),
+    }
+    with pytest.raises(ValueError, match="mined brief returns"):
+        assert_brief_is_not_the_post(leaky, text)
+
+    brief = mine_brief_from_holdout(text)
+    assert brief_word_overlap_ratio(brief, text) <= 0.25
 
 
 def test_g3_bare_base_prompt_has_no_exemplars():
@@ -314,7 +342,7 @@ def test_g5_run_eval_write_holdout_receipt_contoso_safe(tmp_path: Path):
     assert receipt["carve"]["voice_index"] == "voice_index"
     assert receipt["wins"]["rag"] + receipt["wins"]["base"] + receipt["wins"]["tie"] == 1
     assert "contoso-holdout" not in (receipt["items"][0].get("exemplar_ids") or [])
-    assert receipt["items"][0]["brief_leakage_ratio"] <= 0.6
+    assert receipt["items"][0]["brief_leakage_ratio"] <= 0.25
     assert receipt["raw_artifacts_saved"] is True
     assert_receipt_contoso_safe(receipt)
     blob = json.dumps(receipt).lower()

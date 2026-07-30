@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
 from personality_protect.config import DEFAULT_PROFILE, ProfilePaths, get_paths
+from personality_protect.corpus_text import normalize_corpus_text
 from personality_protect.embedder import (
     DEFAULT_EMBEDDING_DIMENSIONS,
     EMBEDDER_NAME,
@@ -16,7 +18,10 @@ from personality_protect.embedder import (
 )
 from personality_protect.models import Piece, load_index
 
-VOICE_INDEX_SCHEMA_VERSION = 1
+# v2 stores and embeds normalized corpus text. A v1 index may contain raw CSS
+# from LinkedIn article exports, so query code refuses it until it is rebuilt.
+VOICE_INDEX_SCHEMA_VERSION = 2
+TEXT_CLEANER = "normalize_corpus_text"
 MANIFEST_FILENAME = "manifest.json"
 VECTORS_FILENAME = "vectors.jsonl"
 
@@ -46,7 +51,19 @@ def build_voice_index(
     selected_embedder = embedder or LocalEmbedder()
     holdouts = {str(piece_id) for piece_id in holdout_ids}
     pieces = load_index(paths.index_path)
-    indexed = sorted((piece for piece in pieces if piece.id not in holdouts), key=lambda p: p.id)
+    indexed = sorted(
+        (
+            replace(
+                piece,
+                text=cleaned,
+                word_count=len(cleaned.split()),
+            )
+            for piece in pieces
+            if piece.id not in holdouts
+            if (cleaned := normalize_corpus_text(piece.text))
+        ),
+        key=lambda p: p.id,
+    )
 
     rows = [
         _vector_row(piece, selected_embedder.embed(piece.text))
@@ -62,6 +79,7 @@ def build_voice_index(
             "name": selected_embedder.name,
             "dimensions": selected_embedder.dimensions,
         },
+        "text_cleaner": TEXT_CLEANER,
         "vectors": VECTORS_FILENAME,
         "indexed": len(rows),
     }
@@ -98,6 +116,8 @@ def _load_voice_index(paths: ProfilePaths) -> tuple[LocalEmbedder, list[dict[str
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != VOICE_INDEX_SCHEMA_VERSION:
         raise ValueError(f"Unsupported voice index schema: {manifest.get('schema_version')}")
+    if manifest.get("text_cleaner") != TEXT_CLEANER:
+        raise ValueError(f"Unsupported voice index cleaner: {manifest.get('text_cleaner')}")
     embedder_meta = manifest.get("embedder") or {}
     if embedder_meta.get("name") != EMBEDDER_NAME:
         raise ValueError(f"Unsupported voice index embedder: {embedder_meta.get('name')}")

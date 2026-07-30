@@ -11,7 +11,9 @@ gates Metal behind ``PP_MLX_ALLOW``.
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +21,7 @@ from typing import Any
 
 from personality_protect.chat_prompt import flatten_chat_messages
 from personality_protect.config import ProfilePaths, load_config
+from personality_protect.corpus_text import normalize_corpus_text
 from personality_protect.eval_compare import extract_evidence_number_keys
 from personality_protect.models import Piece, load_index
 from personality_protect.pair_gate import text_axes
@@ -43,17 +46,23 @@ from personality_protect.writer_guards import (
 TIE_EPSILON = 0.05
 BARE_BASE_EXAMPLES: tuple[str, ...] = ()
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
-_TOPIC_WORD_CAP = 12
+_TOPIC_WORD_CAP = 8
 _TOPIC_MIN_WORDS = 4
-_POINT_WORD_CAP = 14
-_MAX_POINTS = 5
+_POINT_WORD_CAP = 7
+_MIN_POINTS = 2
+_MAX_POINTS = 3
 # Below this a bullet is a fragment, not a claim worth handing to the model.
 _MIN_POINT_WORDS = 3
-# A brief that hands back more than this share of the post is an answer key.
-_MAX_BRIEF_LEAKAGE = 0.6
-# Shortest post that still admits a subject plus one claim inside the leakage
-# budget: ``ceil((_TOPIC_MIN_WORDS + _MIN_POINT_WORDS) / _MAX_BRIEF_LEAKAGE)``.
-_MIN_HOLDOUT_WORDS = 12
+# The visible brief is deliberately lossy. This absolute cap prevents long
+# holdouts from receiving a long extract, while the overlap cap protects short
+# holdouts. Both count normalized words, not formatting markers.
+_MAX_BRIEF_WORDS = 28
+_MAX_BRIEF_OVERLAP = 0.25
+_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_MIN_HOLDOUT_WORDS = math.ceil(
+    (_TOPIC_MIN_WORDS + _MIN_POINTS * _MIN_POINT_WORDS) / _MAX_BRIEF_OVERLAP
+)
 
 # Raw prompts and drafts contain personal text. They live under the profile
 # directory (already gitignored, and outside the repo) and are never surfaced
@@ -130,30 +139,38 @@ def _sentences(body: str) -> list[str]:
     return [part.strip() for part in _SENTENCE_SPLIT.split(body) if part.strip()]
 
 
+def _truncate_words(text: str, word_cap: int) -> str:
+    """Keep at most ``word_cap`` lexical words without splitting the last one."""
+    matches = list(_WORD_RE.finditer(text))
+    if len(matches) <= word_cap:
+        return text.strip()
+    return text[: matches[max(1, word_cap) - 1].end()].strip()
+
+
 def _mine_topic(sentences: Sequence[str], *, word_cap: int = _TOPIC_WORD_CAP) -> str:
     """First sentence, extended while it is too short to name a subject."""
-    words: list[str] = []
+    parts: list[str] = []
     for sentence in sentences:
-        words.extend(sentence.split())
-        if len(words) >= _TOPIC_MIN_WORDS:
+        cleaned = _URL_RE.sub("", sentence).strip()
+        if cleaned:
+            parts.append(cleaned)
+        if len(_word_tokens(" ".join(parts))) >= _TOPIC_MIN_WORDS:
             break
-    return " ".join(words[: max(1, word_cap)]).rstrip(".,;:—-")
+    return _truncate_words(" ".join(parts), word_cap).rstrip(".,;:—-")
 
 
 def _fact_score(sentence: str) -> float:
     """Rank sentences by how much of the post's substance they carry."""
     entities = len(extract_named_entity_keys(sentence))
     numbers = len(extract_evidence_number_keys(sentence))
-    words = len(sentence.split())
+    words = len(_word_tokens(_URL_RE.sub("", sentence)))
     return 2.0 * entities + 3.0 * numbers + min(words, 20) / 20.0
 
 
 def _to_bullet(sentence: str, *, word_cap: int = _POINT_WORD_CAP) -> str:
     """Collapse a sentence to one terse, single-line bullet."""
-    flat = re.sub(r"\s+", " ", sentence).strip()
-    words = flat.split()
-    if len(words) > word_cap:
-        flat = " ".join(words[:word_cap])
+    flat = re.sub(r"\s+", " ", _URL_RE.sub("", sentence)).strip()
+    flat = _truncate_words(flat, word_cap)
     return "- " + flat.rstrip(".,;:—-")
 
 
@@ -167,54 +184,59 @@ def _content_word_count(topic: str, points: str) -> int:
     return len(topic.split()) + len(point_words)
 
 
+def _word_tokens(text: str) -> list[str]:
+    return [match.group(0).casefold().replace("’", "'") for match in _WORD_RE.finditer(text or "")]
+
+
+def brief_word_overlap_ratio(brief: dict[str, str], holdout_text: str) -> float:
+    """Share of source-word occurrences copied into the model-visible brief."""
+    source = Counter(_word_tokens(normalize_corpus_text(holdout_text)))
+    brief_tokens = Counter(_word_tokens(f"{brief['topic']}\n{brief['points']}"))
+    overlap = sum(min(count, source[token]) for token, count in brief_tokens.items())
+    return round(overlap / max(1, sum(source.values())), 4)
+
+
 def mine_brief_from_holdout(
     text: str,
     *,
     holdout_id: str = "",
     max_points: int = _MAX_POINTS,
-    max_leakage: float = _MAX_BRIEF_LEAKAGE,
+    max_overlap: float = _MAX_BRIEF_OVERLAP,
 ) -> dict[str, str]:
-    """g2: deterministically mine a real brief (topic + terse bullets).
+    """g2: deterministically mine a lossy brief (short topic + 2–3 bullets).
 
     A brief is what the author would jot down *before* writing: the subject and
-    a handful of key claims. It is emphatically **not** the finished post.
+    a few key claims. It is emphatically **not** an extract of the finished post.
+    The visible brief has both a hard word cap and a source-overlap cap. Bullets
+    are picked by :func:`_fact_score` and re-emitted in document order.
 
-    An earlier version set ``points`` to the entire holdout body, which handed
-    the eval its own answer: the bare-base arm could paraphrase the target and
-    win on stylometric distance without any voice modelling at all. Bullets are
-    flattened to one line each and the whole brief is fitted to a word budget of
-    ``max_leakage`` of the post, so the model receives some of the facts but
-    none of the post's lineation or cadence — the very things the eval measures.
-
-    The budget is proportional rather than a fixed cap because a short post
-    reaches "here is the answer key" far sooner than a long one: five 14-word
-    bullets is 40% of a 200-word post but 70% of a 116-word post. Bullets are
-    picked by :func:`_fact_score` (most substance first) and then re-emitted in
-    document order.
-
-    Returns ``topic``/``points`` (what the model sees) plus ``guard_facts``,
-    the allowed-facts text for :func:`check_invention`. ``guard_facts`` is
-    derived from the mined bullets, so "invented" means "went beyond the brief"
-    exactly as it does in production. It is a separate field so the guard's
-    fact set can never silently widen into facts the model was not shown.
+    ``guard_facts`` is intentionally separate from what the model sees. It uses
+    the source post as the internal allowed-facts set, so the invention guard
+    can reject facts absent from the source without leaking those facts into the
+    generation prompt. Receipts serialize neither field.
     """
-    body = (text or "").strip()
+    body = normalize_corpus_text(text)
     if not body:
         raise ValueError("holdout text must not be empty")
 
-    holdout_words = len(body.split())
+    holdout_words = len(_word_tokens(body))
     if holdout_words < _MIN_HOLDOUT_WORDS:
         raise ValueError(
             f"holdout is {holdout_words} words — too short to brief without "
-            f"handing back more than {max_leakage:.0%} of it; "
+            f"handing back more than {max_overlap:.0%} of it; "
             "pick a longer holdout rather than relaxing the budget"
         )
 
-    budget = int(holdout_words * max_leakage)
+    budget = min(_MAX_BRIEF_WORDS, int(holdout_words * max_overlap))
     sentences = _sentences(body)
-    topic = _mine_topic(sentences, word_cap=min(_TOPIC_WORD_CAP, budget - _MIN_POINT_WORDS))
+    topic = _mine_topic(
+        sentences,
+        word_cap=min(_TOPIC_WORD_CAP, budget - _MIN_POINTS * _MIN_POINT_WORDS),
+    )
 
-    candidates = sentences[1:] or sentences
+    candidates = sentences[1:]
+    if len(candidates) < _MIN_POINTS:
+        raise ValueError("holdout needs at least three sentences to mine two lossy bullets")
     ranked = sorted(
         enumerate(candidates),
         key=lambda item: (-_fact_score(item[1]), item[0]),
@@ -222,24 +244,41 @@ def mine_brief_from_holdout(
 
     remaining = budget - len(topic.split())
     chosen: list[tuple[int, str]] = []
+    target_points = min(_MAX_POINTS, max(_MIN_POINTS, int(max_points)))
     for position, sentence in ranked:
-        if len(chosen) >= max(1, int(max_points)):
+        if len(chosen) >= target_points:
             break
-        word_cap = min(_POINT_WORD_CAP, remaining)
+        # Do not let the first high-ranked bullet consume the minimum budget
+        # required for a second one.
+        minimum_after = max(0, (_MIN_POINTS - len(chosen) - 1) * _MIN_POINT_WORDS)
+        word_cap = min(_POINT_WORD_CAP, remaining - minimum_after)
         if word_cap < _MIN_POINT_WORDS:
             break
         bullet = _to_bullet(sentence, word_cap=word_cap)
-        remaining -= len(bullet.split()) - 1
+        bullet_words = len(_word_tokens(bullet))
+        if bullet_words < _MIN_POINT_WORDS:
+            continue
+        remaining -= bullet_words
         chosen.append((position, bullet))
 
+    if len(chosen) < _MIN_POINTS:
+        raise ValueError("brief budget cannot fit two short bullets")
     points = "\n".join(bullet for _, bullet in sorted(chosen, key=lambda item: item[0]))
-
-    return {
+    brief = {
         "holdout_id": holdout_id,
         "topic": topic,
         "points": points,
-        "guard_facts": build_brief(topic, points),
+        "guard_facts": body,
     }
+    if _content_word_count(topic, points) > _MAX_BRIEF_WORDS:
+        raise ValueError("mined brief exceeds hard word cap")
+    overlap = brief_word_overlap_ratio(brief, body)
+    if overlap > max_overlap:
+        raise ValueError(
+            f"mined brief overlaps {overlap:.0%} of the holdout "
+            f"(max {max_overlap:.0%}) — mining is not lossy"
+        )
+    return brief
 
 
 def run_bare_base_write(
@@ -403,7 +442,7 @@ def score_rag_vs_base(
 
 
 def brief_leakage_ratio(brief: dict[str, str], holdout_text: str) -> float:
-    """Share of the holdout's words the brief hands back to the model.
+    """Visible brief word count divided by source word count (legacy receipt metric).
 
     The original harness scored 1.0 here (``points`` was the whole post) and
     every arm was really being tested on paraphrase speed. Tracked in the
@@ -421,11 +460,11 @@ def assert_brief_is_not_the_post(brief: dict[str, str], holdout_text: str) -> No
             "mined brief reproduces the holdout body verbatim — "
             "the eval would be scoring paraphrase, not voice"
         )
-    ratio = brief_leakage_ratio(brief, holdout_text)
-    if ratio > _MAX_BRIEF_LEAKAGE:
+    ratio = brief_word_overlap_ratio(brief, holdout_text)
+    if ratio > _MAX_BRIEF_OVERLAP:
         raise ValueError(
             f"mined brief returns {ratio:.0%} of the holdout "
-            f"(max {_MAX_BRIEF_LEAKAGE:.0%}) — tighten brief mining"
+            f"(max {_MAX_BRIEF_OVERLAP:.0%}) — tighten brief mining"
         )
 
 
@@ -446,6 +485,7 @@ def _item_receipt(
         "points_bullets": len([ln for ln in brief["points"].splitlines() if ln.strip()]),
         "holdout_words": len((holdout_text or "").split()),
         "brief_leakage_ratio": brief_leakage_ratio(brief, holdout_text),
+        "brief_word_overlap_ratio": brief_word_overlap_ratio(brief, holdout_text),
         "winner": score["winner"],
         "delta_base_minus_rag": score["delta_base_minus_rag"],
         "rag_distance": score["rag"]["distance"],
@@ -527,8 +567,9 @@ def run_eval_write_holdout(
     wins = {"rag": 0, "base": 0, "tie": 0}
 
     for piece in pieces:
-        brief = mine_brief_from_holdout(piece.text, holdout_id=piece.id)
-        assert_brief_is_not_the_post(brief, piece.text)
+        holdout_text = normalize_corpus_text(piece.text)
+        brief = mine_brief_from_holdout(holdout_text, holdout_id=piece.id)
+        assert_brief_is_not_the_post(brief, holdout_text)
 
         rag_prompts: list[str] = []
         base_prompts: list[str] = []
@@ -551,7 +592,7 @@ def run_eval_write_holdout(
         )
         # The guard scores drafts against the same brief the model saw.
         score = score_rag_vs_base(
-            piece.text,
+            holdout_text,
             rag_result["text"],
             base_result["text"],
             brief["guard_facts"],
@@ -563,7 +604,7 @@ def run_eval_write_holdout(
             _item_receipt(
                 holdout_id=piece.id,
                 brief=brief,
-                holdout_text=piece.text,
+                holdout_text=holdout_text,
                 rag_result=rag_result,
                 base_result=base_result,
                 score=score,
@@ -598,8 +639,10 @@ def run_eval_write_holdout(
         "brief_mining": {
             "topic_word_cap": _TOPIC_WORD_CAP,
             "point_word_cap": _POINT_WORD_CAP,
+            "hard_brief_word_cap": _MAX_BRIEF_WORDS,
+            "min_points": _MIN_POINTS,
             "max_points": _MAX_POINTS,
-            "max_brief_leakage": _MAX_BRIEF_LEAKAGE,
+            "max_brief_overlap": _MAX_BRIEF_OVERLAP,
         },
         "raw_artifacts_saved": bool(save_raw),
         "wins": wins,
