@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 from personality_protect.cli import app
 from personality_protect.config import init_profile
 from personality_protect.models import Piece, save_index
+from personality_protect.style_profile import build_style_profile, save_style_profile
 from personality_protect.voice_index import build_voice_index
 from personality_protect.write import (
     mlx_generate_no_adapter,
@@ -58,8 +59,10 @@ def _contoso_pieces() -> list[Piece]:
 
 def _seed_contoso_index(tmp_path: Path) -> None:
     paths, _, _ = init_profile("contoso", home=tmp_path)
-    save_index(paths.index_path, _contoso_pieces())
+    pieces = _contoso_pieces()
+    save_index(paths.index_path, pieces)
     build_voice_index(paths, holdout_ids={"contoso-holdout"})
+    save_style_profile(paths, build_style_profile(pieces))
 
 
 @pytest.mark.parametrize("module", ["mlx", "mlx.nn", "mlx.core", "mlx_lm"])

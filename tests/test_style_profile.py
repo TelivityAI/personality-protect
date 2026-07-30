@@ -17,6 +17,7 @@ from personality_protect.style_profile import (
     corpus_style_stats,
     load_style_profile,
     run_build_style_profile,
+    style_directives,
     style_profile_path,
     text_style_axes,
 )
@@ -83,6 +84,50 @@ def test_build_style_profile_includes_banned_list():
     assert profile["banned_ai_filler"] == list(BANNED_AI_FILLER)
     assert "leverage" in profile["banned_ai_filler"]
     assert "moreover" in profile["banned_ai_filler"]
+
+
+def test_build_style_profile_records_median_post_words():
+    pieces = [
+        Piece(id="c1", source="linkedin_post", text=CONTOSO_VOICED, year=2024),
+        Piece(id="c2", source="linkedin_article", text=CONTOSO_ARTICLE, year=2024),
+    ]
+    stats = build_style_profile(pieces)["stats"]
+    assert stats["median_post_words"] > 0
+
+
+def test_style_directives_carry_cadence_without_copyable_prose():
+    """The voice card must describe the voice, never quote it."""
+    pieces = [
+        Piece(id="c1", source="linkedin_post", text=CONTOSO_VOICED, year=2024),
+        Piece(id="c2", source="linkedin_article", text=CONTOSO_ARTICLE, year=2024),
+    ]
+    profile = build_style_profile(pieces)
+    directives = style_directives(profile)
+    joined = " ".join(directives)
+
+    assert any("words total" in line for line in directives)
+    assert any("8 words or fewer" in line for line in directives)
+    assert "leverage" in joined  # banned list is stated, not used
+    for sentence in ("Category 12 isn't a feature", "Contoso Labs published"):
+        assert sentence not in joined
+
+
+def test_style_directives_reflect_you_versus_i_lean():
+    i_heavy = Piece(
+        id="i1",
+        source="linkedin_post",
+        text="I shipped the ledger. I owned the outage. I wrote the memo myself.",
+    )
+    directives = style_directives(build_style_profile([i_heavy]))
+    assert any("first person" in line for line in directives)
+
+    you_heavy = Piece(id="y1", source="linkedin_post", text=CONTOSO_VOICED)
+    directives = style_directives(build_style_profile([you_heavy]))
+    assert any("'you'" in line for line in directives)
+
+
+def test_style_directives_empty_profile_is_safe():
+    assert style_directives({}) == []
 
 
 def test_run_build_style_profile_writes_json(tmp_path: Path):

@@ -17,6 +17,7 @@ from personality_protect.chat_prompt import (
 )
 from personality_protect.config import DEFAULT_MLX_MODEL, ProfilePaths, load_config
 from personality_protect.prompt_write import build_write_messages
+from personality_protect.style_profile import load_style_profile, style_directives
 from personality_protect.voice_index import retrieve
 from personality_protect.writer_guards import (
     check_invention,
@@ -24,15 +25,16 @@ from personality_protect.writer_guards import (
     parrot_reject,
 )
 
-DEFAULT_WRITE_K = 5
-MIN_WRITE_K = 3
+# Five 120-word exemplars put ~600 words of the author's prose in front of the
+# model and it answered by continuing them: every RAG draft came back as a
+# multi-post dump while the exemplar-free arm wrote clean posts. Voice now
+# travels mainly as measured cadence targets, so two short excerpts suffice.
+DEFAULT_WRITE_K = 2
+MIN_WRITE_K = 0
 MAX_WRITE_K = 5
 DEFAULT_WRITE_MAX_TOKENS = 768
 MAX_WRITE_ATTEMPTS = 2
-# A retrieved piece can be thousands of words (pasted articles, HTML). Five of
-# them filled a 60 KB prompt and the model answered by continuing the exemplars
-# instead of writing. A short excerpt carries the rhythm the prompt asks for.
-MAX_EXEMPLAR_WORDS = 120
+MAX_EXEMPLAR_WORDS = 60
 
 # Generators take chat messages, not a flat string: the chat template can only
 # be applied where the tokenizer lives.
@@ -167,8 +169,8 @@ def run_write(
 
     config = load_config(paths)
     brief = build_brief(topic, points)
-    matches = retrieve(brief, k=k, profile=paths.name, home=paths.home)
-    if not matches:
+    matches = retrieve(brief, k=k, profile=paths.name, home=paths.home) if k else []
+    if k and not matches:
         raise FileNotFoundError(
             f"No voice exemplars indexed for profile {paths.name}. "
             "Run: personality-protect index-voice"
@@ -176,7 +178,13 @@ def run_write(
 
     exemplars = [str(match["text"]) for match in matches]
     masked = [mask_exemplar_entities(clip_exemplar(exemplar), brief) for exemplar in exemplars]
-    messages = build_write_messages(topic=topic, points=points, examples=masked)
+    directives = style_directives(load_style_profile(paths))
+    messages = build_write_messages(
+        topic=topic,
+        points=points,
+        examples=masked,
+        style_directives=directives,
+    )
 
     generator = generate_fn or mlx_generate_no_adapter
     model_id = config.base_model or DEFAULT_MLX_MODEL

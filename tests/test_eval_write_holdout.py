@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 from personality_protect.cli import app
 from personality_protect.config import init_profile
 from personality_protect.eval_write_holdout import (
+    _MAX_BRIEF_WORDS,
     assert_brief_is_not_the_post,
     assert_receipt_contoso_safe,
     brief_leakage_ratio,
@@ -27,6 +28,7 @@ from personality_protect.eval_write_holdout import (
     verify_holdouts_never_indexed,
 )
 from personality_protect.models import Piece, save_index
+from personality_protect.style_profile import build_style_profile, save_style_profile
 from personality_protect.voice_index import build_voice_index
 
 runner = CliRunner()
@@ -103,8 +105,10 @@ def _contoso_pieces() -> list[Piece]:
 
 def _seed_contoso_index(tmp_path: Path) -> None:
     paths, _, _ = init_profile("contoso", home=tmp_path)
-    save_index(paths.index_path, _contoso_pieces())
+    pieces = _contoso_pieces()
+    save_index(paths.index_path, pieces)
     build_voice_index(paths, holdout_ids={"contoso-holdout"})
+    save_style_profile(paths, build_style_profile(pieces))
 
 
 @pytest.mark.parametrize("module", ["mlx", "mlx.nn", "mlx.core", "mlx_lm"])
@@ -169,7 +173,12 @@ def test_g2_mine_brief_is_terse_bullets_not_the_post():
     # The miner fits the brief to a budget, so it may sit on the cap but the
     # guard must never have to reject its own output.
     assert brief_leakage_ratio(brief, text) <= 0.25
-    assert len((brief["topic"] + " " + brief["points"].replace("- ", "")).split()) <= 28
+    visible = brief["topic"] + " " + brief["points"].replace("- ", "")
+    assert len(visible.split()) <= _MAX_BRIEF_WORDS
+    # Bullets must be claims, not severed clauses the writer can only copy.
+    for bullet in brief["points"].splitlines():
+        last = bullet.replace("- ", "").split()[-1].strip(".,;:").casefold()
+        assert last not in {"is", "and", "the", "of", "to", "now", "a", "for"}
     # The internal invention allowlist is not model-visible; it can retain
     # source facts without turning the generation brief into an answer key.
     assert brief["guard_facts"] == text

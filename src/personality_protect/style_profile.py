@@ -159,6 +159,8 @@ def build_style_profile(
     piece_list = list(pieces)
     stats = corpus_style_stats(p.text for p in piece_list)
     banned = list(banned_phrases) if banned_phrases is not None else list(BANNED_AI_FILLER)
+    lengths = [len(_word_tokens(p.text)) for p in piece_list if (p.text or "").strip()]
+    stats["median_post_words"] = round(_median([float(n) for n in lengths]), 1)
     return {
         "version": 1,
         "built_at": datetime.now(timezone.utc).isoformat(),
@@ -166,6 +168,55 @@ def build_style_profile(
         "stats": stats,
         "banned_ai_filler": banned,
     }
+
+
+def style_directives(profile: dict[str, Any]) -> list[str]:
+    """Render the style card as prompt directives.
+
+    Derived numbers, not the author's sentences. The exemplar path hands the
+    model copyable text and it copies; cadence targets carry the same voice
+    signal with nothing to paste.
+    """
+    stats = profile.get("stats") or {}
+    directives: list[str] = []
+
+    median_sentence = float(stats.get("median_sentence_words") or 0)
+    if median_sentence:
+        directives.append(
+            f"Sentences average about {median_sentence:.0f} words. Vary them, "
+            "but do not write long academic sentences."
+        )
+
+    short_ratio = float(stats.get("short_line_ratio") or 0)
+    if short_ratio:
+        directives.append(
+            f"About {short_ratio * 100:.0f}% of lines are 8 words or fewer. "
+            "Use short standalone lines and frequent paragraph breaks."
+        )
+
+    median_post = float(stats.get("median_post_words") or 0)
+    if median_post:
+        directives.append(
+            f"Target roughly {median_post:.0f} words total. Never exceed "
+            f"{median_post * 1.5:.0f} words."
+        )
+
+    # Absent counts must stay silent: an empty profile asserting a pronoun lean
+    # would put a made-up voice rule in the prompt.
+    if int(stats.get("you_count") or 0) or int(stats.get("i_count") or 0):
+        if stats.get("you_gt_i"):
+            directives.append("Address the reader as 'you' more often than 'I'.")
+        else:
+            directives.append("Speak in first person more often than addressing 'you'.")
+
+    if float(stats.get("contraction_rate") or 0) > 0.01:
+        directives.append("Use contractions; write the way people speak.")
+
+    banned = [str(phrase) for phrase in (profile.get("banned_ai_filler") or [])][:12]
+    if banned:
+        directives.append("Never use these words: " + ", ".join(banned) + ".")
+
+    return directives
 
 
 def save_style_profile(paths: ProfilePaths, profile: dict[str, Any]) -> Path:

@@ -19,6 +19,9 @@ WRITE_SYSTEM_PROMPT = (
     "Rules:\n"
     "- Write ONE new post about the BRIEF. The BRIEF is the only source of "
     "content.\n"
+    "- Write exactly one post and then stop. Never write a second post, a "
+    "variant, an alternative version, or a separator line between posts.\n"
+    "- Follow the VOICE cadence targets, including the word count target.\n"
     "- The EXAMPLES are rhythm reference only: match their line lengths, "
     "paragraph breaks, and sentence cadence.\n"
     "- Never copy, quote, continue, summarize, or list the EXAMPLES. Reuse none "
@@ -47,20 +50,33 @@ _WRITE_INSTRUCTION_WITH_EXAMPLES = (
 )
 
 
+_STYLE_HEADER = "VOICE (cadence targets measured from the author's own posts):"
+
+
 def build_write_user_content(
     *,
     topic: str,
     points: str,
     examples: Sequence[str],
+    style_directives: Sequence[str] = (),
 ) -> str:
-    """User turn: optional exemplars, then the brief, then the instruction.
+    """User turn: voice card, optional exemplars, the brief, then the instruction.
 
     The bare-base arm omits the EXAMPLES section entirely — and every mention of
     EXAMPLES, down to the closing instruction — rather than emitting an empty
     header. Dangling scaffolding is exactly what the model echoes, and it would
     confound the RAG-vs-base comparison.
+
+    ``style_directives`` carry voice as measured numbers rather than copyable
+    prose, so the cadence signal survives even when few or no exemplars are
+    supplied.
     """
     blocks: list[str] = []
+    directives = [line.strip() for line in style_directives if line and line.strip()]
+    if directives:
+        blocks.append(
+            _STYLE_HEADER + "\n" + "\n".join(f"- {line}" for line in directives)
+        )
     kept = [example.strip() for example in examples if example and example.strip()]
     if kept:
         blocks.append(_EXAMPLES_HEADER + "\n\n" + _EXAMPLE_SEPARATOR.join(kept))
@@ -74,19 +90,36 @@ def build_write_messages(
     topic: str,
     points: str,
     examples: Sequence[str],
+    style_directives: Sequence[str] = (),
 ) -> list[dict[str, str]]:
     """Locked writing prompt as chat turns (system + user)."""
     return [
         {"role": "system", "content": WRITE_SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": build_write_user_content(topic=topic, points=points, examples=examples),
+            "content": build_write_user_content(
+                topic=topic,
+                points=points,
+                examples=examples,
+                style_directives=style_directives,
+            ),
         },
     ]
 
 
-def build_write_prompt(*, topic: str, points: str, examples: Sequence[str]) -> str:
+def build_write_prompt(
+    *,
+    topic: str,
+    points: str,
+    examples: Sequence[str],
+    style_directives: Sequence[str] = (),
+) -> str:
     """Flat rendering of the locked prompt (no chat template available)."""
     return flatten_chat_messages(
-        build_write_messages(topic=topic, points=points, examples=examples)
+        build_write_messages(
+            topic=topic,
+            points=points,
+            examples=examples,
+            style_directives=style_directives,
+        )
     )

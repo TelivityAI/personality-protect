@@ -46,9 +46,12 @@ from personality_protect.writer_guards import (
 TIE_EPSILON = 0.05
 BARE_BASE_EXAMPLES: tuple[str, ...] = ()
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
-_TOPIC_WORD_CAP = 8
+_TOPIC_WORD_CAP = 10
 _TOPIC_MIN_WORDS = 4
-_POINT_WORD_CAP = 7
+# A 7-word cap forced every bullet to be cut mid-sentence. Clause-boundary
+# fitting needs room to land on a complete claim; the overlap cap below is what
+# actually keeps the brief lossy.
+_POINT_WORD_CAP = 12
 _MIN_POINTS = 2
 _MAX_POINTS = 3
 # Below this a bullet is a fragment, not a claim worth handing to the model.
@@ -56,9 +59,33 @@ _MIN_POINT_WORDS = 3
 # The visible brief is deliberately lossy. This absolute cap prevents long
 # holdouts from receiving a long extract, while the overlap cap protects short
 # holdouts. Both count normalized words, not formatting markers.
-_MAX_BRIEF_WORDS = 28
+_MAX_BRIEF_WORDS = 40
 _MAX_BRIEF_OVERLAP = 0.25
 _WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
+_CLAUSE_SPLIT = re.compile(r"(?<=[,;:])\s+|\s+[—–]\s+")
+# Words that cannot end a claim. Kept deliberately small: articles, copulas,
+# conjunctions, prepositions, and bare temporal adverbs.
+_DANGLING_TAIL_WORDS = frozenset(
+    {
+        "a", "an", "the", "and", "or", "but", "nor", "so", "yet", "if", "then",
+        "than", "that", "which", "who", "whom", "whose", "as", "because",
+        "while", "when", "where", "is", "are", "was", "were", "be", "been",
+        "being", "am", "do", "does", "did", "has", "have", "had", "will",
+        "would", "can", "could", "should", "may", "might", "must", "of", "to",
+        "in", "on", "at", "by", "for", "with", "from", "into", "about", "over",
+        "under", "between", "through", "after", "before", "now", "just", "also",
+        "very", "not", "no", "more", "most", "one", "its", "it", "their",
+        "our", "your", "his", "her", "my",
+    }
+)
+_NUMBER_TAIL_WORDS = frozenset(
+    {
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+        "nine", "ten", "eleven", "twelve", "twenty", "thirty", "forty", "fifty",
+        "sixty", "seventy", "eighty", "ninety", "hundred", "thousand",
+        "million", "billion",
+    }
+)
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _MIN_HOLDOUT_WORDS = math.ceil(
     (_TOPIC_MIN_WORDS + _MIN_POINTS * _MIN_POINT_WORDS) / _MAX_BRIEF_OVERLAP
@@ -147,16 +174,87 @@ def _truncate_words(text: str, word_cap: int) -> str:
     return text[: matches[max(1, word_cap) - 1].end()].strip()
 
 
-def _mine_topic(sentences: Sequence[str], *, word_cap: int = _TOPIC_WORD_CAP) -> str:
-    """First sentence, extended while it is too short to name a subject."""
-    parts: list[str] = []
-    for sentence in sentences:
-        cleaned = _URL_RE.sub("", sentence).strip()
-        if cleaned:
-            parts.append(cleaned)
-        if len(_word_tokens(" ".join(parts))) >= _TOPIC_MIN_WORDS:
+def _strip_trailing_punctuation(text: str) -> str:
+    return text.strip().rstrip(".,;:—-").strip()
+
+
+def _is_dangling_tail(token: str) -> bool:
+    lowered = token.casefold()
+    # A severed quantity ("...by twelve percent over seven") reads as a fragment
+    # once its unit is gone, so a trailing bare number goes with the cut.
+    return lowered in _DANGLING_TAIL_WORDS or lowered in _NUMBER_TAIL_WORDS or token.isdigit()
+
+
+def _strip_dangling(text: str) -> str:
+    """Drop trailing words that leave a cut phrase grammatically mid-air.
+
+    Cutting a sentence short lands on words like "is" or "and", and a bullet
+    reading "IATA is now" is worse than no bullet: the writer copies the fragment
+    instead of making a claim. Only applied where a cut happened — a sentence
+    that fit whole is left exactly as the author ended it.
+    """
+    cleaned = _strip_trailing_punctuation(text)
+    while True:
+        tokens = _WORD_RE.findall(cleaned)
+        if not tokens or not _is_dangling_tail(tokens[-1]):
+            return cleaned
+        end = list(_WORD_RE.finditer(cleaned))[-1].start()
+        cleaned = _strip_trailing_punctuation(cleaned[:end])
+
+
+def _fit_phrase(sentence: str, word_cap: int) -> str:
+    """Longest self-contained phrase from ``sentence`` fitting ``word_cap``.
+
+    Whole sentence when it fits; otherwise the longest run of leading clauses
+    that fits, so cuts land on punctuation the author wrote. Word-count
+    truncation is the last resort and always has its dangling tail removed.
+    """
+    flat = re.sub(r"\s+", " ", _URL_RE.sub("", sentence)).strip()
+    if not flat:
+        return ""
+    if len(_word_tokens(flat)) <= word_cap:
+        return _strip_trailing_punctuation(flat)
+
+    clauses = [clause for clause in _CLAUSE_SPLIT.split(flat) if clause.strip()]
+    kept: list[str] = []
+    for clause in clauses:
+        candidate = " ".join([*kept, clause.strip()])
+        if len(_word_tokens(candidate)) > word_cap:
             break
-    return _truncate_words(" ".join(parts), word_cap).rstrip(".,;:—-")
+        kept.append(clause.strip())
+    if kept:
+        return _strip_dangling(" ".join(kept))
+    return _strip_dangling(_truncate_words(flat, word_cap))
+
+
+def _mine_topic_with_source(
+    sentences: Sequence[str],
+    *,
+    word_cap: int = _TOPIC_WORD_CAP,
+) -> tuple[str, int]:
+    """Subject line plus the index of the sentence it came from.
+
+    Openers are often interjections ("Sweet lord."). Concatenating them onto the
+    next sentence produced topics that read as a stray exclamation followed by a
+    severed clause, so short leads are skipped rather than glued. The index lets
+    the caller keep the topic's own sentence out of the bullet pool.
+    """
+    for index, sentence in enumerate(sentences):
+        cleaned = _URL_RE.sub("", sentence).strip()
+        if not cleaned or len(_word_tokens(cleaned)) < _TOPIC_MIN_WORDS:
+            continue
+        fitted = _fit_phrase(cleaned, word_cap)
+        if len(_word_tokens(fitted)) >= _TOPIC_MIN_WORDS:
+            return fitted, index
+    # Nothing stands alone: fall back to concatenation so a thin holdout still
+    # yields a topic instead of raising.
+    joined = " ".join(_URL_RE.sub("", s).strip() for s in sentences if s.strip())
+    return _strip_dangling(_truncate_words(joined, word_cap)), 0
+
+
+def _mine_topic(sentences: Sequence[str], *, word_cap: int = _TOPIC_WORD_CAP) -> str:
+    """Subject line mined from the holdout's opening sentences."""
+    return _mine_topic_with_source(sentences, word_cap=word_cap)[0]
 
 
 def _fact_score(sentence: str) -> float:
@@ -169,9 +267,7 @@ def _fact_score(sentence: str) -> float:
 
 def _to_bullet(sentence: str, *, word_cap: int = _POINT_WORD_CAP) -> str:
     """Collapse a sentence to one terse, single-line bullet."""
-    flat = re.sub(r"\s+", " ", _URL_RE.sub("", sentence)).strip()
-    flat = _truncate_words(flat, word_cap)
-    return "- " + flat.rstrip(".,;:—-")
+    return "- " + _fit_phrase(sentence, word_cap)
 
 
 def _content_word_count(topic: str, points: str) -> int:
@@ -229,12 +325,12 @@ def mine_brief_from_holdout(
 
     budget = min(_MAX_BRIEF_WORDS, int(holdout_words * max_overlap))
     sentences = _sentences(body)
-    topic = _mine_topic(
+    topic, topic_index = _mine_topic_with_source(
         sentences,
         word_cap=min(_TOPIC_WORD_CAP, budget - _MIN_POINTS * _MIN_POINT_WORDS),
     )
 
-    candidates = sentences[1:]
+    candidates = [s for i, s in enumerate(sentences) if i != topic_index]
     if len(candidates) < _MIN_POINTS:
         raise ValueError("holdout needs at least three sentences to mine two lossy bullets")
     ranked = sorted(
