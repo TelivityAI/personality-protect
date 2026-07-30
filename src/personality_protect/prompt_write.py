@@ -23,8 +23,10 @@ WRITE_SYSTEM_PROMPT = (
     "paragraph breaks, and sentence cadence.\n"
     "- Never copy, quote, continue, summarize, or list the EXAMPLES. Reuse none "
     "of their words, sentences, facts, names, numbers, or links.\n"
+    # Naming a placeholder here would put the very token we do not want in
+    # front of the model; the rule stays generic on purpose.
     "- Names have been removed from the EXAMPLES. Do not guess them, and never "
-    "output bracketed placeholders such as [ENTITY] or [NAME].\n"
+    "output bracketed or capitalized placeholders of any kind.\n"
     "- Do not invent companies, people, products, or figures the BRIEF did not "
     "give you.\n"
     "- No AI filler (leverage, delve, moreover, tapestry).\n"
