@@ -33,6 +33,13 @@ DEFAULT_PARROT_NGRAM = 8
 PARROT_COVERAGE_NGRAM = 5
 PARROT_COVERAGE_LIMIT = 0.3
 PARROT_COVERAGE_MIN_TOKENS = 40
+# The brief is the draft's own content source, so reusing its wording is
+# expected and a shared window means nothing. Only a draft that is *mostly*
+# brief text has skipped the writing.
+BRIEF_ECHO_LIMIT = 0.6
+# Unlike the exemplar check, the reference here is a handful of specific bullets
+# rather than general prose, so coverage is already meaningful on a short draft.
+BRIEF_ECHO_MIN_TOKENS = 12
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
 _ENTITY_RE = re.compile(
@@ -455,6 +462,26 @@ def parrot_reject(
     if len(_word_tokens(draft)) < coverage_min_tokens:
         return False
     return copied_token_ratio(draft, pool) >= coverage_limit
+
+
+def brief_echo_reject(
+    draft: str,
+    brief: str,
+    *,
+    limit: float = BRIEF_ECHO_LIMIT,
+    min_tokens: int = BRIEF_ECHO_MIN_TOKENS,
+) -> bool:
+    """Reject a draft that is little more than the brief handed back.
+
+    Deliberately looser than :func:`parrot_reject`: a post is *supposed* to use
+    the brief's facts and often its phrasing, so only near-total coverage counts.
+    A holdout draft that listed the mined bullets verbatim scored the best axis
+    distance of its arm while writing nothing at all.
+    """
+
+    if len(_word_tokens(draft)) < min_tokens:
+        return False
+    return copied_token_ratio(draft, [brief]) >= limit
 
 
 def check_invention(brief: str, draft: str) -> InventionResult:

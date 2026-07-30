@@ -34,6 +34,7 @@ from personality_protect.write import (
     run_write,
 )
 from personality_protect.writer_guards import (
+    brief_echo_reject,
     check_invention,
     extract_named_entity_keys,
     parrot_reject,
@@ -346,16 +347,18 @@ def score_draft_against_holdout(
     ref_axes = text_axes(holdout_text)
     draft_axes = text_axes(draft)
     invention = check_invention(brief, normalize_sentence_case(draft))
-    # The brief joins the copy-check pool: handing the mined bullets back is the
-    # other way to score a flattering distance without writing anything, and it
-    # is what the winning draft did on one holdout.
-    parroted = parrot_reject(draft, [*exemplars, brief])
+    parroted = parrot_reject(draft, list(exemplars))
+    # Handing the mined bullets back is the other way to score a flattering
+    # distance without writing anything, and it is what the winning draft did on
+    # one holdout.
+    echoed = brief_echo_reject(draft, brief)
     return {
         "distance": _axes_distance(ref_axes, draft_axes),
         "axes": draft_axes,
         "parrot_reject": parroted,
+        "brief_echo_reject": echoed,
         "invent_reject": not invention.passed,
-        "disqualified": bool(parroted or not invention.passed),
+        "disqualified": bool(parroted or echoed or not invention.passed),
         "invented_entities": sorted(invention.invented_entities),
         "invented_numbers": sorted(invention.invented_numbers),
         "invented_entities_count": len(invention.invented_entities),
@@ -451,6 +454,8 @@ def _item_receipt(
         "base_invent_reject": score["base"]["invent_reject"],
         "rag_parrot_reject": score["rag"]["parrot_reject"],
         "base_parrot_reject": score["base"]["parrot_reject"],
+        "rag_brief_echo_reject": score["rag"]["brief_echo_reject"],
+        "base_brief_echo_reject": score["base"]["brief_echo_reject"],
         "rag_disqualified": score["rag"]["disqualified"],
         "base_disqualified": score["base"]["disqualified"],
         "rag_invented_entities_count": score["rag"]["invented_entities_count"],

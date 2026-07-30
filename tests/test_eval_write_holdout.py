@@ -460,6 +460,6 @@ def test_draft_that_echoes_the_brief_is_disqualified():
 
     score = score_rag_vs_base(holdout, echo, echo, brief)
 
-    assert score["rag"]["parrot_reject"] is True
+    assert score["rag"]["brief_echo_reject"] is True
     assert score["rag"]["disqualified"] is True
     assert score["winner"] == "tie"

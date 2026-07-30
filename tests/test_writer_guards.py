@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from personality_protect.writer_guards import (
+    brief_echo_reject,
     check_invention,
     copied_token_ratio,
     find_parroted_ngrams,
@@ -248,3 +249,43 @@ def test_mask_exemplar_entities_keeps_ordinary_possessives():
     exemplar = "That's it. The industry's habit is confusing noise with progress."
 
     assert mask_exemplar_entities(exemplar, "") == exemplar
+
+
+def test_brief_echo_allows_a_post_built_from_the_brief():
+    """Reusing the brief's facts and wording is the job, not a failure."""
+    brief = (
+        "Topic: Contoso queue ownership\n"
+        "Points: - Name one owner per queue\n"
+        "- Watch one metric for a week\n"
+        "- Keep the rollback boring"
+    )
+    draft = (
+        "We named one owner per queue last month.\n"
+        "\n"
+        "Not a committee. One person who answers for the backlog and gets to "
+        "say no when the list grows.\n"
+        "\n"
+        "Then we watched one metric for a week and ignored the rest, because "
+        "every extra dashboard buys another argument.\n"
+        "\n"
+        "The rollback stayed boring on purpose. Boring is what you want at "
+        "two in the morning."
+    )
+
+    assert brief_echo_reject(draft, brief) is False
+
+
+def test_brief_echo_rejects_the_bullets_handed_back():
+    brief = (
+        "Topic: Contoso queue ownership\n"
+        "Points: - Name one owner per queue\n"
+        "- Watch one metric for a week\n"
+        "- Keep the rollback boring and reversible for the on-call engineer"
+    )
+    echo = (
+        "Name one owner per queue\n"
+        "Watch one metric for a week\n"
+        "Keep the rollback boring and reversible for the on-call engineer"
+    )
+
+    assert brief_echo_reject(echo, brief) is True
