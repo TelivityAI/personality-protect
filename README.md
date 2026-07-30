@@ -2,7 +2,7 @@
 
 **Stop sounding like everyone else's AI.**
 
-Draft LinkedIn posts and articles in *your* voice on your machine. Index your writing, measure your cadence, retrieve short rhythm references from your own pieces, and generate with a local quantized model (~5–7 GB). Your corpus never leaves this Mac.
+Draft LinkedIn posts and articles in *your* voice on your machine. Index your writing, measure your cadence, retrieve short rhythm references from your own pieces, and generate with a local quantized model (~5–7 GB). Your corpus never leaves your Mac.
 
 Built by [Telivity](https://telivity.com). Apache-2.0.
 
