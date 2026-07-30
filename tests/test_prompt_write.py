@@ -1,46 +1,77 @@
-"""Tests for the locked RAG writing prompt."""
+"""Tests for the locked RAG writing prompt (chat turns + flat fallback)."""
 
-from personality_protect.prompt_write import build_write_prompt
+from personality_protect.prompt_write import (
+    WRITE_SYSTEM_PROMPT,
+    build_write_messages,
+    build_write_prompt,
+)
 
 
-def test_build_write_prompt_matches_locked_template():
-    prompt = build_write_prompt(
+def test_build_write_messages_are_system_plus_user():
+    messages = build_write_messages(
         topic="Contoso's quarterly planning",
-        points="Keep the plan focused; name one accountable owner.",
+        points="- Keep the plan focused\n- Name one accountable owner",
         examples=[
             "Short lines.\nClear decisions.",
             "A plan is useful only when the owner is named.",
         ],
     )
 
-    assert prompt == (
-        "System: Write a LinkedIn post in the author's voice. "
-        "Match rhythm/lineation of EXAMPLES.\n"
-        "Do not copy facts or names from EXAMPLES unless they appear in the BRIEF.\n"
-        "No AI filler (leverage, delve, moreover, tapestry).\n"
-        "\n"
-        "EXAMPLES:\n"
-        "Short lines.\n"
-        "Clear decisions.\n"
-        "\n"
-        "A plan is useful only when the owner is named.\n"
-        "\n"
-        "BRIEF:\n"
-        "Topic: Contoso's quarterly planning\n"
-        "Points: Keep the plan focused; name one accountable owner.\n"
-        "\n"
-        "POST:"
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[0]["content"] == WRITE_SYSTEM_PROMPT
+    user = messages[1]["content"]
+    assert "EXAMPLES (voice reference only" in user
+    assert "Short lines.\nClear decisions." in user
+    assert "A plan is useful only when the owner is named." in user
+    assert "BRIEF:\nTopic: Contoso's quarterly planning\n" in user
+    assert "- Keep the plan focused" in user
+    assert "Write the post now." in user
+    # No trailing "POST:" completion cue — the chat template's assistant
+    # turn marker is the generation prompt, and "POST:" was scaffolding
+    # the old path echoed.
+    assert "POST:" not in user
+
+
+def test_build_write_prompt_flat_fallback_matches_locked_content():
+    prompt = build_write_prompt(
+        topic="Contoso's quarterly planning",
+        points="- Keep the plan focused\n- Name one accountable owner",
+        examples=[
+            "Short lines.\nClear decisions.",
+            "A plan is useful only when the owner is named.",
+        ],
     )
+
+    assert prompt.startswith(WRITE_SYSTEM_PROMPT)
+    assert "EXAMPLES (voice reference only" in prompt
+    assert "BRIEF:\nTopic: Contoso's quarterly planning\n" in prompt
+    assert prompt.endswith("Write the post now.\n")
+
+
+def test_bare_base_omits_examples_header_entirely():
+    """An empty EXAMPLES: header is scaffolding the model will echo."""
+    messages = build_write_messages(
+        topic="Contoso product updates",
+        points="- Explain what changed",
+        examples=[],
+    )
+    user = messages[1]["content"]
+    assert "EXAMPLES" not in user
+    assert user.startswith("BRIEF:\n")
+    assert "Write the post now." in user
 
 
 def test_build_write_prompt_preserves_contoso_example_order_and_lineation():
     prompt = build_write_prompt(
         topic="Contoso product updates",
-        points="Explain what changed.",
+        points="- Explain what changed",
         examples=["First Contoso example\nwith two lines.", "Second Contoso example."],
     )
 
-    examples_section = prompt.split("EXAMPLES:\n", 1)[1].split("\n\nBRIEF:", 1)[0]
+    examples_section = prompt.split(
+        "EXAMPLES (voice reference only — never reuse their facts or names):\n\n",
+        1,
+    )[1].split("\n\nBRIEF:", 1)[0]
     assert examples_section == (
-        "First Contoso example\nwith two lines.\n\nSecond Contoso example."
+        "First Contoso example\nwith two lines.\n\n---\n\nSecond Contoso example."
     )

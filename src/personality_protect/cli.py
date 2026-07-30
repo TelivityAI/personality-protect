@@ -567,7 +567,10 @@ def write_cmd(
 
     guard_failed = bool(result["parrot_reject"] or result["invent_reject"])
     if as_json:
-        typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+        # Prompt/messages carry the retrieved exemplars (personal text) and are
+        # for local debugging only — never part of the emitted receipt.
+        payload = {key: value for key, value in result.items() if key not in {"prompt", "messages"}}
+        typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
         if out and not guard_failed:
             out.write_text(result["text"] + "\n", encoding="utf-8")
         if guard_failed:
@@ -618,6 +621,12 @@ def eval_write_holdout_cmd(
         "--out",
         help="Write Contoso-safe receipt JSON (no draft bodies).",
     ),
+    save_raw: bool = typer.Option(
+        False,
+        "--save-raw/--no-save-raw",
+        help="Dump exact prompts and raw drafts under the profile's "
+        "gitignored dogfood/raw dir (personal text; never commit).",
+    ),
     profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
     home: Optional[Path] = typer.Option(None, "--home"),
     as_json: bool = typer.Option(False, "--json"),
@@ -646,6 +655,7 @@ def eval_write_holdout_cmd(
             ids,
             k=k,
             max_tokens=max_tokens,
+            save_raw=save_raw,
         )
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -676,10 +686,15 @@ def eval_write_holdout_cmd(
             f"  {item['holdout_id']}: winner={item['winner']} "
             f"Δ={item['delta_base_minus_rag']} "
             f"rag_dist={item['rag_distance']} base_dist={item['base_distance']} "
-            f"invent rag={item['rag_invent_reject']} base={item['base_invent_reject']}"
+            f"invent rag={item['rag_invent_reject']} base={item['base_invent_reject']} "
+            f"brief_leak={item['brief_leakage_ratio']}"
         )
     if out:
         console.print(f"[dim]wrote receipt {out}[/dim]")
+    if save_raw:
+        console.print(
+            "[dim]raw prompts/drafts under profile dogfood/raw (personal text — never commit)[/dim]"
+        )
 
 
 @app.command("download")

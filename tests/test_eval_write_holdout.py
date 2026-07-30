@@ -14,9 +14,12 @@ from typer.testing import CliRunner
 from personality_protect.cli import app
 from personality_protect.config import init_profile
 from personality_protect.eval_write_holdout import (
+    assert_brief_is_not_the_post,
     assert_receipt_contoso_safe,
+    brief_leakage_ratio,
     load_holdout_pieces,
     mine_brief_from_holdout,
+    raw_artifacts_dir,
     run_bare_base_write,
     run_eval_write_holdout,
     score_rag_vs_base,
@@ -66,7 +69,10 @@ def _contoso_pieces() -> list[Piece]:
                 "\n"
                 "You name one owner.\n"
                 "\n"
-                "Keep Contoso Ledger boring."
+                "Keep Contoso Ledger boring.\n"
+                "\n"
+                "Cut exceptions by 12% over seven weeks or stop pretending "
+                "the roadmap is the work."
             ),
         ),
     ]
@@ -125,40 +131,70 @@ def test_g1_fails_when_holdout_leaked_into_index(tmp_path: Path):
         )
 
 
-def test_g2_mine_brief_from_holdout_contoso():
+def test_g2_mine_brief_is_terse_bullets_not_the_post():
     text = (
         "Customer pricing and packaging lessons belong in the private holdout.\n"
         "\n"
-        "You name one owner."
+        "You name one owner.\n"
+        "\n"
+        "Keep Contoso Ledger boring.\n"
+        "\n"
+        "Cut exceptions by 12% over seven weeks or stop pretending "
+        "the roadmap is the work."
     )
     brief = mine_brief_from_holdout(text, holdout_id="contoso-holdout")
+
     assert brief["holdout_id"] == "contoso-holdout"
     assert brief["topic"].startswith("Customer pricing")
-    assert "private holdout" in brief["points"]
-    assert "You name one owner" in brief["points"]
+    # Points are bullets, not the body. Short Contoso posts may yield only one
+    # bullet under the leakage budget; that is fine — the fail-closed check is
+    # "not the post", not "at least N bullets".
+    assert brief["points"] != text
+    assert brief["points"].startswith("- ")
+    assert "12%" in brief["points"] or "Contoso" in brief["points"]
+    # Cap: a brief that hands back the whole post is an answer key.
+    assert_brief_is_not_the_post(brief, text)
+    assert brief_leakage_ratio(brief, text) <= 0.6
+    # Guard facts are the same brief the model sees — never the raw body.
+    assert brief["guard_facts"] == (f"Topic: {brief['topic']}\nPoints: {brief['points']}")
+    assert text not in brief["guard_facts"]
     # Contoso-safe: no personal markers in mined brief.
     blob = (brief["topic"] + "\n" + brief["points"]).lower()
     for token in ("linkedin.com", "@gmail", "dusan"):
         assert token not in blob
 
 
-def test_g3_bare_base_prompt_has_no_exemplars():
-    calls: list[str] = []
+def test_g2_mine_brief_is_deterministic():
+    text = (
+        "Platform migrations need careful service boundaries.\n"
+        "\n"
+        "Name one owner before you start Contoso Ledger."
+    )
+    a = mine_brief_from_holdout(text, holdout_id="x")
+    b = mine_brief_from_holdout(text, holdout_id="x")
+    assert a == b
 
-    def fake_generate(prompt: str, **_kwargs: object) -> str:
-        calls.append(prompt)
+
+def test_g3_bare_base_prompt_has_no_exemplars():
+    calls: list = []
+
+    def fake_generate(messages, **_kwargs: object) -> str:
+        calls.append(messages)
         return "Contoso names one owner and keeps Ledger boring."
 
     result = run_bare_base_write(
         "Contoso pricing",
-        "Name one owner; keep Ledger boring.",
+        "- Name one owner\n- Keep Ledger boring",
         generate_fn=fake_generate,
         base_model="mlx-community/Qwen3.5-9B-4bit",
     )
 
     assert len(calls) == 1
-    assert "EXAMPLES:\n\nBRIEF:" in calls[0]
-    assert "Pricing experiments work" not in calls[0]
+    user = calls[0][1]["content"]
+    # Empty EXAMPLES header is scaffolding — it must be absent entirely.
+    assert "EXAMPLES" not in user
+    assert user.startswith("BRIEF:\n")
+    assert "Pricing experiments work" not in user
     assert result["mode"] == "bare_base"
     assert result["adapter"] == "none"
     assert result["k"] == 0
@@ -218,20 +254,22 @@ def test_g5_run_eval_write_holdout_receipt_contoso_safe(tmp_path: Path):
     _seed_contoso_index(tmp_path)
     paths, _, _ = init_profile("contoso", home=tmp_path)
 
-    def rag_generate(prompt: str, **_kwargs: object) -> str:
-        assert "EXAMPLES:" in prompt
-        examples_section = prompt.split("EXAMPLES:\n", 1)[1].split("\nBRIEF:", 1)[0]
-        # Holdout body may appear in BRIEF (mined points) but never as an exemplar.
+    def rag_generate(messages, **_kwargs: object) -> str:
+        user = messages[1]["content"]
+        assert "EXAMPLES (voice reference only" in user
+        examples_section = user.split("EXAMPLES", 1)[1].split("\n\nBRIEF:", 1)[0]
+        # Holdout body must never appear as an exemplar.
         assert "private holdout" not in examples_section
         assert "contoso-holdout" not in examples_section
-        return (
-            "Customer pricing needs one owner.\n"
-            "\n"
-            "You keep Contoso Ledger boring."
-        )
+        # Brief points must be bullets, not the full holdout.
+        brief_section = user.split("BRIEF:\n", 1)[1]
+        assert "Cut exceptions by 12%" in brief_section or "owner" in brief_section
+        assert brief_section.count("\n") >= 1
+        return "Customer pricing needs one owner.\n\nYou keep Contoso Ledger boring."
 
-    def base_generate(prompt: str, **_kwargs: object) -> str:
-        assert "EXAMPLES:\n\nBRIEF:" in prompt
+    def base_generate(messages, **_kwargs: object) -> str:
+        user = messages[1]["content"]
+        assert "EXAMPLES" not in user
         return (
             "A quarterly Contoso pricing bulletin outlined packaging lessons "
             "and private holdout alignment for regional customer segments "
@@ -244,6 +282,7 @@ def test_g5_run_eval_write_holdout_receipt_contoso_safe(tmp_path: Path):
         k=3,
         generate_fn=rag_generate,
         generate_fn_base=base_generate,
+        save_raw=True,
     )
 
     assert receipt["kind"] == "eval_write_holdout"
@@ -254,31 +293,39 @@ def test_g5_run_eval_write_holdout_receipt_contoso_safe(tmp_path: Path):
     assert receipt["carve"]["voice_index"] == "voice_index"
     assert receipt["wins"]["rag"] + receipt["wins"]["base"] + receipt["wins"]["tie"] == 1
     assert "contoso-holdout" not in (receipt["items"][0].get("exemplar_ids") or [])
+    assert receipt["items"][0]["brief_leakage_ratio"] < 0.6
+    assert receipt["raw_artifacts_saved"] is True
     assert_receipt_contoso_safe(receipt)
     blob = json.dumps(receipt).lower()
     # Receipt omits draft/holdout bodies (word counts only).
     assert "private holdout" not in blob
     assert "text" not in receipt["items"][0]
+    assert "prompt" not in receipt["items"][0]
+
+    raw_dir = raw_artifacts_dir(paths)
+    for arm in ("rag", "bare_base"):
+        prompt_path = raw_dir / f"contoso-holdout.{arm}.prompt.txt"
+        draft_path = raw_dir / f"contoso-holdout.{arm}.draft.txt"
+        assert prompt_path.is_file()
+        assert draft_path.is_file()
+        assert prompt_path.read_text(encoding="utf-8").strip()
+        assert draft_path.read_text(encoding="utf-8").strip()
 
 
 def test_cli_eval_write_holdout_json_receipt(tmp_path: Path):
     _seed_contoso_index(tmp_path)
 
-    rag = (
-        "Customer pricing needs one owner.\n"
-        "\n"
-        "You keep Contoso Ledger boring."
-    )
+    rag = "Customer pricing needs one owner.\n\nYou keep Contoso Ledger boring."
     base = (
         "A Contoso pricing bulletin described packaging lessons for regional "
         "customer segments after leadership consultation across three continents."
     )
-    calls: list[str] = []
+    calls: list = []
 
-    def fake_mlx(prompt: str, **_kwargs: object) -> str:
-        calls.append(prompt)
-        # First call(s) are RAG (has exemplar body); bare-base has empty EXAMPLES.
-        if "EXAMPLES:\n\nBRIEF:" in prompt:
+    def fake_mlx(messages, **_kwargs: object) -> str:
+        calls.append(messages)
+        user = messages[1]["content"]
+        if "EXAMPLES" not in user:
             return base
         return rag
 

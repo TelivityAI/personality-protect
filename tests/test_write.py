@@ -98,14 +98,21 @@ def test_write_module_import_does_not_import_mlx():
     assert not [name for name in sys.modules if name.split(".", 1)[0] == "mlx"]
 
 
-def test_mlx_generate_no_adapter_never_passes_adapter_path(tmp_path: Path):
-    """Write-path MLX load must force adapter_path=None."""
+def test_mlx_generate_no_adapter_applies_chat_template_and_never_passes_adapter(
+    tmp_path: Path,
+):
+    """Write-path MLX load must force adapter_path=None and wrap the chat turns."""
     load_calls: list[dict] = []
 
     fake_model = object()
     fake_tokenizer = MagicMock()
-    fake_tokenizer.has_chat_template = False
-    fake_tokenizer.chat_template = None
+    fake_tokenizer.has_chat_template = True
+    fake_tokenizer.chat_template = "unused"
+    fake_tokenizer.apply_chat_template.return_value = (
+        "<|im_start|>system\nBe brief.<|im_end|>\n"
+        "<|im_start|>user\nWrite Contoso.<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
 
     def fake_load(model_id, adapter_path=None, **kwargs):
         load_calls.append({"model_id": model_id, "adapter_path": adapter_path, **kwargs})
@@ -114,6 +121,11 @@ def test_mlx_generate_no_adapter_never_passes_adapter_path(tmp_path: Path):
     fake_mlx_lm = MagicMock()
     fake_mlx_lm.load = fake_load
     fake_mlx_lm.generate = MagicMock(return_value="Contoso ships Ledger quietly.")
+    sink: list[str] = []
+    messages = [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Write Contoso."},
+    ]
 
     with (
         patch.dict("sys.modules", {"mlx_lm": fake_mlx_lm}),
@@ -122,16 +134,22 @@ def test_mlx_generate_no_adapter_never_passes_adapter_path(tmp_path: Path):
         patch("personality_protect.mlx_runtime.release_mlx_memory"),
     ):
         out = mlx_generate_no_adapter(
-            "POST:\n",
+            messages,
             base_model="mlx-community/Qwen3.5-9B-4bit",
             max_tokens=64,
+            prompt_sink=sink,
         )
 
     assert out == "Contoso ships Ledger quietly."
-    assert load_calls == [
-        {"model_id": "mlx-community/Qwen3.5-9B-4bit", "adapter_path": None}
-    ]
-    fake_mlx_lm.generate.assert_called_once()
+    assert load_calls == [{"model_id": "mlx-community/Qwen3.5-9B-4bit", "adapter_path": None}]
+    fake_tokenizer.apply_chat_template.assert_called_once()
+    call_kwargs = fake_tokenizer.apply_chat_template.call_args.kwargs
+    assert call_kwargs["add_generation_prompt"] is True
+    assert call_kwargs["enable_thinking"] is False
+    assert call_kwargs["tokenize"] is False
+    generate_kwargs = fake_mlx_lm.generate.call_args.kwargs
+    assert generate_kwargs["prompt"].startswith("<|im_start|>system")
+    assert sink == [generate_kwargs["prompt"]]
 
 
 def test_run_write_retrieves_masks_and_returns_adapter_none_receipt(tmp_path: Path):
@@ -139,13 +157,15 @@ def test_run_write_retrieves_masks_and_returns_adapter_none_receipt(tmp_path: Pa
     paths, config, _ = init_profile("contoso", home=tmp_path)
     assert config.write_adapter is None
 
-    def fake_generate(prompt: str, **_kwargs: object) -> str:
-        assert "EXAMPLES:" in prompt
-        assert "BRIEF:" in prompt
-        assert "Topic: Contoso pricing" in prompt
-        assert "Fabrikam" not in prompt  # nothing to invent from fixtures
+    def fake_generate(messages, **_kwargs: object) -> str:
+        assert [message["role"] for message in messages] == ["system", "user"]
+        user = messages[1]["content"]
+        assert "EXAMPLES (voice reference only" in user
+        assert "BRIEF:" in user
+        assert "Topic: Contoso pricing" in user
+        assert "Fabrikam" not in user  # nothing to invent from fixtures
         # Masked exemplars should not leave holdout text in the prompt.
-        assert "private holdout" not in prompt
+        assert "private holdout" not in user
         return (
             "Contoso pricing tests work when one owner watches renewal signals.\n"
             "Keep the experiment boring."
@@ -186,8 +206,8 @@ def test_run_write_regenerates_once_on_parrot_guard(tmp_path: Path):
         "renewal signals without copying last quarter's memo."
     )
 
-    def fake_generate(prompt: str, **_kwargs: object) -> str:
-        calls.append(prompt)
+    def fake_generate(messages, **_kwargs: object) -> str:
+        calls.append(messages)
         return parrot if len(calls) == 1 else clean
 
     result = run_write(
@@ -213,7 +233,7 @@ def test_run_write_regenerates_once_on_invent_guard(tmp_path: Path):
     invented = "Contoso should copy Fabrikam and cut Ledger exceptions by 18%."
     clean = "Contoso should name one owner and simplify Ledger exceptions."
 
-    def fake_generate(prompt: str, **_kwargs: object) -> str:
+    def fake_generate(messages, **_kwargs: object) -> str:
         calls.append(1)
         return invented if len(calls) == 1 else clean
 
@@ -251,7 +271,7 @@ def test_run_write_reports_guard_failure_after_one_regen(tmp_path: Path):
     paths, _, _ = init_profile("contoso", home=tmp_path)
     calls: list[int] = []
 
-    def fake_generate(prompt: str, **_kwargs: object) -> str:
+    def fake_generate(messages, **_kwargs: object) -> str:
         calls.append(1)
         return "Contoso should copy Fabrikam and cut exceptions by 18%."
 

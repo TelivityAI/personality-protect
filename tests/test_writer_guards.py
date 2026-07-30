@@ -13,8 +13,7 @@ from personality_protect.writer_guards import (
 def test_mask_exemplar_entities_absent_from_brief():
     brief = "Contoso is launching Ledger for operations teams."
     exemplar = (
-        "Fabrikam rebuilt its queue with Northwind Traders. "
-        "Contoso kept Ledger deliberately small."
+        "Fabrikam rebuilt its queue with Northwind Traders. Contoso kept Ledger deliberately small."
     )
 
     masked = mask_exemplar_entities(exemplar, brief)
@@ -91,3 +90,45 @@ def test_invention_guard_uses_brief_not_exemplar_entities():
     # Exemplar text is deliberately not an input to the invention guard.
     assert "Fabrikam" in exemplar
     assert check_invention(brief, draft).passed is False
+
+
+def test_invention_guard_ignores_common_nouns_and_prompt_scaffolding():
+    """Real signal only: ordinary words and section labels are not entities.
+
+    The dogfood smoke run flagged ``brief``, ``examples``, ``entity``,
+    ``match``, and ``ai`` as invented companies — every draft failed, so the
+    single regen carried no information. Those must pass cleanly.
+    """
+    brief = "Topic: Contoso pricing\nPoints: Keep the test boring; name one owner."
+    draft = (
+        "Keep the Match boring.\n"
+        "\n"
+        "Examples help, but AI is not the Brief.\n"
+        "\n"
+        "Name one owner before you ship Contoso."
+    )
+
+    result = check_invention(brief, draft)
+
+    assert result.passed is True
+    assert result.invented_entities == frozenset()
+
+
+def test_invention_guard_still_catches_real_proper_names_and_numbers():
+    brief = "Topic: Contoso pricing\nPoints: Name one owner; keep Ledger boring."
+    draft = "Contoso should copy Fabrikam and Northwind Traders, then cut exceptions by 18%."
+
+    result = check_invention(brief, draft)
+
+    assert result.passed is False
+    assert "fabrikam" in result.invented_entities
+    # Ordinary second token ("Traders") is shed; the unfamiliar stem remains.
+    assert "northwind" in result.invented_entities
+    assert "18%" in result.invented_numbers
+
+
+def test_invention_guard_ignores_sentence_initial_verbs():
+    brief = "Topic: Contoso ops\nPoints: Name one owner."
+    draft = "Stop pretending the roadmap is the work.\nKeep Contoso boring."
+
+    assert check_invention(brief, draft).passed is True

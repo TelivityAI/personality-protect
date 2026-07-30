@@ -7,11 +7,16 @@ MLX is imported only inside :func:`mlx_generate_no_adapter`, behind the
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, MutableSequence, Sequence
 from typing import Any
 
+from personality_protect.chat_prompt import (
+    Message,
+    flatten_chat_messages,
+    render_chat_prompt,
+)
 from personality_protect.config import DEFAULT_MLX_MODEL, ProfilePaths, load_config
-from personality_protect.prompt_write import build_write_prompt
+from personality_protect.prompt_write import build_write_messages
 from personality_protect.voice_index import retrieve
 from personality_protect.writer_guards import (
     check_invention,
@@ -25,19 +30,28 @@ MAX_WRITE_K = 5
 DEFAULT_WRITE_MAX_TOKENS = 768
 MAX_WRITE_ATTEMPTS = 2
 
+# Generators take chat messages, not a flat string: the chat template can only
+# be applied where the tokenizer lives.
 GenerateFn = Callable[..., str]
+PromptSink = MutableSequence[str]
 
 
 def mlx_generate_no_adapter(
-    prompt: str,
+    messages: Sequence[Message],
     *,
     base_model: str,
     max_tokens: int = DEFAULT_WRITE_MAX_TOKENS,
+    prompt_sink: PromptSink | None = None,
 ) -> str:
     """Generate from MLX base weights with ``adapter_path=None``.
 
     The write path is RAG-only: a LoRA adapter is never loaded, even when one
     exists on disk. Tests inject ``generate_fn`` instead of calling this.
+
+    ``messages`` are rendered through the tokenizer's chat template. Skipping
+    that step makes the instruct model continue the prompt as a document and
+    echo its section headers back. ``prompt_sink`` receives the exact final
+    prompt string so callers can persist it for human review.
     """
     from personality_protect.mlx_runtime import (
         assert_mlx_import_allowed,
@@ -51,6 +65,13 @@ def mlx_generate_no_adapter(
         from mlx_lm import generate, load
 
         model, tokenizer = load(base_model, adapter_path=None)
+        prompt = render_chat_prompt(
+            tokenizer,
+            messages,
+            fallback=flatten_chat_messages(messages),
+        )
+        if prompt_sink is not None:
+            prompt_sink.append(prompt)
         output = generate(
             model,
             tokenizer,
@@ -80,9 +101,11 @@ def normalize_sentence_case(draft: str) -> str:
     text = draft or ""
     kept = {match.group(1) for match in _MID_SENTENCE_CAP_RE.finditer(text)}
     return _SENTENCE_START_WORD_RE.sub(
-        lambda match: match.group(1)
-        if match.group(1) in kept
-        else match.group(1)[0].lower() + match.group(1)[1:],
+        lambda match: (
+            match.group(1)
+            if match.group(1) in kept
+            else match.group(1)[0].lower() + match.group(1)[1:]
+        ),
         text,
     )
 
@@ -110,6 +133,7 @@ def run_write(
     k: int = DEFAULT_WRITE_K,
     max_tokens: int = DEFAULT_WRITE_MAX_TOKENS,
     generate_fn: GenerateFn | None = None,
+    prompt_sink: PromptSink | None = None,
 ) -> dict[str, Any]:
     """Retrieve exemplars, generate a draft, regenerate once on guard failure."""
     topic = topic.strip()
@@ -132,7 +156,7 @@ def run_write(
 
     exemplars = [str(match["text"]) for match in matches]
     masked = [mask_exemplar_entities(exemplar, brief) for exemplar in exemplars]
-    prompt = build_write_prompt(topic=topic, points=points, examples=masked)
+    messages = build_write_messages(topic=topic, points=points, examples=masked)
 
     generator = generate_fn or mlx_generate_no_adapter
     model_id = config.base_model or DEFAULT_MLX_MODEL
@@ -142,7 +166,12 @@ def run_write(
     attempts = 0
     for attempts in range(1, MAX_WRITE_ATTEMPTS + 1):
         draft = str(
-            generator(prompt, base_model=model_id, max_tokens=max_tokens)
+            generator(
+                messages,
+                base_model=model_id,
+                max_tokens=max_tokens,
+                prompt_sink=prompt_sink,
+            )
         ).strip()
         guards = _guard_flags(brief, draft, exemplars)
         if not guards["parrot_reject"] and not guards["invent_reject"]:
@@ -158,4 +187,7 @@ def run_write(
         "exemplar_ids": [str(match["id"]) for match in matches],
         "attempts": attempts,
         **guards,
+        # Local-only debugging aids; CLI/receipts strip these (personal text).
+        "messages": messages,
+        "prompt": flatten_chat_messages(messages),
     }

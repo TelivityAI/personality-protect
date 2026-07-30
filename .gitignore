@@ -36,6 +36,10 @@ linkedin_export/
 train_result.json
 adapter_meta.json
 
+# Raw write prompts / drafts kept for human review — verbatim personal text
+dogfood/
+**/dogfood/
+
 
 # Archives / dumps that often hold personal exports
 *.zip
