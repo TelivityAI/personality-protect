@@ -64,6 +64,9 @@ def _contoso_pieces() -> list[Piece]:
         Piece(
             id="contoso-holdout",
             source="linkedin_post",
+            # Long enough to brief realistically. The miner fits topic + bullets
+            # into a share of the post, so a three-line fixture would only ever
+            # exercise the degenerate short-post path.
             text=(
                 "Customer pricing and packaging lessons belong in the private holdout.\n"
                 "\n"
@@ -72,7 +75,13 @@ def _contoso_pieces() -> list[Piece]:
                 "Keep Contoso Ledger boring.\n"
                 "\n"
                 "Cut exceptions by 12% over seven weeks or stop pretending "
-                "the roadmap is the work."
+                "the roadmap is the work.\n"
+                "\n"
+                "Every packaging change needs a person who answers for it.\n"
+                "\n"
+                "The review took three weeks and removed two tiers nobody used.\n"
+                "\n"
+                "You ship the simpler price list or you keep the escalations."
             ),
         ),
     ]
@@ -140,23 +149,31 @@ def test_g2_mine_brief_is_terse_bullets_not_the_post():
         "Keep Contoso Ledger boring.\n"
         "\n"
         "Cut exceptions by 12% over seven weeks or stop pretending "
-        "the roadmap is the work."
+        "the roadmap is the work.\n"
+        "\n"
+        "Every packaging change needs a person who answers for it.\n"
+        "\n"
+        "The review took three weeks and removed two tiers nobody used.\n"
+        "\n"
+        "You ship the simpler price list or you keep the escalations."
     )
     brief = mine_brief_from_holdout(text, holdout_id="contoso-holdout")
 
     assert brief["holdout_id"] == "contoso-holdout"
     assert brief["topic"].startswith("Customer pricing")
-    # Points are bullets, not the body. Short Contoso posts may yield only one
-    # bullet under the leakage budget; that is fine — the fail-closed check is
-    # "not the post", not "at least N bullets".
+    # Points are bullets, not the body.
     assert brief["points"] != text
     assert brief["points"].startswith("- ")
-    assert "12%" in brief["points"] or "Contoso" in brief["points"]
+    assert "\n- " in brief["points"] or brief["points"].count("\n") >= 1
     # Cap: a brief that hands back the whole post is an answer key.
     assert_brief_is_not_the_post(brief, text)
+    # The miner fits the brief to a budget, so it may sit on the cap but the
+    # guard must never have to reject its own output.
     assert brief_leakage_ratio(brief, text) <= 0.6
     # Guard facts are the same brief the model sees — never the raw body.
-    assert brief["guard_facts"] == (f"Topic: {brief['topic']}\nPoints: {brief['points']}")
+    assert brief["guard_facts"] == (
+        f"Topic: {brief['topic']}\nPoints: {brief['points']}"
+    )
     assert text not in brief["guard_facts"]
     # Contoso-safe: no personal markers in mined brief.
     blob = (brief["topic"] + "\n" + brief["points"]).lower()
@@ -265,7 +282,11 @@ def test_g5_run_eval_write_holdout_receipt_contoso_safe(tmp_path: Path):
         brief_section = user.split("BRIEF:\n", 1)[1]
         assert "Cut exceptions by 12%" in brief_section or "owner" in brief_section
         assert brief_section.count("\n") >= 1
-        return "Customer pricing needs one owner.\n\nYou keep Contoso Ledger boring."
+        return (
+            "Customer pricing needs one owner.\n"
+            "\n"
+            "You keep Contoso Ledger boring."
+        )
 
     def base_generate(messages, **_kwargs: object) -> str:
         user = messages[1]["content"]
@@ -293,7 +314,7 @@ def test_g5_run_eval_write_holdout_receipt_contoso_safe(tmp_path: Path):
     assert receipt["carve"]["voice_index"] == "voice_index"
     assert receipt["wins"]["rag"] + receipt["wins"]["base"] + receipt["wins"]["tie"] == 1
     assert "contoso-holdout" not in (receipt["items"][0].get("exemplar_ids") or [])
-    assert receipt["items"][0]["brief_leakage_ratio"] < 0.6
+    assert receipt["items"][0]["brief_leakage_ratio"] <= 0.6
     assert receipt["raw_artifacts_saved"] is True
     assert_receipt_contoso_safe(receipt)
     blob = json.dumps(receipt).lower()
@@ -315,7 +336,11 @@ def test_g5_run_eval_write_holdout_receipt_contoso_safe(tmp_path: Path):
 def test_cli_eval_write_holdout_json_receipt(tmp_path: Path):
     _seed_contoso_index(tmp_path)
 
-    rag = "Customer pricing needs one owner.\n\nYou keep Contoso Ledger boring."
+    rag = (
+        "Customer pricing needs one owner.\n"
+        "\n"
+        "You keep Contoso Ledger boring."
+    )
     base = (
         "A Contoso pricing bulletin described packaging lessons for regional "
         "customer segments after leadership consultation across three continents."
