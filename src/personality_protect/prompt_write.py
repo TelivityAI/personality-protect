@@ -8,6 +8,8 @@ from collections.abc import Sequence
 def build_write_prompt(*, topic: str, points: str, examples: Sequence[str]) -> str:
     """Render the locked writing prompt with retrieved examples and a brief."""
     examples_text = "\n\n".join(examples)
+    # Empty EXAMPLES still leave a blank line before BRIEF (bare-base eval).
+    examples_block = f"{examples_text}\n\n" if examples_text else "\n"
     return (
         "System: Write a LinkedIn post in the author's voice. "
         "Match rhythm/lineation of EXAMPLES.\n"
@@ -15,8 +17,7 @@ def build_write_prompt(*, topic: str, points: str, examples: Sequence[str]) -> s
         "No AI filler (leverage, delve, moreover, tapestry).\n"
         "\n"
         "EXAMPLES:\n"
-        f"{examples_text}\n"
-        "\n"
+        f"{examples_block}"
         "BRIEF:\n"
         f"Topic: {topic}\n"
         f"Points: {points}\n"

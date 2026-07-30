@@ -293,6 +293,7 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 | `index-voice` | Build local retrieval index (Camp A RAG) |
 | `build-style-profile` | Corpus style stats + banned filler list |
 | `write` | Draft from retrieved exemplars (`adapter=none`) |
+| `eval-write-holdout` | RAG vs bare-base holdout ear (Contoso-safe receipt) |
 | `select` | Gate corpus by length / year / source |
 | `train` | Legacy LoRA train (**not** product path) |
 | `filter` | Legacy translator rewrite (**not** product path) |

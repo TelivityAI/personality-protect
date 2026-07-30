@@ -48,6 +48,10 @@ from personality_protect.eval_compare import (
     run_eval,
     specificity_scorecard,
 )
+from personality_protect.eval_write_holdout import (
+    run_eval_write_holdout,
+    write_receipt,
+)
 from personality_protect.filter import (
     filter_draft,
     paragraph_windows,
@@ -189,7 +193,7 @@ def main(
         typer.echo("")
         typer.echo(
             "Commands: init | download | ingest | index-voice | build-style-profile | "
-            "select | write | train | filter | "
+            "select | write | eval-write-holdout | train | filter | "
             "eval | compare | scorecard | pair-gate | sterile-check | "
             "translator-eval | demo | api | logo | status"
         )
@@ -589,6 +593,93 @@ def write_cmd(
         out.write_text(result["text"] + "\n", encoding="utf-8")
         console.print(f"[dim]wrote {out}[/dim]")
     console.print(result["text"])
+
+
+@app.command("eval-write-holdout")
+def eval_write_holdout_cmd(
+    ctx: typer.Context,
+    holdout_id: Optional[list[str]] = typer.Option(
+        None,
+        "--holdout-id",
+        help="Holdout piece id never indexed (repeatable).",
+    ),
+    k: int = typer.Option(
+        DEFAULT_WRITE_K,
+        "--k",
+        help=f"Exemplars to retrieve for RAG drafts ({MIN_WRITE_K}–{MAX_WRITE_K}).",
+    ),
+    max_tokens: int = typer.Option(
+        DEFAULT_WRITE_MAX_TOKENS,
+        "--max-tokens",
+        help="Generation budget per draft.",
+    ),
+    out: Optional[Path] = typer.Option(
+        None,
+        "--out",
+        help="Write Contoso-safe receipt JSON (no draft bodies).",
+    ),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Score RAG write vs bare-base on never-indexed holdouts.
+
+    Receipts omit draft/holdout bodies (ids + scores + invent counts only).
+    Generation uses injectable MLX behind PP_MLX_ALLOW; tests mock generate.
+    """
+    _banner_from_ctx(ctx, json_mode=as_json)
+    ids = [str(piece_id) for piece_id in (holdout_id or []) if str(piece_id).strip()]
+    if not ids:
+        console.print("[red]Provide at least one --holdout-id.[/red]")
+        raise typer.Exit(2)
+
+    paths = get_paths(profile, home=home)
+    try:
+        load_config(paths)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    try:
+        receipt = run_eval_write_holdout(
+            paths,
+            ids,
+            k=k,
+            max_tokens=max_tokens,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+    except (FileNotFoundError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    if out:
+        write_receipt(receipt, out)
+
+    if as_json:
+        typer.echo(json.dumps(receipt, indent=2, ensure_ascii=False))
+        return
+
+    wins = receipt["wins"]
+    console.print(
+        f"[bold]eval-write-holdout[/bold] n={receipt['n_holdouts']} "
+        f"adapter={receipt['adapter']} model={receipt['model']}"
+    )
+    console.print(
+        f"carve_ok={receipt['carve']['ok']} "
+        f"wins rag={wins['rag']} base={wins['base']} tie={wins['tie']} "
+        f"rag_beats_base={receipt['rag_beats_base']}"
+    )
+    for item in receipt["items"]:
+        console.print(
+            f"  {item['holdout_id']}: winner={item['winner']} "
+            f"Δ={item['delta_base_minus_rag']} "
+            f"rag_dist={item['rag_distance']} base_dist={item['base_distance']} "
+            f"invent rag={item['rag_invent_reject']} base={item['base_invent_reject']}"
+        )
+    if out:
+        console.print(f"[dim]wrote receipt {out}[/dim]")
 
 
 @app.command("download")
