@@ -6,9 +6,10 @@ Operator guide for a local PersonalityProtect run. Corpus, SFT JSONL, adapters, 
 
 | Path | Machine | Disk download |
 | --- | --- | --- |
-| MLX train + filter | Apple Silicon | MLX 4-bit **~6 GB** |
-| GGUF filter | Any (llama.cpp) | Q4_K_M **~5.6 GB** |
-| CUDA QLoRA train | NVIDIA 24GB+ VRAM | Prefer GGUF for day-to-day filter |
+| `write` (post + article) | Apple Silicon | MLX 4-bit **~6 GB** |
+| GGUF `filter` (optional) | Any (llama.cpp) | Q4_K_M **~5.6 GB** |
+| MLX LoRA train (optional) | Apple Silicon | Reuses the MLX 4-bit base |
+| CUDA QLoRA train (optional) | NVIDIA 24GB+ VRAM | Prefer GGUF for day-to-day `filter` |
 | Mock / smoke | CI or pipeline check | None |
 
 Quantized defaults stay in the **~5–7 GB** range. Full BF16 is not the happy path.
@@ -22,15 +23,23 @@ Quantized defaults stay in the **~5–7 GB** range. Full BF16 is not the happy p
 
 ## Operator steps
 
-1. Install: `pip install -e ".[dev]"` plus extras (`mlx`, `gguf`, `cuda`, `models`) as needed.
+1. Install: `pip install -e ".[dev,mlx]"` plus extras (`gguf`, `cuda`, `models`) as needed.
 2. Init: `personality-protect init`
-3. Download one quantized artifact: `personality-protect download` (GGUF) and/or `--format mlx` on Apple Silicon.
+3. Download the MLX base: `personality-protect download --format mlx` (add `--format gguf` only if you want `filter`).
 4. Ingest local writing: `personality-protect ingest --linkedin <export> --path <docs>`
-5. Select: `personality-protect select` (warns below 50 pieces; blocks below 20 unless `--force`)
-6. Full train: `personality-protect train` (auto steps from SFT count). Useful flags: `--proof`, `--resume`, `--chunk-steps`, `--memory-gb`. CI uses `--smoke` / `--backend mock`.
-7. Filter: `personality-protect filter --text "…"`
-8. Compare: `personality-protect compare --synthetic slop_branding`
-9. Eval: `personality-protect eval --synthetic slop_branding`
+5. Index: `personality-protect index-voice`
+6. Style card: `personality-protect build-style-profile`
+7. Draft: `personality-protect write --topic "…" --points "…"` (add `--channel article` with 5+ `linkedin_article` pieces)
+8. Receipt: `personality-protect eval-write-holdout --out receipt.json`
+9. State check: `personality-protect status`
+
+Steps 1–9 need no training run. `write` uses base weights (`adapter=none`) plus the retrieval index and style card.
+
+## Optional experiments
+
+- Select + train a LoRA: `personality-protect select`, then `personality-protect train` (`--writer` for the brief→post writer LoRA). Useful flags: `--proof`, `--resume`, `--chunk-steps`, `--memory-gb`. CI uses `--smoke` / `--backend mock`.
+- Load an adapter for a draft: `personality-protect write --adapter …` — only after `eval-write-holdout` shows it beating the default on holdouts.
+- Rewrite/score existing text: `personality-protect filter --text "…"`, `personality-protect compare --synthetic slop_branding`, `personality-protect eval --synthetic slop_branding`.
 
 MLX train is chunked and checkpointed — a crash does not wipe a full run; use `--resume` (incomplete runs also auto-resume).
 

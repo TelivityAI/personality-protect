@@ -2,16 +2,18 @@
 
 **Stop sounding like everyone else's AI.**
 
-Draft LinkedIn posts in *your* voice on your machine. Index your writing, retrieve a few of your own posts for rhythm, and generate from a quantized local model (~5–7 GB). Your corpus never leaves this Mac.
+Draft LinkedIn posts and articles in *your* voice on your machine. Index your writing, measure your cadence, retrieve short rhythm references from your own pieces, and generate with a local quantized model (~5–7 GB). Your corpus never leaves this Mac.
 
 Built by [Telivity](https://telivity.com). Apache-2.0.
 
 ```text
-your writing ──► ingest ──► index-voice ──► build-style-profile ──► write
+your writing ──► ingest ──► index-voice ──► build-style-profile ──► write [--channel post|article]
 ```
 
+No fine-tune is required to get a draft. `write` runs the local base model with your retrieval index plus your measured style card (`adapter=none`).
+
 <p align="center">
-  <img src="docs/images/cli-shipped.png" alt="personality-protect write path" width="760" />
+  <img src="docs/images/cli-shipped.png" alt="personality-protect write drafting a Contoso post locally with adapter=none" width="800" />
 </p>
 
 ---
@@ -22,13 +24,29 @@ The feed is drowning in AI writing that all sounds the same — *“In today’s
 
 Cloud fine-tunes are a non-option for personal writing. Notes, emails, and posts are biometric-adjacent. Shipping them to a rented GPU so someone else’s stack can imitate you is a strange bargain.
 
-PersonalityProtect keeps the corpus on disk, measures your cadence, retrieves short rhythm references from your own posts, and drafts locally with MLX on Apple Silicon. Treat outputs as drafts you still own.
+PersonalityProtect keeps the corpus on disk, measures your cadence, retrieves short rhythm references from your own writing, and drafts locally with MLX on Apple Silicon. Treat outputs as drafts you still own.
+
+---
+
+## How you get voice
+
+1. **Ingest** your LinkedIn export and/or local notes (stays on disk).
+2. **`index-voice`** builds a local retrieval index.
+3. **`build-style-profile`** measures cadence (sentence length, short lines, post length band, banned filler).
+4. **`write --topic --points`** drafts from the brief only; retrieved pieces are rhythm reference.
+
+Two channels come out of step 4:
+
+- **`--channel post`** (default) targets your long-post band, up to the LinkedIn ~3000-character limit (~550 words).
+- **`--channel article`** runs outline → sections → stitch, and needs at least five `linkedin_article` pieces in the corpus.
+
+Local LoRA training stays in the CLI as an experiment, not as the path to a first draft — see [Advanced](#advanced-optional).
 
 ---
 
 ## Quick start
 
-Requires Python 3.10+ and an Apple Silicon Mac for the happy path.
+Requires Python 3.10+ and an Apple Silicon Mac: `write` runs on MLX and needs Metal.
 
 ```bash
 git clone https://github.com/TelivityAI/personality-protect.git
@@ -40,18 +58,27 @@ pip install -e ".[dev,mlx]"
 personality-protect init
 personality-protect download --format mlx    # ~6 GB, once
 
-# Your exports stay on this machine
 personality-protect ingest --linkedin ~/path/to/linkedin-export
 personality-protect ingest --path ~/path/to/notes --source note
 
 personality-protect index-voice
 personality-protect build-style-profile
+
+# LinkedIn post (targets your long-post band, up to ~550 words / ~3k chars)
 personality-protect write \
   --topic "Contoso Ledger exceptions" \
-  --points "Name one owner. Keep the rollout boring."
+  --points "- Name one owner\n- Keep the rollout boring"
+
+# Article (outline → sections → stitch)
+personality-protect write \
+  --channel article \
+  --topic "Contoso Ledger guide" \
+  --points "- Name one owner\n- Cut exceptions\n- Keep rollbacks boring"
 
 personality-protect status
 ```
+
+That is the whole path to a draft — no training step.
 
 Optional extras:
 
@@ -67,9 +94,9 @@ pip install -e ".[cuda]"     # NVIDIA path (optional)
 
 Public docs use **synthetic Contoso / synergy-slop text only**. No personal corpus.
 
-| Write path | Status | Mark |
+| `write` (post + article) | `status` | Mark |
 | --- | --- | --- |
-| <img src="docs/images/cli-shipped.png" alt="write path" width="360" /> | <img src="docs/images/cli-status.png" alt="status" width="280" /> | <img src="docs/images/cli-logo.png" alt="Telivity CLI logo" width="280" /> |
+| <img src="docs/images/cli-shipped.png" alt="write drafting a Contoso post with adapter=none" width="360" /> | <img src="docs/images/cli-status.png" alt="status output for the synthetic demo profile" width="280" /> | <img src="docs/images/cli-logo.png" alt="Telivity CLI logo" width="280" /> |
 
 ```bash
 personality-protect index-voice
@@ -93,8 +120,9 @@ personality-protect demo
 | Stays in `~/.personality-protect/` | Never commit / never upload |
 | --- | --- |
 | Profiles, corpus index, voice index, style profile | Real LinkedIn / email / note exports |
-| Downloaded weights under `models/` / HF cache | Profile URLs, personal paths |
-| Local eval receipts | API keys, `.env`, tokens |
+| Writer LoRA adapters under `adapters/` | Profile URLs, personal paths |
+| Downloaded weights under `models/` / HF cache | API keys, `.env`, tokens |
+| Local eval receipts | Cloud train uploads |
 
 Override the home directory with `--home` or `PERSONALITY_PROTECT_HOME`.
 
@@ -106,13 +134,14 @@ This README uses synthetic examples only (e.g. Contoso, “leverage synergies”
 
 ## Hardware
 
-**Happy path: Apple Silicon Mac** (MLX).
+**`write` requires an Apple Silicon Mac.** Drafting runs Qwen3.5-9B 4-bit through MLX/Metal; there is no cloud fallback.
 
 | What | Size / note |
 | --- | --- |
-| MLX 4-bit base (default write) | ~6 GB download |
-| GGUF Q4_K_M (optional) | ~5.6 GB download |
-| Peak RAM while writing | Memory-capped; typically comfortable on 16 GB+ |
+| MLX 4-bit base (what `write` loads) | ~6 GB download, once |
+| Peak RAM while writing | Memory-capped; 16 GB+ recommended |
+| GGUF Q4_K_M (optional, for `filter`) | ~5.6 GB download |
+| Writer LoRA (optional) | Small (MBs) under the profile |
 
 MLX applies a wired-memory cap so Metal does not jetsam-kill Python on mid-size Macs.
 
@@ -122,34 +151,13 @@ MLX applies a wired-memory cap so Metal does not jetsam-kill Python on mid-size 
 
 State lives in `~/.personality-protect/profiles/<name>/`.
 
-### Init
+### Init / download / ingest
 
 ```bash
 personality-protect init
-personality-protect init --profile work
-```
-
-### Download
-
-```bash
-personality-protect download --format mlx    # → Hugging Face cache, ~6 GB
-personality-protect download --format gguf   # → ~/.personality-protect/models/*.gguf
-```
-
-### Ingest
-
-LinkedIn export (folder or `.zip`) — CSV/HTML read in place; zips unpack only into the profile cache:
-
-```bash
-personality-protect ingest --linkedin ~/path/to/linkedin-export
+personality-protect download --format mlx
 personality-protect ingest --linkedin ~/path/to/linkedin-export.zip
-```
-
-Local docs / notes / mail archives (read in place — **no mandatory copy**):
-
-```bash
 personality-protect ingest --path ~/path/to/notes --source note
-personality-protect ingest --path ~/path/to/mail-archive --source email
 ```
 
 ### Index and style
@@ -159,32 +167,23 @@ personality-protect index-voice
 personality-protect build-style-profile
 ```
 
-`index-voice` builds a local retrieval index from your corpus. `build-style-profile` measures cadence targets (sentence length, short lines, typical post length, banned filler) used by `write`.
+Post length targets come from `linkedin_post` pieces (p75/p90), clamped to the LinkedIn ~3000-character band (~550 words).
 
 ### Write
 
 ```bash
-personality-protect write \
-  --topic "Contoso Ledger exceptions" \
-  --points "Name one owner. Keep the rollout boring."
+personality-protect write --topic "…" --points "…"
+personality-protect write --channel article --topic "…" --points "…"
 personality-protect write --topic "…" --points "…" --json
 ```
 
-`--topic` and `--points` are the only content the draft may use. Retrieved posts are rhythm reference only — facts come from the brief.
+`--topic` and `--points` are the only content the draft may use; retrieved pieces supply rhythm, not facts. Every `write` above runs base weights (`adapter=none`). Article channel requires at least five `linkedin_article` pieces in the corpus.
 
-### Status
+### Status / API
 
 ```bash
 personality-protect status
-```
-
-### Local API stub
-
-Loopback only (`127.0.0.1`). Refuses non-local binds. Future browser-extension hook.
-
-```bash
-personality-protect api
-# GET  http://127.0.0.1:8765/health
+personality-protect api   # loopback 127.0.0.1 only
 ```
 
 ---
@@ -199,40 +198,27 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 | `download` | Prefetch quantized MLX or GGUF base |
 | `ingest` | Index LinkedIn export and/or local paths |
 | `index-voice` | Build local voice retrieval index |
-| `build-style-profile` | Build cadence / banned-filler style card |
-| `write` | Draft a post from topic + points |
+| `build-style-profile` | Build cadence / length / banned-filler style card |
+| `write` | Draft a post or article (`--channel post\|article`) |
 | `eval-write-holdout` | Score write quality on held-out pieces (local receipt) |
 | `status` | Show profile state |
 | `demo` | Optional synthetic smoke tour (no download) |
 | `api` | Loopback HTTP stub |
 | `logo` | Print Telivity CLI mark |
+| `build-writer-sft`, `train` | Optional LoRA experiments — see [Advanced](#advanced-optional) |
 
-### Important flags
-
-**`download`**
-
-| Flag | Meaning |
-| --- | --- |
-| `--format mlx\|gguf` | Which quantized artifact to fetch |
-
-**`ingest`**
+### `write` flags
 
 | Flag | Meaning |
 | --- | --- |
-| `--linkedin PATH` | LinkedIn export folder or `.zip` |
-| `--path PATH` | Local docs/notes/mail (repeatable) |
-| `--source NAME` | Label for `--path` sources |
-
-**`write`**
-
-| Flag | Meaning |
-| --- | --- |
-| `--topic` | What the post is about |
+| `--topic` | What the piece is about |
 | `--points` | Facts/claims the draft may use |
-| `--k` | How many rhythm exemplars to retrieve |
+| `--channel post\|article` | Post (default) or article outline→sections→stitch |
+| `--k` | Rhythm exemplars to retrieve |
+| `--adapter` / `--no-adapter` | Default `--no-adapter` (base weights); `--adapter` needs a trained LoRA |
 | `--json` | Machine-readable receipt |
 
-**`eval-write-holdout`**
+### `eval-write-holdout` flags
 
 | Flag | Meaning |
 | --- | --- |
@@ -244,29 +230,36 @@ Global flags (most commands): `--profile`, `--home`, `--json`, plus branding `--
 
 ## Advanced (optional)
 
-These commands are available for experimentation. The shipped path above does not require them.
+Nothing here is needed for a draft. These commands stay in the CLI for local experiments and receipts.
+
+### Writer LoRA (experimental plumbing)
+
+`write` defaults to base weights. The adapter path exists so a trained LoRA *can* be loaded, and `--adapter` errors out when no adapter is present:
 
 ```bash
-personality-protect select
-personality-protect train --backend mlx
-personality-protect filter --text "…"
-personality-protect compare --synthetic slop_branding
+personality-protect build-writer-sft
+personality-protect train --writer --backend mlx
+personality-protect eval-write-holdout --out receipt.json
+personality-protect write --adapter --topic "…" --points "…"
 ```
 
-See `personality-protect train --help` and `filter --help` for flags. Adapters, when used, stay under `~/.personality-protect/profiles/<name>/adapters/`.
+Keep an adapter only if `eval-write-holdout` shows it beating RAG-alone on held-out pieces. Otherwise delete it and stay on the default. Training is not a prerequisite for `write`, and an untested adapter is not an upgrade.
 
----
+### Other experiment commands
 
-## Launch script
+`select`, `filter`, `compare`, `eval`, and the translator-pair commands remain available. They score or rewrite existing text and are not part of the drafting path above.
 
-Operator checklist: [docs/LAUNCH.md](docs/LAUNCH.md).
+### Operator script
+
+`scripts/beast_demo.sh` drives the older `select` → `train` → `compare` → `eval` sequence, not `write`. Use it for train/compare runs only:
 
 ```bash
 chmod +x scripts/beast_demo.sh
 ./scripts/beast_demo.sh --linkedin ~/path/to/linkedin-export
-# synthetic smoke (no personal data, no multi-GB download):
-./scripts/beast_demo.sh --skip-download
+./scripts/beast_demo.sh --skip-download   # synthetic smoke
 ```
+
+Operator checklist: [docs/LAUNCH.md](docs/LAUNCH.md).
 
 ---
 

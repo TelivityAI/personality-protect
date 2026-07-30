@@ -293,7 +293,7 @@ def test_run_write_reports_guard_failure_after_one_regen(tmp_path: Path):
     assert result["invented_numbers"] == ["18%"]
 
 
-def test_cli_write_rejects_adapter_flag(tmp_path: Path):
+def test_cli_write_adapter_requires_weights(tmp_path: Path):
     _seed_contoso_index(tmp_path)
 
     result = runner.invoke(
@@ -314,8 +314,8 @@ def test_cli_write_rejects_adapter_flag(tmp_path: Path):
         ],
     )
 
-    assert result.exit_code == 2
-    assert "adapter=none" in result.output
+    assert result.exit_code == 1
+    assert "No writer adapter" in result.output
 
 
 def test_cli_write_exits_nonzero_when_guards_still_fail(tmp_path: Path):

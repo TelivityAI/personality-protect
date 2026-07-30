@@ -194,6 +194,47 @@ def corpus_style_stats(texts: Iterable[str]) -> dict[str, Any]:
     }
 
 
+# Short posts and comments pull medians down; length targets come from posts
+# that are already post-shaped. LinkedIn's ~3000 character limit is ~480–550
+# words — that is the hard ceiling for the post channel.
+_POST_LENGTH_SOURCES = frozenset({"linkedin_post"})
+_MIN_LENGTH_SAMPLE_WORDS = 80
+LINKEDIN_POST_WORD_CEILING = 550
+DEFAULT_DRAFT_WORD_TARGET = 500
+DEFAULT_DRAFT_WORD_FLOOR = 300
+
+
+def post_length_stats(pieces: Iterable[Piece]) -> dict[str, float]:
+    """Word-length percentiles from post-shaped pieces only.
+
+    Falls back to all non-empty pieces when no linkedin_post rows qualify, so
+    Contoso fixtures and note-only corpora still get a length card.
+    """
+    piece_list = list(pieces)
+    posts = [
+        p
+        for p in piece_list
+        if p.source in _POST_LENGTH_SOURCES
+        and len(_word_tokens(p.text or "")) >= _MIN_LENGTH_SAMPLE_WORDS
+    ]
+    if not posts:
+        posts = [p for p in piece_list if (p.text or "").strip()]
+    lengths = [float(len(_word_tokens(p.text or ""))) for p in posts]
+    if not lengths:
+        return {
+            "median_post_words": 0.0,
+            "post_words_p75": 0.0,
+            "post_words_p90": 0.0,
+            "post_length_samples": 0.0,
+        }
+    return {
+        "median_post_words": round(_median(lengths), 1),
+        "post_words_p75": round(_percentile(lengths, 0.75), 1),
+        "post_words_p90": round(_percentile(lengths, 0.90), 1),
+        "post_length_samples": float(len(lengths)),
+    }
+
+
 def build_style_profile(
     pieces: Iterable[Piece],
     *,
@@ -204,8 +245,7 @@ def build_style_profile(
     stats = corpus_style_stats(p.text for p in piece_list)
     banned = list(banned_phrases) if banned_phrases is not None else list(BANNED_AI_FILLER)
     texts = [p.text for p in piece_list if (p.text or "").strip()]
-    lengths = [len(_word_tokens(text)) for text in texts]
-    stats["median_post_words"] = round(_median([float(n) for n in lengths]), 1)
+    stats.update(post_length_stats(piece_list))
     stats.update(sentence_length_spread(texts))
     stats["multi_sentence_paragraph_ratio"] = multi_sentence_paragraph_ratio(texts)
     return {
@@ -217,19 +257,31 @@ def build_style_profile(
     }
 
 
-# Slight headroom over the author's median so a legitimately long post is kept
-# whole, while a runaway generation gets cut. The prompt states this same
-# ceiling, so the instruction and the edit cannot drift apart.
-_LENGTH_HEADROOM = 1.15
-DEFAULT_DRAFT_WORD_TARGET = 300
-
-
 def draft_word_target(profile: dict[str, Any]) -> int:
-    """Word ceiling for a finished draft, measured from the author's posts."""
-    median = float((profile.get("stats") or {}).get("median_post_words") or 0)
-    if median <= 0:
-        return DEFAULT_DRAFT_WORD_TARGET
-    return int(round(median * _LENGTH_HEADROOM))
+    """Word ceiling for a finished post draft.
+
+    Prefer the author's long-post band (p90, else p75, else median) so short
+    comments in the selection cannot shrink drafts to stub length. Clamp to the
+    LinkedIn character budget in words.
+    """
+    stats = profile.get("stats") or {}
+    for key in ("post_words_p90", "post_words_p75", "median_post_words"):
+        value = float(stats.get(key) or 0)
+        if value > 0:
+            target = int(round(max(value, DEFAULT_DRAFT_WORD_FLOOR)))
+            return min(LINKEDIN_POST_WORD_CEILING, target)
+    return DEFAULT_DRAFT_WORD_TARGET
+
+
+def draft_word_aim(profile: dict[str, Any]) -> int:
+    """Typical finished length stated in the prompt (below the hard ceiling)."""
+    stats = profile.get("stats") or {}
+    for key in ("post_words_p75", "post_words_p90", "median_post_words"):
+        value = float(stats.get(key) or 0)
+        if value > 0:
+            aim = int(round(max(value, DEFAULT_DRAFT_WORD_FLOOR)))
+            return min(draft_word_target(profile), aim)
+    return min(DEFAULT_DRAFT_WORD_TARGET, draft_word_target(profile))
 
 
 def style_directives(profile: dict[str, Any]) -> list[str]:

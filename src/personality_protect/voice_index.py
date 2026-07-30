@@ -137,17 +137,26 @@ def retrieve(
     *,
     profile: str = DEFAULT_PROFILE,
     home: Path | None = None,
+    sources: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return up to k indexed exemplars ranked by similarity to the brief."""
+    """Return up to k indexed exemplars ranked by similarity to the brief.
+
+    ``sources`` limits matches to those piece sources (e.g. article-only
+    retrieval). When the filter yields fewer than ``k`` rows, the shortlist is
+    returned as-is rather than falling back to other sources.
+    """
     if k <= 0:
         return []
     paths = get_paths(profile, home=home)
     embedder, rows = _load_voice_index(paths)
     query = embedder.embed(brief)
+    allowed = {str(source) for source in sources} if sources is not None else None
 
     scored: list[tuple[float, dict[str, Any]]] = []
     for row in rows:
         piece = dict(row["piece"])
+        if allowed is not None and str(piece.get("source") or "") not in allowed:
+            continue
         score = cosine_similarity(query, row["vector"])
         scored.append((score, piece))
     scored.sort(key=lambda item: (-item[0], str(item[1]["id"])))

@@ -13,8 +13,10 @@ from personality_protect.models import Piece, save_index
 from personality_protect.select import Selection
 from personality_protect.style_profile import (
     BANNED_AI_FILLER,
+    LINKEDIN_POST_WORD_CEILING,
     build_style_profile,
     corpus_style_stats,
+    draft_word_target,
     load_style_profile,
     run_build_style_profile,
     style_directives,
@@ -93,6 +95,35 @@ def test_build_style_profile_records_median_post_words():
     ]
     stats = build_style_profile(pieces)["stats"]
     assert stats["median_post_words"] > 0
+    assert stats["post_words_p75"] > 0
+    assert stats["post_words_p90"] > 0
+
+
+def test_post_length_ignores_short_comments_for_targets():
+    """Length targets come from post-shaped pieces, not comment stubs."""
+    short = "Ok." * 5
+    long_post = (
+        "Contoso Ledger. " * 40
+        + "You ship the reconciliation or you own the outage. "
+        * 20
+    )
+    pieces = [
+        Piece(id="comment", source="linkedin_comment", text=short, year=2024),
+        Piece(id="post", source="linkedin_post", text=long_post, year=2024),
+    ]
+    stats = build_style_profile(pieces)["stats"]
+    assert stats["post_words_p90"] >= 80
+    ceiling = draft_word_target(build_style_profile(pieces))
+    assert ceiling >= 300
+    assert ceiling <= LINKEDIN_POST_WORD_CEILING
+
+
+def test_draft_word_target_clamps_to_linkedin_ceiling():
+    huge = "word " * 2000
+    profile = build_style_profile(
+        [Piece(id="p", source="linkedin_post", text=huge, year=2024)]
+    )
+    assert draft_word_target(profile) == LINKEDIN_POST_WORD_CEILING
 
 
 def test_style_directives_carry_cadence_without_copyable_prose():
