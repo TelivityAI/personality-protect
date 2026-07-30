@@ -95,6 +95,13 @@ from personality_protect.translator_eval import (
     score_translator_holdout,
 )
 from personality_protect.voice_index import build_voice_index
+from personality_protect.write import (
+    DEFAULT_WRITE_K,
+    DEFAULT_WRITE_MAX_TOKENS,
+    MAX_WRITE_K,
+    MIN_WRITE_K,
+    run_write,
+)
 
 app = typer.Typer(
     name="personality-protect",
@@ -179,7 +186,8 @@ def main(
         typer.echo("Run with --help for commands. Data never leaves this machine.")
         typer.echo("")
         typer.echo(
-            "Commands: init | download | ingest | index-voice | select | train | filter | "
+            "Commands: init | download | ingest | index-voice | build-style-profile | "
+            "select | write | train | filter | "
             "eval | compare | scorecard | pair-gate | sterile-check | "
             "translator-eval | demo | api | logo | status"
         )
@@ -488,6 +496,97 @@ def build_style_profile_cmd(
     )
     console.print(f"banned_ai_filler: {len(style['banned_ai_filler'])} phrases")
     console.print(f"Saved: {out_path}")
+
+
+@app.command("write")
+def write_cmd(
+    ctx: typer.Context,
+    topic: str = typer.Option(..., "--topic", help="What the post is about."),
+    points: str = typer.Option(..., "--points", help="Facts/claims the post may use."),
+    k: int = typer.Option(
+        DEFAULT_WRITE_K,
+        "--k",
+        help=f"Exemplars to retrieve ({MIN_WRITE_K}–{MAX_WRITE_K}).",
+    ),
+    max_tokens: int = typer.Option(
+        DEFAULT_WRITE_MAX_TOKENS,
+        "--max-tokens",
+        help="Generation budget for the draft.",
+    ),
+    no_adapter: bool = typer.Option(
+        True,
+        "--no-adapter/--adapter",
+        help="RAG write runs on base weights only; --adapter is unsupported.",
+    ),
+    out: Optional[Path] = typer.Option(None, "--out", help="Write draft to file."),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Draft a post from retrieved exemplars on base weights (no adapter)."""
+    _banner_from_ctx(ctx, json_mode=as_json)
+    if not no_adapter:
+        console.print(
+            "[red]--adapter is not supported: the RAG write path always runs "
+            "base weights with adapter=none.[/red]"
+        )
+        raise typer.Exit(2)
+
+    paths = get_paths(profile, home=home)
+    try:
+        config = load_config(paths)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    if config.write_adapter is not None and not as_json:
+        console.print(
+            f"[yellow]Ignoring profile write_adapter={config.write_adapter} — "
+            "write is RAG-only.[/yellow]"
+        )
+
+    try:
+        result = run_write(
+            topic,
+            points,
+            paths,
+            k=k,
+            max_tokens=max_tokens,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+    except (FileNotFoundError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    guard_failed = bool(result["parrot_reject"] or result["invent_reject"])
+    if as_json:
+        typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+        if out and not guard_failed:
+            out.write_text(result["text"] + "\n", encoding="utf-8")
+        if guard_failed:
+            raise typer.Exit(1)
+        return
+
+    console.print(
+        f"[dim]voice_mode={result['voice_mode']} adapter={result['adapter']} "
+        f"model={result['model']} k={result['k']} attempts={result['attempts']}[/dim]"
+    )
+    console.print(f"[dim]exemplars: {', '.join(result['exemplar_ids'])}[/dim]")
+    if guard_failed:
+        console.print(
+            "[red]Guards still failing after one regen "
+            f"(parrot={result['parrot_reject']} invent={result['invent_reject']} "
+            f"entities+{len(result['invented_entities'])} "
+            f"numbers+{len(result['invented_numbers'])}). "
+            "Not saving draft — tighten --points or re-run.[/red]"
+        )
+        console.print(result["text"])
+        raise typer.Exit(1)
+    if out:
+        out.write_text(result["text"] + "\n", encoding="utf-8")
+        console.print(f"[dim]wrote {out}[/dim]")
+    console.print(result["text"])
 
 
 @app.command("download")
