@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +40,7 @@ from personality_protect.config import (
     init_profile,
     load_config,
 )
+from personality_protect.corpus_dedupe import DEFAULT_NEAR_RATIO, dedupe_pieces
 from personality_protect.demo import run_demo
 from personality_protect.download import run_download
 from personality_protect.eval_compare import (
@@ -73,7 +75,7 @@ from personality_protect.mlx_train import (
     DEFAULT_MAX_SEQ_LENGTH,
     PROOF_MAX_STEPS,
 )
-from personality_protect.models import load_index, summarize_by_source_year
+from personality_protect.models import load_index, save_index, summarize_by_source_year
 from personality_protect.pair_gate import (
     MAX_INPUT_PROPER_PER_1K,
     MAX_STERILE_FRAG_DELTA,
@@ -192,8 +194,8 @@ def main(
         typer.echo("Run with --help for commands. Data never leaves this machine.")
         typer.echo("")
         typer.echo(
-            "Commands: init | download | ingest | index-voice | build-style-profile | "
-            "select | write | eval-write-holdout | train | filter | "
+            "Commands: init | download | ingest | dedupe-index | index-voice | "
+            "build-style-profile | select | write | eval-write-holdout | train | filter | "
             "eval | compare | scorecard | pair-gate | sterile-check | "
             "translator-eval | demo | api | logo | status"
         )
@@ -360,6 +362,91 @@ def index_voice_cmd(
         f"(skipped holdout: {result['skipped_holdout']})."
     )
     console.print(f"Voice index: {result['voice_index']}")
+
+
+@app.command("dedupe-index")
+def dedupe_index_cmd(
+    ctx: typer.Context,
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Rewrite the index (default: report only).",
+    ),
+    near_ratio: float = typer.Option(
+        DEFAULT_NEAR_RATIO,
+        "--near-ratio",
+        help="Similarity for near-identical captures; 1.0 for exact text only.",
+    ),
+    holdout_id: Optional[list[str]] = typer.Option(
+        None,
+        "--holdout-id",
+        help="Id that must survive as keeper (repeatable; adds to the local holdout file).",
+    ),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Drop pieces repeating another piece's text (re-ingest under a new path).
+
+    Rebuild ``index-voice``, ``select`` and ``build-style-profile`` after
+    applying, otherwise they keep counting the dropped pieces.
+    """
+    from personality_protect.writer_sft import load_holdout_id_set
+
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    pieces = load_index(paths.index_path)
+    if not pieces:
+        console.print(f"[red]No corpus index at {paths.index_path}.[/red]")
+        raise typer.Exit(1)
+
+    holdouts = load_holdout_id_set(paths) | {
+        str(piece_id) for piece_id in (holdout_id or []) if str(piece_id).strip()
+    }
+    result = dedupe_pieces(
+        pieces,
+        holdout_ids=holdouts,
+        near_ratio=None if near_ratio >= 1.0 else near_ratio,
+    )
+
+    payload: dict[str, object] = {
+        "index": str(paths.index_path),
+        "applied": False,
+        "near_ratio": near_ratio,
+        "holdout_ids": sorted(holdouts),
+        "before": summarize_by_source_year(pieces),
+        "after": summarize_by_source_year(result.kept),
+        **result.to_report(),
+    }
+    if apply and result.groups:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup = paths.index_path.with_name(f"{paths.index_path.name}.bak-{stamp}")
+        backup.write_bytes(paths.index_path.read_bytes())
+        payload["backup"] = str(backup)
+        payload["written"] = save_index(paths.index_path, result.kept)
+        payload["applied"] = True
+
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2))
+        return
+    console.print(
+        f"[bold]{len(result.groups)}[/bold] duplicate-text groups "
+        f"({payload['exact_groups']} exact, {payload['near_groups']} near); "
+        f"[bold]{payload['dropped']}[/bold] pieces removable."
+    )
+    console.print(f"by source: {payload['dropped_by_source']}")
+    if result.groups and payload["cross_source_groups"]:
+        console.print(
+            f"[yellow]{len(payload['cross_source_groups'])} groups span sources "
+            "— identical text kept under the more specific source.[/yellow]"
+        )
+    if payload["applied"]:
+        console.print(
+            f"Index now [bold]{payload['written']}[/bold] pieces. Backup: {payload['backup']}"
+        )
+        console.print("Rebuild: index-voice, select, build-style-profile.")
+    elif result.groups:
+        console.print("Report only. Pass --apply to rewrite the index.")
 
 
 @app.command("select")
