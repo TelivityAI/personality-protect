@@ -94,6 +94,7 @@ from personality_protect.translator_eval import (
     load_packaged_foreign_holdout,
     score_translator_holdout,
 )
+from personality_protect.voice_index import build_voice_index
 
 app = typer.Typer(
     name="personality-protect",
@@ -178,7 +179,7 @@ def main(
         typer.echo("Run with --help for commands. Data never leaves this machine.")
         typer.echo("")
         typer.echo(
-            "Commands: init | download | ingest | select | train | filter | "
+            "Commands: init | download | ingest | index-voice | select | train | filter | "
             "eval | compare | scorecard | pair-gate | sterile-check | "
             "translator-eval | demo | api | logo | status"
         )
@@ -313,6 +314,38 @@ def ingest_cmd(
                   f"(batch parsed {len(new_pieces)}; index now {len(all_pieces)}).")
     console.print(f"Index: {paths.index_path}")
     _print_summary(summary, title="Index")
+
+
+@app.command("index-voice")
+def index_voice_cmd(
+    ctx: typer.Context,
+    holdout_id: Optional[list[str]] = typer.Option(
+        None,
+        "--holdout-id",
+        help="Piece id to exclude from retrieval (repeatable).",
+    ),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Rebuild the local voice retrieval index from the current corpus."""
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    try:
+        load_config(paths)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    result = build_voice_index(paths, holdout_ids=holdout_id or ())
+    if as_json:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    console.print(
+        f"Indexed [bold]{result['indexed']}[/bold] voice exemplars "
+        f"(skipped holdout: {result['skipped_holdout']})."
+    )
+    console.print(f"Voice index: {result['voice_index']}")
 
 
 @app.command("select")
