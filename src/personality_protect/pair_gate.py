@@ -83,6 +83,10 @@ def text_axes(text: str) -> dict[str, Any]:
         "short_line_ratio": round(short_ratio, 4),
         "you_count": you_n,
         "i_count": i_n,
+        # Rates alongside the raw counts: comparing two texts of different
+        # lengths on counts alone measures length, not voice.
+        "you_per_1k": round(you_n * 1000.0 / n_words, 2),
+        "i_per_1k": round(i_n * 1000.0 / n_words, 2),
         "you_gt_i": you_n > i_n,
     }
 

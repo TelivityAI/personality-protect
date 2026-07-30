@@ -170,9 +170,10 @@ def build_style_profile(
     }
 
 
-# Headroom over the author's median so a slightly long post is kept whole, while
-# a runaway generation still gets cut. Mirrors the cap stated in the prompt.
-_LENGTH_HEADROOM = 1.5
+# Slight headroom over the author's median so a legitimately long post is kept
+# whole, while a runaway generation gets cut. The prompt states this same
+# ceiling, so the instruction and the edit cannot drift apart.
+_LENGTH_HEADROOM = 1.15
 DEFAULT_DRAFT_WORD_TARGET = 300
 
 

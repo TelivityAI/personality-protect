@@ -271,6 +271,36 @@ def test_g4_score_schema_prefers_rag_closer_to_holdout():
     assert "invented_numbers_count" in score["base"]
 
 
+def test_g4_a_stub_cannot_beat_a_full_post_on_distance():
+    """Raw pronoun counts once made three sentences the closest match to a post."""
+    holdout = (
+        "Contoso keeps the queue boring.\n\n"
+        "You ship the reconciliation or you own the outage.\n\n"
+        "You name one owner before the packaging change starts.\n\n"
+        "You cut exceptions or you explain them.\n\n"
+        "Partners already know which one you picked.\n\n"
+        "Stop pretending the roadmap is the work.\n\n"
+        "You own the queue you refuse to look at.\n\n"
+        "Boring beats clever every quarter."
+    )
+    brief = "Topic: Contoso ops\nPoints:\n- Keep the queue boring\n- Name one owner"
+    full_post = (
+        "Contoso keeps the queue boring.\n\n"
+        "You ship the reconciliation or you own the outage.\n\n"
+        "You name one owner before the change starts.\n\n"
+        "You cut exceptions or you explain them.\n\n"
+        "Partners already know which one you picked.\n\n"
+        "Stop dressing the roadmap as the work.\n\n"
+        "You own the queue you avoid.\n\n"
+        "Boring wins every quarter."
+    )
+    stub = "You keep the queue boring."
+
+    score = score_rag_vs_base(holdout, full_post, stub, brief)
+    assert score["rag"]["distance"] < score["base"]["distance"]
+    assert score["winner"] == "rag"
+
+
 def test_g4_invent_flags_fire_on_entities_beyond_brief():
     holdout = "Contoso keeps pricing tests boring."
     brief = "Topic: Contoso pricing\nPoints: Keep tests boring."

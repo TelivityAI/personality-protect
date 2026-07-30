@@ -462,16 +462,35 @@ def write_raw_artifacts(
     return written
 
 
+def _length_penalty(reference_words: int, candidate_words: int) -> float:
+    """Penalize a draft that is not the length of a post at all.
+
+    Symmetric in log space, so half-length and double-length cost the same. A
+    stub is otherwise unpunished: with every other axis length-normalized, three
+    sentences can sit at near-zero distance from a full post.
+    """
+    reference = max(1, int(reference_words))
+    candidate = max(1, int(candidate_words))
+    return abs(math.log(candidate / reference))
+
+
 def _axes_distance(reference: dict[str, Any], candidate: dict[str, Any]) -> float:
-    """Lower = closer to the holdout voice band."""
+    """Lower = closer to the holdout voice band.
+
+    Every term is length-normalized. Raw pronoun counts were used here and they
+    measured length rather than voice: a long draft was penalized per extra
+    "you" while a three-sentence stub scored near zero, so the comparison
+    rewarded not writing a post.
+    """
     return round(
         abs(float(reference["short_line_ratio"]) - float(candidate["short_line_ratio"]))
         + abs(float(reference["median_sentence_words"]) - float(candidate["median_sentence_words"]))
         / 20.0
         + abs(float(reference["you_gt_i"]) - float(candidate["you_gt_i"]))
         + abs(float(reference["proper_per_1k"]) - float(candidate["proper_per_1k"])) / 50.0
-        + abs(int(reference["you_count"]) - int(candidate["you_count"])) / 10.0
-        + abs(int(reference["i_count"]) - int(candidate["i_count"])) / 10.0,
+        + abs(float(reference["you_per_1k"]) - float(candidate["you_per_1k"])) / 20.0
+        + abs(float(reference["i_per_1k"]) - float(candidate["i_per_1k"])) / 20.0
+        + _length_penalty(reference["words"], candidate["words"]),
         4,
     )
 
