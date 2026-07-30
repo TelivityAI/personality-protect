@@ -106,6 +106,58 @@ def test_detect_backend_mock():
     assert detect_backend("mock") == "mock"
 
 
+def test_demo_runs_write_path(tmp_path: Path):
+    """Demo must exercise index-voice → style profile → write, not just train/filter."""
+    result = run_demo(home=tmp_path)
+    assert result["indexed"] >= 1
+    assert result["style_pieces"] >= 1
+    assert result["banned_ai_filler"] >= 1
+    assert result["write_channel"] == "post"
+    assert result["write_adapter"] == "none"
+    assert result["write_stubbed_model"] is True
+    # Guards must have passed — run_write raises/flags rather than return junk.
+    assert "Contoso" in result["written"]
+
+
+def test_style_profile_requires_selection(tmp_path: Path):
+    """README quick start must keep `select` before `build-style-profile`."""
+    import pytest
+
+    from personality_protect.config import get_paths, init_profile
+    from personality_protect.style_profile import run_build_style_profile
+
+    init_profile("t", home=tmp_path)
+    with pytest.raises(FileNotFoundError):
+        run_build_style_profile(get_paths("t", home=tmp_path))
+
+
+def test_select_default_includes_current_year(tmp_path: Path):
+    """A corpus written this year must not select to zero under bare `select`."""
+    from datetime import datetime, timezone
+
+    from personality_protect.config import DEFAULT_THROUGH_YEAR
+    from personality_protect.models import Piece
+    from personality_protect.select import filter_pieces
+
+    this_year = datetime.now(timezone.utc).year
+    assert DEFAULT_THROUGH_YEAR >= this_year
+
+    recent = Piece(
+        id="r1",
+        source="linkedin_post",
+        text="word " * 200,
+        year=this_year,
+        word_count=200,
+    )
+    kept = filter_pieces(
+        [recent],
+        min_words=50,
+        through_year=DEFAULT_THROUGH_YEAR,
+        include_undated=False,
+    )
+    assert [p.id for p in kept] == ["r1"]
+
+
 def test_api_health(tmp_path: Path):
     import threading
     import urllib.request
