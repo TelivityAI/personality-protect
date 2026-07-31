@@ -508,6 +508,7 @@ def score_draft_against_holdout(
     draft: str,
     brief: str,
     exemplars: Sequence[str] = (),
+    visible_brief: str | None = None,
 ) -> dict[str, Any]:
     """g4: axis distance + guard flags (counts + keys; no draft body).
 
@@ -515,6 +516,12 @@ def score_draft_against_holdout(
     rhythm, and an exemplar dump has perfect rhythm because it *is* the author's
     text — so distance alone once crowned a draft that was a copy of its own
     prompt. A disqualified draft cannot win, whatever its distance.
+
+    ``brief`` is the allowed-facts set the invention guard checks against, which
+    on a de-voiced pair is the source piece rather than the prompt. Echo has to
+    be measured against what the model actually saw, so ``visible_brief`` may
+    carry the mined topic and bullets separately; it defaults to ``brief``,
+    which is correct wherever the two are the same text.
     """
     ref_axes = text_axes(holdout_text)
     draft_axes = text_axes(draft)
@@ -523,7 +530,8 @@ def score_draft_against_holdout(
     # Handing the mined bullets back is the other way to score a flattering
     # distance without writing anything, and it is what the winning draft did on
     # one holdout.
-    echoed = brief_echo_reject(draft, brief)
+    shown = brief if visible_brief is None else visible_brief
+    echoed = brief_echo_reject(draft, shown)
     return {
         "distance": _axes_distance(ref_axes, draft_axes),
         "axes": draft_axes,
@@ -546,11 +554,16 @@ def score_rag_vs_base(
     *,
     rag_exemplars: Sequence[str] = (),
     tie_epsilon: float = TIE_EPSILON,
+    visible_brief: str | None = None,
 ) -> dict[str, Any]:
     """Three-way score: holdout reference vs RAG draft vs bare-base draft."""
     holdout_axes = text_axes(holdout_text)
-    rag = score_draft_against_holdout(holdout_text, rag_draft, brief, rag_exemplars)
-    base = score_draft_against_holdout(holdout_text, base_draft, brief)
+    rag = score_draft_against_holdout(
+        holdout_text, rag_draft, brief, rag_exemplars, visible_brief=visible_brief
+    )
+    base = score_draft_against_holdout(
+        holdout_text, base_draft, brief, visible_brief=visible_brief
+    )
     delta = float(base["distance"]) - float(rag["distance"])
     if rag["disqualified"] and base["disqualified"]:
         winner = "tie"

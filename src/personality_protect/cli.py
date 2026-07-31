@@ -23,6 +23,11 @@ from rich.table import Table
 from personality_protect import __version__
 from personality_protect.api import DEFAULT_HOST, DEFAULT_PORT
 from personality_protect.api import serve as serve_api
+from personality_protect.article_holdout import (
+    DEFAULT_ARTICLE_HOLDOUT_FRACTION,
+    MAX_ARTICLE_HOLDOUT_N,
+    MIN_ARTICLE_HOLDOUT_N,
+)
 from personality_protect.config import (
     CORPUS_BLOCK_BELOW,
     CORPUS_WARN_BELOW,
@@ -50,6 +55,7 @@ from personality_protect.eval_compare import (
     run_eval,
     specificity_scorecard,
 )
+from personality_protect.eval_write_article import ARTICLE_ALPHA
 from personality_protect.eval_write_holdout import (
     run_eval_write_holdout,
     write_receipt,
@@ -111,6 +117,7 @@ from personality_protect.write import (
     MIN_WRITE_K,
     run_write,
 )
+from personality_protect.write_article import MIN_ARTICLE_CORPUS
 from personality_protect.writer_holdout import (
     DEFAULT_HOLDOUT_FRACTION,
     MAX_HOLDOUT_N,
@@ -349,13 +356,14 @@ def index_voice_cmd(
     from_carve: bool = typer.Option(
         False,
         "--from-carve",
-        help="Also exclude every id in the profile's writer holdout carve.",
+        help="Also exclude every id in the profile's writer and article carves.",
     ),
     profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
     home: Optional[Path] = typer.Option(None, "--home"),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Rebuild the local voice retrieval index from the current corpus."""
+    from personality_protect.article_holdout import load_pinned_article_holdout_ids
     from personality_protect.writer_holdout import load_pinned_holdout_ids
 
     _banner_from_ctx(ctx, json_mode=as_json)
@@ -367,10 +375,14 @@ def index_voice_cmd(
         raise typer.Exit(1) from exc
 
     # Retyping a widened carve as flags is how a holdout quietly re-enters
-    # retrieval; read it from the file the carve already wrote.
+    # retrieval; read it from the files the carves already wrote.
     excluded = list(holdout_id or ())
     if from_carve:
-        excluded = sorted(set(excluded) | set(load_pinned_holdout_ids(paths)))
+        excluded = sorted(
+            set(excluded)
+            | set(load_pinned_holdout_ids(paths))
+            | set(load_pinned_article_holdout_ids(paths))
+        )
 
     result = build_voice_index(paths, holdout_ids=excluded)
     if as_json:
@@ -704,6 +716,215 @@ def select_writer_holdouts_cmd(
         console.print(
             "[yellow]Rebuild retrieval so the new holdouts are never indexed: "
             "personality-protect index-voice[/yellow]"
+        )
+
+
+@app.command("select-article-holdouts")
+def select_article_holdouts_cmd(
+    ctx: typer.Context,
+    fraction: float = typer.Option(
+        DEFAULT_ARTICLE_HOLDOUT_FRACTION,
+        "--fraction",
+        help="Share of briefable articles to reserve for the article eval.",
+    ),
+    minimum: int = typer.Option(
+        MIN_ARTICLE_HOLDOUT_N, "--min", help="Floor on article holdout count."
+    ),
+    maximum: int = typer.Option(
+        MAX_ARTICLE_HOLDOUT_N, "--max", help="Ceiling on article holdout count."
+    ),
+    keep_indexed: int = typer.Option(
+        MIN_ARTICLE_CORPUS,
+        "--keep-indexed",
+        help="Articles the carve must leave in retrieval for the write path.",
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Write the carve to the profile. Default is report-only.",
+    ),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Pick a deterministic article holdout set for the article-channel eval."""
+    from personality_protect.article_holdout import (
+        load_pinned_article_holdout_ids,
+        save_article_holdout_ids,
+        select_article_holdouts,
+    )
+
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    try:
+        pieces = load_index(paths.index_path)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    receipt = select_article_holdouts(
+        pieces,
+        pinned_ids=load_pinned_article_holdout_ids(paths),
+        fraction=fraction,
+        minimum=minimum,
+        maximum=maximum,
+        keep_indexed=keep_indexed,
+    )
+    if apply:
+        receipt["written_to"] = str(save_article_holdout_ids(paths, receipt))
+
+    if as_json:
+        typer.echo(json.dumps(receipt, indent=2, ensure_ascii=False))
+        return
+    console.print(
+        f"article holdouts: {receipt['n_holdouts']} of {receipt['n_briefable']} "
+        f"briefable articles ({receipt['n_articles']} total); "
+        f"{receipt['articles_left_indexed']} left for retrieval"
+    )
+    if receipt["n_holdouts"] == 0:
+        console.print(
+            "[yellow]Carve is empty: the corpus cannot spare an article and stay "
+            f"above the retrieval floor of {keep_indexed}.[/yellow]"
+        )
+    if not apply:
+        console.print("[dim]report-only — re-run with --apply to write the carve[/dim]")
+    else:
+        console.print(
+            "[yellow]Rebuild retrieval so the new holdouts are never indexed: "
+            "personality-protect index-voice --from-carve[/yellow]"
+        )
+
+
+@app.command("eval-write-article")
+def eval_write_article_cmd(
+    ctx: typer.Context,
+    holdout_id: Optional[list[str]] = typer.Option(
+        None,
+        "--holdout-id",
+        help="Article holdout id (repeatable). Defaults to the saved carve.",
+    ),
+    k: int = typer.Option(
+        DEFAULT_WRITE_K,
+        "--k",
+        help=f"Article exemplars per section ({MIN_WRITE_K}–{MAX_WRITE_K}).",
+    ),
+    alpha: float = typer.Option(
+        ARTICLE_ALPHA, "--alpha", help="One-sided significance the run must reach."
+    ),
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Write Contoso-safe receipt JSON (no draft bodies)."
+    ),
+    save_raw: bool = typer.Option(
+        False,
+        "--save-raw/--no-save-raw",
+        help="Dump exact prompts and drafts under the profile's gitignored "
+        "dogfood/raw dir (personal text; never commit).",
+    ),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Score article-channel drafts against bare-base on never-indexed articles.
+
+    Loads MLX weights once and reuses them across both arms. Needs PP_MLX_ALLOW=1
+    and a real Metal device; tests inject a generator instead.
+    """
+    from personality_protect.article_holdout import load_pinned_article_holdout_ids
+    from personality_protect.eval_write_article import (
+        run_eval_write_article,
+        write_article_eval_receipt,
+    )
+    from personality_protect.write import make_mlx_generator
+
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    try:
+        config = load_config(paths)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    ids = [str(piece_id) for piece_id in (holdout_id or []) if str(piece_id).strip()]
+    if not ids:
+        ids = load_pinned_article_holdout_ids(paths)
+    if not ids:
+        console.print(
+            "[red]No article holdouts. Run: "
+            "personality-protect select-article-holdouts --apply[/red]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        generator = make_mlx_generator(base_model=config.base_model)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    done = {"n": 0}
+
+    def _progress(item: dict) -> None:
+        done["n"] += 1
+        console.print(
+            f"[dim]{done['n']}/{len(ids)} {item['holdout_id']}: {item['winner']} "
+            f"(article {item['article_draft_words']}w vs base "
+            f"{item['base_draft_words']}w, holdout {item['holdout_words']}w)[/dim]"
+        )
+
+    try:
+        receipt = run_eval_write_article(
+            paths,
+            ids,
+            k=k,
+            generate_fn=generator,
+            alpha=alpha,
+            save_raw=save_raw,
+            on_item=None if as_json else _progress,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+    except (FileNotFoundError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    target = out or (paths.root / "dogfood" / "eval_write_article_receipt.json")
+    write_article_eval_receipt(receipt, target)
+
+    if as_json:
+        typer.echo(json.dumps(receipt, indent=2, ensure_ascii=False))
+        return
+
+    wins = receipt["wins"]
+    console.print(
+        f"[bold]eval-write-article[/bold] n={receipt['n_holdouts']} "
+        f"model={receipt['model']} articles_indexed={receipt['articles_indexed']}"
+    )
+    console.print(
+        f"carve_ok={receipt['carve']['ok']} wins article={wins['article']} "
+        f"base={wins['base']} tie={wins['tie']} "
+        f"(p={receipt['p_value']}, alpha={receipt['alpha']})"
+    )
+    console.print(
+        f"disqualified: article {receipt['disqualified']['article']}, "
+        f"base {receipt['disqualified']['base']}"
+    )
+    for item in receipt["items"]:
+        console.print(
+            f"  {item['holdout_id']}: winner={item['winner']} "
+            f"Δ={item['delta_base_minus_article']} "
+            f"article_dist={item['article_distance']} "
+            f"base_dist={item['base_distance']} "
+            f"words {item['article_draft_words']}/{item['base_draft_words']} "
+            f"(holdout {item['holdout_words']}) "
+            f"brief_overlap={item['brief_overlap_ratio']}"
+        )
+    console.print(f"verdict: [bold]{receipt['verdict']}[/bold] → {target}")
+    if receipt["blocking_reasons"]:
+        console.print(f"[yellow]{', '.join(receipt['blocking_reasons'])}[/yellow]")
+    if save_raw:
+        console.print(
+            "[dim]raw prompts/drafts under profile dogfood/raw "
+            "(personal text — never commit)[/dim]"
         )
 
 

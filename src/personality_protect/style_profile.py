@@ -235,6 +235,96 @@ def post_length_stats(pieces: Iterable[Piece]) -> dict[str, float]:
     }
 
 
+# Articles are a different length regime, so their targets come from
+# article-shaped pieces only. Falling back to the post band is what produced
+# ~500-word "articles": the post ceiling is a LinkedIn character limit, not
+# anything the author's longform does.
+_ARTICLE_LENGTH_SOURCES = frozenset({"linkedin_article"})
+_MIN_ARTICLE_SAMPLE_WORDS = 150
+# Used only when the corpus has no article-shaped pieces to measure.
+DEFAULT_ARTICLE_WORD_AIM = 1100
+ARTICLE_WORD_FLOOR = 600
+ARTICLE_WORD_CEILING = 3000
+# Section budgets. Below the floor a section is a paragraph, above the ceiling
+# the model stops writing sections and writes one undifferentiated essay.
+MIN_ARTICLE_SECTION_WORDS = 180
+MAX_ARTICLE_SECTION_WORDS = 600
+# Words a section of a longform piece typically carries, used to turn a total
+# length into a plausible section count.
+TYPICAL_ARTICLE_SECTION_WORDS = 300
+MIN_ARTICLE_SECTION_HINT = 2
+MAX_ARTICLE_SECTION_HINT = 8
+
+
+def article_length_stats(pieces: Iterable[Piece]) -> dict[str, float]:
+    """Word-length percentiles from article-shaped pieces only.
+
+    Returns zeros when the corpus carries no articles rather than borrowing the
+    post band: an article target derived from posts is not a measurement of the
+    author's longform, and the callers below fall back to a stated default.
+    """
+    articles = [
+        p
+        for p in pieces
+        if p.source in _ARTICLE_LENGTH_SOURCES
+        and len(_word_tokens(p.text or "")) >= _MIN_ARTICLE_SAMPLE_WORDS
+    ]
+    lengths = [float(len(_word_tokens(p.text or ""))) for p in articles]
+    if not lengths:
+        return {
+            "median_article_words": 0.0,
+            "article_words_p75": 0.0,
+            "article_words_p90": 0.0,
+            "article_length_samples": 0.0,
+        }
+    return {
+        "median_article_words": round(_median(lengths), 1),
+        "article_words_p75": round(_percentile(lengths, 0.75), 1),
+        "article_words_p90": round(_percentile(lengths, 0.90), 1),
+        "article_length_samples": float(len(lengths)),
+    }
+
+
+def article_word_aim(profile: dict[str, Any]) -> int:
+    """Typical finished article length, stated in the prompt.
+
+    The median is the aim because a longform piece should read like the
+    author's usual article, not like their longest one.
+    """
+    stats = profile.get("stats") or {}
+    for key in ("median_article_words", "article_words_p75", "article_words_p90"):
+        value = float(stats.get(key) or 0)
+        if value > 0:
+            return int(min(ARTICLE_WORD_CEILING, max(ARTICLE_WORD_FLOOR, round(value))))
+    return DEFAULT_ARTICLE_WORD_AIM
+
+
+def article_word_target(profile: dict[str, Any]) -> int:
+    """Hard word ceiling for a finished article (the author's long band)."""
+    stats = profile.get("stats") or {}
+    aim = article_word_aim(profile)
+    for key in ("article_words_p90", "article_words_p75", "median_article_words"):
+        value = float(stats.get(key) or 0)
+        if value > 0:
+            return int(min(ARTICLE_WORD_CEILING, max(aim, round(value))))
+    return max(aim, DEFAULT_ARTICLE_WORD_AIM)
+
+
+def article_section_count_hint(profile: dict[str, Any]) -> int:
+    """Sections an article of the author's typical length would carry."""
+    sections = round(article_word_aim(profile) / TYPICAL_ARTICLE_SECTION_WORDS)
+    return max(MIN_ARTICLE_SECTION_HINT, min(MAX_ARTICLE_SECTION_HINT, int(sections)))
+
+
+def article_section_words(profile: dict[str, Any], *, sections: int) -> int:
+    """Per-section word budget that adds up to the author's article length."""
+    count = max(1, int(sections))
+    per_section = round(article_word_aim(profile) / count)
+    return int(
+        min(MAX_ARTICLE_SECTION_WORDS, max(MIN_ARTICLE_SECTION_WORDS, per_section))
+    )
+
+
 def build_style_profile(
     pieces: Iterable[Piece],
     *,
@@ -246,6 +336,7 @@ def build_style_profile(
     banned = list(banned_phrases) if banned_phrases is not None else list(BANNED_AI_FILLER)
     texts = [p.text for p in piece_list if (p.text or "").strip()]
     stats.update(post_length_stats(piece_list))
+    stats.update(article_length_stats(piece_list))
     stats.update(sentence_length_spread(texts))
     stats["multi_sentence_paragraph_ratio"] = multi_sentence_paragraph_ratio(texts)
     return {
@@ -284,14 +375,20 @@ def draft_word_aim(profile: dict[str, Any]) -> int:
     return min(DEFAULT_DRAFT_WORD_TARGET, draft_word_target(profile))
 
 
-def style_directives(profile: dict[str, Any]) -> list[str]:
+def style_directives(profile: dict[str, Any], *, channel: str = "post") -> list[str]:
     """Render the style card as prompt directives.
 
     Derived numbers, not the author's sentences. The exemplar path hands the
     model copyable text and it copies; cadence targets carry the same voice
     signal with nothing to paste.
+
+    ``channel='article'`` drops the post length directive. Cadence transfers
+    across channels; a word budget does not, and telling an article section to
+    stay under the LinkedIn post ceiling is how a longform draft came out post
+    length. The article path states its own budget per section.
     """
     stats = profile.get("stats") or {}
+    is_article = (channel or "post").strip().lower() == "article"
     directives: list[str] = []
 
     low = float(stats.get("sentence_words_p25") or 0)
@@ -323,7 +420,7 @@ def style_directives(profile: dict[str, Any]) -> list[str]:
         )
 
     median_post = float(stats.get("median_post_words") or 0)
-    if median_post:
+    if median_post and not is_article:
         directives.append(
             f"Target roughly {median_post:.0f} words total. Never exceed "
             f"{draft_word_target(profile)} words. Stop when the point is made."
