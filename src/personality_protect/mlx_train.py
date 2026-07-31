@@ -42,7 +42,10 @@ DEFAULT_LORA_RANK = 8
 WRITER_NUM_LAYERS = 16
 WRITER_LORA_RANK = 16
 WRITER_LEARNING_RATE = 3e-5
-WRITER_EPOCHS = 10
+# 10 epochs on ~60 de-voiced pairs drove train loss ~0.08 and raised invention /
+# parroting on the n=20 gate. Three passes is enough to move the adapter without
+# memorizing the tiny set; mid-train step snapshots let a later gate pick earlier.
+WRITER_EPOCHS = 3
 # Cap wired Metal memory: leave OS/apps breathing room.
 DEFAULT_WIRED_FRACTION = 0.40
 DEFAULT_WIRED_CAP_BYTES = 16 * 10**9  # 16 GB hard cap (leave Studio headroom)
@@ -51,6 +54,10 @@ PROOF_MAX_STEPS = 150  # enough for real receipts without a marathon
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 CHECKPOINT_META_NAME = "train_chunks.json"
+# Durable per-chunk copies under adapter_dir/checkpoints/step_NNNNNN/.
+# Distinct from mlx-lm's ephemeral ``0000050_adapters.safetensors`` which each
+# chunk overwrites with the same name.
+STEP_CHECKPOINTS_DIRNAME = "checkpoints"
 # Snapshot before each chunk so nan / crash never leaves a wiped or poisoned adapter.
 LAST_GOOD_ADAPTER_NAME = "adapters.safetensors.last_good"
 
@@ -77,6 +84,47 @@ def restore_last_good_adapter(adapter_dir: Path) -> bool:
     dest = adapter_dir / "adapters.safetensors"
     shutil.copy2(src, dest)
     return True
+
+
+def persist_step_checkpoint(adapter_dir: Path, completed_steps: int) -> Path | None:
+    """Copy live weights into ``checkpoints/step_NNNNNN/`` after a good chunk.
+
+    mlx-lm's own numbered files reuse the same basename every chunk, so earlier
+    steps disappear. These directories keep every completed step count so a gate
+    can evaluate under-trained adapters without a full retrain.
+    """
+    src = adapter_dir / "adapters.safetensors"
+    if not src.is_file():
+        return None
+    steps = max(0, int(completed_steps))
+    dest_dir = adapter_dir / STEP_CHECKPOINTS_DIRNAME / f"step_{steps:06d}"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest_dir / "adapters.safetensors")
+    for name in ("adapter_config.json", "adapter_config.yaml"):
+        cfg = adapter_dir / name
+        if cfg.is_file():
+            shutil.copy2(cfg, dest_dir / name)
+    return dest_dir
+
+
+def list_step_checkpoints(adapter_dir: Path) -> list[Path]:
+    """Return step checkpoint dirs oldest-first (under-trained → final)."""
+    root = adapter_dir / STEP_CHECKPOINTS_DIRNAME
+    if not root.is_dir():
+        return []
+    dirs = [
+        path
+        for path in root.iterdir()
+        if path.is_dir() and (path / "adapters.safetensors").is_file()
+    ]
+    return sorted(dirs, key=lambda path: path.name)
+
+
+def clear_step_checkpoints(adapter_dir: Path) -> None:
+    """Drop durable step snapshots (used on ``--force-retrain``)."""
+    root = adapter_dir / STEP_CHECKPOINTS_DIRNAME
+    if root.is_dir():
+        shutil.rmtree(root)
 
 
 def plan_train_chunks(total_steps: int, chunk_size: int) -> list[int]:
@@ -164,9 +212,13 @@ def _clear_adapter_weights(adapter_dir: Path) -> None:
         adapter_file.unlink()
     for stale in adapter_dir.glob("*_adapters.safetensors"):
         stale.unlink()
+    last_good = adapter_dir / LAST_GOOD_ADAPTER_NAME
+    if last_good.is_file():
+        last_good.unlink()
     meta_path = adapter_dir / CHECKPOINT_META_NAME
     if meta_path.is_file():
         meta_path.unlink()
+    clear_step_checkpoints(adapter_dir)
 
 
 def resolve_train_plan(
@@ -697,6 +749,7 @@ def run_chunked_mlx_train(
 
         completed += n_iters
         status = "complete" if completed >= plan.total_steps else "in_progress"
+        step_ckpt = persist_step_checkpoint(adapter_dir, completed)
         chunk_meta = {
             "status": status,
             "completed_steps": completed,
@@ -715,6 +768,7 @@ def run_chunked_mlx_train(
             "already_completed": plan.already_completed,
             "steps_this_run": completed - plan.already_completed,
             "chunks": total_chunk_count,
+            "step_checkpoint": str(step_ckpt) if step_ckpt is not None else None,
         }
         write_train_checkpoint_meta(adapter_dir, chunk_meta)
 
@@ -727,6 +781,7 @@ def run_chunked_mlx_train(
                     "completed_steps": completed,
                     "total_steps": plan.total_steps,
                     "peak_mem_gb": result.peak_mem_gb,
+                    "step_checkpoint": str(step_ckpt) if step_ckpt is not None else None,
                 }
             )
 

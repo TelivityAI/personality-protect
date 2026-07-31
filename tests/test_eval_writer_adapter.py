@@ -162,3 +162,48 @@ def test_gate_refuses_a_holdout_that_leaked_into_retrieval(tmp_path: Path, monke
             generate_fn_rag=_fixed(RAG_DRAFT),
             k=0,
         )
+
+
+def test_checkpoint_sweep_keeps_the_first_shipping_step(tmp_path: Path):
+    from personality_protect.eval_writer_adapter import run_checkpoint_gate_sweep
+    from personality_protect.mlx_train import persist_step_checkpoint
+
+    paths = _profile(tmp_path)
+    latest = paths.adapters_dir / "latest"
+    (latest / "adapters.safetensors").write_bytes(b"early")
+    persist_step_checkpoint(latest, 50)
+    (latest / "adapters.safetensors").write_bytes(b"late")
+    persist_step_checkpoint(latest, 100)
+
+    calls: list[str] = []
+
+    def _make(adapter_path: str):
+        calls.append(Path(adapter_path).name)
+        # Early checkpoint wins the distance game; late one mirrors the RAG loser.
+        if Path(adapter_path).name == "step_000050":
+            return _fixed(ADAPTER_DRAFT)
+        return _fixed(RAG_DRAFT)
+
+    sweep = run_checkpoint_gate_sweep(
+        paths,
+        ["hold1", "hold2"],
+        make_adapter_generate=_make,
+        generate_fn_rag=_fixed(RAG_DRAFT),
+        k=0,
+        alpha=1.0,  # majority alone is enough for Contoso stub n=2
+    )
+    assert sweep["decision"] == "keep"
+    assert sweep["kept_checkpoint"] == "step_000050"
+    assert sweep["evaluated"] == 1  # stop at first keep
+    assert calls == ["step_000050"]
+    assert (latest / "adapters.safetensors").read_bytes() == b"early"
+    assert_receipt_contoso_safe(sweep)
+
+
+def test_writer_epochs_default_is_short_enough_to_avoid_overfit():
+    from personality_protect.mlx_train import WRITER_EPOCHS
+    from personality_protect.train import auto_max_steps, writer_train_settings
+
+    assert WRITER_EPOCHS == 3
+    assert writer_train_settings()["epochs"] == 3
+    assert auto_max_steps(60, epochs=WRITER_EPOCHS) == 180

@@ -300,12 +300,14 @@ Nothing here is needed for a draft. These commands stay in the CLI for local exp
 
 ```bash
 personality-protect build-writer-sft
+personality-protect select-writer-holdouts --apply
+personality-protect index-voice --from-carve
 personality-protect train --writer --backend mlx
-personality-protect eval-write-holdout --out receipt.json
+personality-protect eval-writer-adapter --archive-on-fail
 personality-protect write --adapter --topic "…" --points "…"
 ```
 
-Keep an adapter only if `eval-write-holdout` shows it beating RAG-alone on held-out pieces. Otherwise delete it and stay on the default. Training is not a prerequisite for `write`, and an untested adapter is not an upgrade.
+`build-writer-sft` builds de-voiced brief→post pairs. `train --writer` uses a short writer recipe (3 epochs) and keeps per-chunk checkpoints under `adapters/latest/checkpoints/`. Keep an adapter only when `eval-writer-adapter` decides `keep`; otherwise archive it and stay on `adapter=none`. Training is not a prerequisite for `write`.
 
 ### Other experiment commands
 

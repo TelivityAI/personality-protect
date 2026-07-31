@@ -570,6 +570,37 @@ def test_chunked_train_writes_meta_after_each_chunk(tmp_path: Path):
     assert metas_during[1] is not None
     assert metas_during[1]["completed_steps"] == 50
     assert metas_during[1]["status"] == "in_progress"
+    from personality_protect.mlx_train import list_step_checkpoints
+
+    steps = [p.name for p in list_step_checkpoints(adapter_dir)]
+    assert steps == ["step_000050", "step_000100", "step_000120"]
+    assert (adapter_dir / "checkpoints" / "step_000050" / "adapters.safetensors").is_file()
+
+
+def test_persist_step_checkpoint_roundtrip(tmp_path: Path):
+    from personality_protect.mlx_train import (
+        clear_step_checkpoints,
+        list_step_checkpoints,
+        persist_step_checkpoint,
+    )
+
+    adapter_dir = tmp_path / "adapters"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapters.safetensors").write_bytes(b"w50")
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    dest = persist_step_checkpoint(adapter_dir, 50)
+    assert dest is not None
+    assert dest.name == "step_000050"
+    assert (dest / "adapters.safetensors").read_bytes() == b"w50"
+    assert (dest / "adapter_config.json").read_text(encoding="utf-8") == "{}"
+    (adapter_dir / "adapters.safetensors").write_bytes(b"w100")
+    persist_step_checkpoint(adapter_dir, 100)
+    assert [p.name for p in list_step_checkpoints(adapter_dir)] == [
+        "step_000050",
+        "step_000100",
+    ]
+    clear_step_checkpoints(adapter_dir)
+    assert list_step_checkpoints(adapter_dir) == []
 
 
 def test_chunked_train_resume_skips_completed_steps(tmp_path: Path):
