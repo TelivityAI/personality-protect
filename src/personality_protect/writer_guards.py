@@ -504,3 +504,16 @@ def check_invention(brief: str, draft: str) -> InventionResult:
         invented_entities=frozenset(invented_entities),
         invented_numbers=frozenset(invented_numbers),
     )
+
+
+def brief_allowed_facts(brief: str) -> dict[str, list[str]]:
+    """Entities and figures the draft may reuse from the visible brief.
+
+    Returned as sorted lists for Contoso-safe prompts and receipts — never as
+    free prose from the author corpus.
+    """
+    text = brief or ""
+    return {
+        "entities": sorted(extract_entity_keys(text)),
+        "numbers": sorted(extract_evidence_number_keys(text)),
+    }

@@ -8,24 +8,24 @@ import pytest
 from contoso_articles import contoso_articles, contoso_post
 
 from personality_protect.config import init_profile
+from personality_protect.draft_trim import word_count
 from personality_protect.models import save_index
 from personality_protect.style_profile import (
     article_section_words,
-    article_word_aim,
     build_style_profile,
     draft_word_target,
     save_style_profile,
 )
 from personality_protect.voice_index import build_voice_index
-from personality_protect.write import run_write
+from personality_protect.write import build_brief, run_write
 from personality_protect.write_article import (
     MIN_ARTICLE_CORPUS,
     SECTION_TRIM_HEADROOM,
-    article_draft_ceiling,
     assert_article_corpus,
     count_indexed_article_pieces,
     outline_from_brief,
     run_write_article,
+    scale_section_words_for_brief,
 )
 
 BRIEF_POINTS = "- Name one owner\n- Cut exceptions\n- Keep Ledger boring"
@@ -129,12 +129,19 @@ def test_section_budget_comes_from_article_length_not_the_post_ceiling(tmp_path:
         prompt_sink=sinks,
     )
     style = build_style_profile([*contoso_articles(6), contoso_post()])
-    expected = article_section_words(style, sections=3)
+    brief_words = word_count(build_brief("Contoso packaging", BRIEF_POINTS))
+    expected = scale_section_words_for_brief(
+        article_section_words(style, sections=3),
+        brief_words=brief_words,
+        sections=3,
+    )
     assert result["section_words"] == expected
-    assert result["word_aim"] == article_word_aim(style)
+    assert result["word_aim"] == expected * 3
     # The post ceiling is a LinkedIn character limit and must not be the target.
-    assert f"Write about {expected} words in this section" in seen[0]
+    assert f"Aim for about {expected} words in this section" in seen[0]
     assert f"Never exceed {draft_word_target(style)} words" not in seen[0]
+    assert "ALLOWED names from the BRIEF only" in seen[0]
+    assert "Prefer stopping early over inventing" in seen[0]
 
 
 def test_section_prompt_states_its_place_in_the_article(tmp_path: Path):
@@ -169,9 +176,15 @@ def test_section_trim_keeps_a_long_section_from_running_away(tmp_path: Path):
         generate_fn=lambda _m, **_k: runaway,
     )
     style = build_style_profile([*contoso_articles(6), contoso_post()])
-    per_section = int(round(article_section_words(style, sections=3) * SECTION_TRIM_HEADROOM))
+    brief_words = word_count(build_brief("Contoso packaging", BRIEF_POINTS))
+    expected_words = scale_section_words_for_brief(
+        article_section_words(style, sections=3),
+        brief_words=brief_words,
+        sections=3,
+    )
+    per_section = int(round(expected_words * SECTION_TRIM_HEADROOM))
     assert result["section_trim_words"] == per_section
-    assert result["draft_words"] <= article_draft_ceiling(style, sections=3)
+    assert result["draft_words"] <= per_section * 3
 
 
 def test_article_retrieval_never_mixes_in_posts(tmp_path: Path):
@@ -187,6 +200,28 @@ def test_article_retrieval_never_mixes_in_posts(tmp_path: Path):
     )
     assert contoso_post().id not in result["exemplar_ids"]
     assert all(piece_id.startswith("contoso-article") for piece_id in result["exemplar_ids"])
+
+
+def test_inventing_section_is_dropped_from_the_stitch(tmp_path: Path):
+    _seed_articles(tmp_path, n=MIN_ARTICLE_CORPUS)
+    paths, _, _ = init_profile("contoso", home=tmp_path)
+    calls = {"n": 0}
+
+    def fake_generate(_messages, **_kwargs: object) -> str:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return (
+                "Fabrikam Northwind invented a packaging vendor Contoso never named."
+            )
+        return "Contoso names one owner and cuts exceptions. Keep Ledger boring."
+
+    result = run_write_article(
+        "Contoso packaging", BRIEF_POINTS, paths, k=1, generate_fn=fake_generate
+    )
+    assert result["dropped_sections"]
+    assert "Fabrikam" not in result["text"]
+    assert result["invent_reject"]
+    assert result["invented_entities"]
 
 
 def test_run_write_channel_article_delegates(tmp_path: Path):

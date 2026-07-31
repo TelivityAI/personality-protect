@@ -37,6 +37,7 @@ from personality_protect.write import (
     normalize_sentence_case,
 )
 from personality_protect.writer_guards import (
+    brief_allowed_facts,
     check_invention,
     mask_exemplar_entities,
     parrot_reject,
@@ -63,6 +64,11 @@ SECTION_TOKENS_PER_WORD = 2.0
 # Longform gives the model more room to copy, not less, so the clip stays short
 # and voice travels as measured cadence instead.
 ARTICLE_EXEMPLAR_WORDS = MAX_EXEMPLAR_WORDS
+# When the visible brief is thin, demanding a full article-length section is
+# what forces invention. Cap the per-section aim from brief richness instead.
+THIN_BRIEF_WORDS = 80
+THIN_SECTION_WORD_FLOOR = 80
+THIN_WORDS_PER_BRIEF_WORD = 2.5
 
 _BULLET_RE = re.compile(r"^\s*[-*•]\s+")
 
@@ -165,6 +171,32 @@ def _section_brief(topic: str, section: str, points: str) -> tuple[str, str]:
     )
 
 
+def scale_section_words_for_brief(
+    section_words: int,
+    *,
+    brief_words: int,
+    sections: int,
+) -> int:
+    """Lower the section aim when the brief cannot support a long expand.
+
+    A 60-word brief asking for 280 words per section is the invent pressure the
+    holdout measured. The scaled aim still leaves room to write, but stops
+    treating length as a hard quota over facts.
+    """
+    base = max(1, int(section_words))
+    n_sections = max(1, int(sections))
+    brief_n = max(0, int(brief_words))
+    if brief_n >= THIN_BRIEF_WORDS:
+        return base
+    # Total article aim ≈ brief_words * factor, split across sections.
+    thin_total = max(
+        THIN_SECTION_WORD_FLOOR * n_sections,
+        int(round(brief_n * THIN_WORDS_PER_BRIEF_WORD * n_sections)),
+    )
+    thin_per = max(THIN_SECTION_WORD_FLOOR, thin_total // n_sections)
+    return min(base, thin_per)
+
+
 def section_structure_directives(
     *,
     section: str,
@@ -173,21 +205,41 @@ def section_structure_directives(
     word_aim: int,
     section_words: int,
     section_trim_words: int,
+    allowed_entities: Sequence[str] = (),
+    allowed_numbers: Sequence[str] = (),
 ) -> list[str]:
-    """Where this section sits and how long it runs.
+    """Where this section sits, how long it may run, and which facts are allowed.
 
     Structure, not voice. Kept separate from the cadence card so the eval's
     control arm can be asked for an article of the same shape without also
     being handed the measured style profile — otherwise the comparison would
     only be establishing that asking for an article produces one.
     """
-    return [
+    lines = [
         f"This is section {index} of {total} in a longform article of about "
         f"{word_aim} words; the other sections cover the rest of the brief.",
         f"Write only the section about: {section}",
-        f"Write about {section_words} words in this section, and no more "
-        f"than {section_trim_words}.",
+        f"Aim for about {section_words} words in this section, and no more "
+        f"than {section_trim_words}. Prefer stopping early over inventing "
+        "facts to fill the count.",
     ]
+    entities = [str(item).strip() for item in allowed_entities if str(item).strip()]
+    numbers = [str(item).strip() for item in allowed_numbers if str(item).strip()]
+    if entities:
+        lines.append(
+            "ALLOWED names from the BRIEF only: " + ", ".join(entities) + "."
+        )
+    else:
+        lines.append(
+            "The BRIEF names no companies or people. Invent none."
+        )
+    if numbers:
+        lines.append(
+            "ALLOWED figures from the BRIEF only: " + ", ".join(numbers) + "."
+        )
+    else:
+        lines.append("The BRIEF has no figures. Write no numbers.")
+    return lines
 
 
 def _guard_flags(brief: str, draft: str, exemplars: Sequence[str]) -> dict[str, Any]:
@@ -228,15 +280,26 @@ def run_write_article(
     # not from the post band, whose ceiling is a LinkedIn character limit.
     word_aim = article_word_aim(style)
     word_ceiling = article_word_target(style)
-    section_words = article_section_words(style, sections=len(sections))
+    full_brief = build_brief(topic, points)
+    brief_words = word_count(full_brief)
+    section_words = scale_section_words_for_brief(
+        article_section_words(style, sections=len(sections)),
+        brief_words=brief_words,
+        sections=len(sections),
+    )
+    # Recompute the stitched aim so receipts and the eval ceiling match what
+    # sections were actually asked to write.
+    word_aim = max(word_aim, section_words * len(sections))
+    if brief_words < THIN_BRIEF_WORDS:
+        word_aim = section_words * len(sections)
     section_trim_words = int(round(section_words * SECTION_TRIM_HEADROOM))
     section_max_tokens = max(
         int(max_tokens), int(round(section_words * SECTION_TOKENS_PER_WORD))
     )
+    allowed = brief_allowed_facts(full_brief)
     generator = generate_fn or mlx_generate_no_adapter
     model_id = config.base_model or DEFAULT_MLX_MODEL
 
-    full_brief = build_brief(topic, points)
     matches = retrieve(
         full_brief,
         k=k,
@@ -258,8 +321,11 @@ def run_write_article(
     ]
 
     section_drafts: list[str] = []
+    dropped_sections: list[str] = []
     all_messages: list[list[dict[str, str]]] = []
     attempts_total = 0
+    dropped_invented_entities: set[str] = set()
+    dropped_invented_numbers: set[str] = set()
     last_guards: dict[str, Any] = {
         "parrot_reject": False,
         "invent_reject": False,
@@ -269,40 +335,58 @@ def run_write_article(
 
     for section in sections:
         section_topic, section_points = _section_brief(topic, section, points)
-        section_brief = build_brief(section_topic, section_points)
+        invent_brief = full_brief
         messages = build_write_messages(
             topic=section_topic,
             points=section_points,
             examples=masked,
+            channel="article",
             style_directives=[
                 *directives,
                 *section_structure_directives(
                     section=section,
-                    index=len(section_drafts) + 1,
+                    index=len(section_drafts) + len(dropped_sections) + 1,
                     total=len(sections),
                     word_aim=word_aim,
                     section_words=section_words,
                     section_trim_words=section_trim_words,
+                    allowed_entities=allowed["entities"],
+                    allowed_numbers=allowed["numbers"],
                 ),
             ],
         )
         all_messages.append(messages)
         draft = ""
+        kept = False
         for attempt in range(1, 3):
             attempts_total += 1
+            # Second attempt: stricter short budget if the first invents.
+            attempt_trim = section_trim_words
+            attempt_tokens = section_max_tokens
+            if attempt > 1:
+                attempt_trim = max(THIN_SECTION_WORD_FLOOR, section_words // 2)
+                attempt_tokens = max(
+                    256, int(round(attempt_trim * SECTION_TOKENS_PER_WORD))
+                )
             raw = str(
                 generator(
                     messages,
                     base_model=model_id,
-                    max_tokens=section_max_tokens,
+                    max_tokens=attempt_tokens,
                     prompt_sink=prompt_sink,
                 )
             ).strip()
-            draft = trim_draft(raw, max_words=section_trim_words)
-            last_guards = _guard_flags(section_brief, draft, exemplars)
+            draft = trim_draft(raw, max_words=attempt_trim)
+            last_guards = _guard_flags(invent_brief, draft, exemplars)
             if not last_guards["parrot_reject"] and not last_guards["invent_reject"]:
+                kept = True
                 break
-        section_drafts.append(draft)
+        if kept and draft.strip():
+            section_drafts.append(draft)
+        else:
+            dropped_sections.append(section)
+            dropped_invented_entities.update(last_guards.get("invented_entities") or [])
+            dropped_invented_numbers.update(last_guards.get("invented_numbers") or [])
 
     # Sections are generated independently from the same brief, so two of them
     # can arrive as the same paragraph. Stitching them unfiltered is what turns
@@ -312,6 +396,16 @@ def run_write_article(
     ).strip()
     # Final invent check against the full brief the author supplied.
     final_guards = _guard_flags(full_brief, text, exemplars)
+    if dropped_sections:
+        final_guards["invent_reject"] = True
+        final_guards["invented_entities"] = sorted(
+            set(final_guards["invented_entities"]) | dropped_invented_entities
+        )
+        final_guards["invented_numbers"] = sorted(
+            set(final_guards["invented_numbers"]) | dropped_invented_numbers
+        )
+    if not section_drafts:
+        final_guards["invent_reject"] = True
 
     return {
         "text": text,
@@ -330,8 +424,11 @@ def run_write_article(
         "section_count_hint": article_section_count_hint(style),
         "article_count": article_count,
         "sections": sections,
-        "section_count": len(sections),
+        "section_count": len(section_drafts),
+        "dropped_sections": dropped_sections,
         "draft_words": word_count(text),
+        "allowed_entities": allowed["entities"],
+        "allowed_numbers": allowed["numbers"],
         **final_guards,
         "exemplar_texts": exemplars,
         "messages": all_messages[0] if all_messages else [],

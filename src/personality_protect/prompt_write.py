@@ -38,6 +38,30 @@ WRITE_SYSTEM_PROMPT = (
     "lines, no hashtags copied from the EXAMPLES."
 )
 
+WRITE_ARTICLE_SYSTEM_PROMPT = (
+    "You write one section of a LinkedIn article in the author's voice.\n"
+    "\n"
+    "Rules:\n"
+    "- Write ONLY the current section about the BRIEF. The BRIEF is the only "
+    "source of facts.\n"
+    "- Expand claims already in the BRIEF. Prefer a shorter true section over "
+    "padding that invents companies, people, products, places, or figures.\n"
+    "- Do not invent companies, people, products, or figures the BRIEF did not "
+    "give you. If the BRIEF has no number, write no number.\n"
+    "- Follow the VOICE cadence targets. Treat the section word aim as a soft "
+    "ceiling: stop early rather than invent.\n"
+    "- The EXAMPLES are rhythm reference only: match their line lengths, "
+    "paragraph breaks, and sentence cadence.\n"
+    "- Never copy, quote, continue, summarize, or list the EXAMPLES. Reuse none "
+    "of their words, sentences, facts, names, numbers, or links.\n"
+    "- Names have been removed from the EXAMPLES. Do not guess them, and never "
+    "output bracketed or capitalized placeholders of any kind.\n"
+    "- No AI filler (leverage, delve, moreover, tapestry).\n"
+    "- Output the section text and nothing else: no title, no preamble, "
+    "no commentary, no markdown headings, no section labels, no separator "
+    "lines, no hashtags copied from the EXAMPLES."
+)
+
 _EXAMPLES_HEADER = (
     "EXAMPLES (rhythm reference only — names removed; never reuse their words, "
     "facts, or names):"
@@ -47,6 +71,11 @@ _WRITE_INSTRUCTION = "Write one new post from the BRIEF now."
 _WRITE_INSTRUCTION_WITH_EXAMPLES = (
     "Write one new post from the BRIEF now, in the rhythm of the EXAMPLES. "
     "Do not repeat any EXAMPLE."
+)
+_WRITE_ARTICLE_INSTRUCTION = "Write this article section from the BRIEF now."
+_WRITE_ARTICLE_INSTRUCTION_WITH_EXAMPLES = (
+    "Write this article section from the BRIEF now, in the rhythm of the "
+    "EXAMPLES. Do not repeat any EXAMPLE."
 )
 
 
@@ -59,6 +88,7 @@ def build_write_user_content(
     points: str,
     examples: Sequence[str],
     style_directives: Sequence[str] = (),
+    channel: str = "post",
 ) -> str:
     """User turn: voice card, optional exemplars, the brief, then the instruction.
 
@@ -81,7 +111,14 @@ def build_write_user_content(
     if kept:
         blocks.append(_EXAMPLES_HEADER + "\n\n" + _EXAMPLE_SEPARATOR.join(kept))
     blocks.append(f"BRIEF:\nTopic: {topic}\nPoints:\n{points}")
-    blocks.append(_WRITE_INSTRUCTION_WITH_EXAMPLES if kept else _WRITE_INSTRUCTION)
+    if channel == "article":
+        blocks.append(
+            _WRITE_ARTICLE_INSTRUCTION_WITH_EXAMPLES
+            if kept
+            else _WRITE_ARTICLE_INSTRUCTION
+        )
+    else:
+        blocks.append(_WRITE_INSTRUCTION_WITH_EXAMPLES if kept else _WRITE_INSTRUCTION)
     return "\n\n".join(blocks)
 
 
@@ -91,10 +128,14 @@ def build_write_messages(
     points: str,
     examples: Sequence[str],
     style_directives: Sequence[str] = (),
+    channel: str = "post",
 ) -> list[dict[str, str]]:
     """Locked writing prompt as chat turns (system + user)."""
+    system = (
+        WRITE_ARTICLE_SYSTEM_PROMPT if channel == "article" else WRITE_SYSTEM_PROMPT
+    )
     return [
-        {"role": "system", "content": WRITE_SYSTEM_PROMPT},
+        {"role": "system", "content": system},
         {
             "role": "user",
             "content": build_write_user_content(
@@ -102,6 +143,7 @@ def build_write_messages(
                 points=points,
                 examples=examples,
                 style_directives=style_directives,
+                channel=channel,
             ),
         },
     ]
@@ -113,6 +155,7 @@ def build_write_prompt(
     points: str,
     examples: Sequence[str],
     style_directives: Sequence[str] = (),
+    channel: str = "post",
 ) -> str:
     """Flat rendering of the locked prompt (no chat template available)."""
     return flatten_chat_messages(
@@ -121,5 +164,6 @@ def build_write_prompt(
             points=points,
             examples=examples,
             style_directives=style_directives,
+            channel=channel,
         )
     )

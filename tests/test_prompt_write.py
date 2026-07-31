@@ -1,6 +1,7 @@
 """Tests for the locked RAG writing prompt (chat turns + flat fallback)."""
 
 from personality_protect.prompt_write import (
+    WRITE_ARTICLE_SYSTEM_PROMPT,
     WRITE_SYSTEM_PROMPT,
     build_write_messages,
     build_write_prompt,
@@ -30,6 +31,21 @@ def test_build_write_messages_are_system_plus_user():
     # turn marker is the generation prompt, and "POST:" was scaffolding
     # the old path echoed.
     assert "POST:" not in user
+
+
+def test_article_channel_uses_article_system_prompt_not_post_shaped():
+    messages = build_write_messages(
+        topic="Contoso packaging",
+        points="- Name one owner\n- Cut exceptions",
+        examples=["Short Contoso lines."],
+        channel="article",
+    )
+    assert messages[0]["content"] == WRITE_ARTICLE_SYSTEM_PROMPT
+    assert "You write one section of a LinkedIn article" in messages[0]["content"]
+    assert "Write ONE new post" not in messages[0]["content"]
+    assert "Prefer a shorter true section" in messages[0]["content"]
+    assert "Write this article section from the BRIEF now" in messages[1]["content"]
+    assert "Write one new post from the BRIEF now" not in messages[1]["content"]
 
 
 def test_build_write_prompt_flat_fallback_matches_locked_content():
