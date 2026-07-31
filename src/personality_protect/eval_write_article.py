@@ -40,7 +40,7 @@ from personality_protect.article_brief import (
 from personality_protect.chat_prompt import flatten_chat_messages
 from personality_protect.config import ProfilePaths, load_config
 from personality_protect.corpus_text import normalize_corpus_text
-from personality_protect.draft_trim import drop_repeated_paragraphs, trim_draft
+from personality_protect.draft_trim import drop_repeated_paragraphs, trim_draft, word_count
 from personality_protect.eval_write_holdout import (
     TIE_EPSILON,
     assert_receipt_contoso_safe,
@@ -53,21 +53,28 @@ from personality_protect.eval_writer_adapter import sign_test_p_value
 from personality_protect.prompt_write import build_write_messages
 from personality_protect.style_profile import (
     article_section_words,
-    article_word_aim,
     load_style_profile,
 )
-from personality_protect.write import DEFAULT_WRITE_K, GenerateFn, mlx_generate_no_adapter
+from personality_protect.write import (
+    DEFAULT_WRITE_K,
+    GenerateFn,
+    build_brief,
+    mlx_generate_no_adapter,
+)
 from personality_protect.write_article import (
     DEFAULT_ARTICLE_SECTION_MAX_TOKENS,
     SECTION_TOKENS_PER_WORD,
     SECTION_TRIM_HEADROOM,
+    THIN_SECTION_WORD_FLOOR,
+    _guard_flags,
     _section_brief,
-    article_draft_ceiling,
     count_indexed_article_pieces,
     outline_from_brief,
     run_write_article,
+    scale_section_words_for_brief,
     section_structure_directives,
 )
+from personality_protect.writer_guards import brief_allowed_facts
 
 # One-sided bar, matching the writer ship gate. Stated rather than enforced:
 # with fourteen articles a carve cannot exceed five, and a clean sweep of three
@@ -84,18 +91,29 @@ def article_word_budget(paths: ProfilePaths, topic: str, points: str) -> dict[st
     """
     style = load_style_profile(paths)
     sections = outline_from_brief(topic, points)
-    section_words = article_section_words(style, sections=len(sections))
+    brief = build_brief(topic, points)
+    brief_words = word_count(brief)
+    section_words = scale_section_words_for_brief(
+        article_section_words(style, sections=len(sections)),
+        brief_words=brief_words,
+        sections=len(sections),
+    )
+    word_aim = section_words * len(sections)
+    allowed = brief_allowed_facts(brief)
     return {
         "sections": sections,
         "section_count": len(sections),
-        "word_aim": article_word_aim(style),
+        "word_aim": word_aim,
         "section_words": section_words,
         "section_trim_words": int(round(section_words * SECTION_TRIM_HEADROOM)),
-        "word_ceiling": article_draft_ceiling(style, sections=len(sections)),
+        "word_ceiling": int(round(section_words * SECTION_TRIM_HEADROOM)) * len(sections),
         "max_tokens": max(
             DEFAULT_ARTICLE_SECTION_MAX_TOKENS,
             int(round(section_words * SECTION_TOKENS_PER_WORD)),
         ),
+        "allowed_entities": allowed["entities"],
+        "allowed_numbers": allowed["numbers"],
+        "visible_brief": brief,
     }
 
 
@@ -122,13 +140,16 @@ def run_bare_base_article(
     exemplars and the measured style profile — which is the only thing the
     comparison is meant to be about.
     """
+    invent_brief = str(budget.get("visible_brief") or build_brief(topic, points))
     section_drafts: list[str] = []
+    messages: list[dict[str, str]] = []
     for index, section in enumerate(budget["sections"], start=1):
         section_topic, section_points = _section_brief(topic, section, points)
         messages = build_write_messages(
             topic=section_topic,
             points=section_points,
             examples=(),
+            channel="article",
             style_directives=section_structure_directives(
                 section=section,
                 index=index,
@@ -136,17 +157,35 @@ def run_bare_base_article(
                 word_aim=budget["word_aim"],
                 section_words=budget["section_words"],
                 section_trim_words=budget["section_trim_words"],
+                allowed_entities=budget.get("allowed_entities") or (),
+                allowed_numbers=budget.get("allowed_numbers") or (),
             ),
         )
-        raw = str(
-            generate_fn(
-                messages,
-                base_model=base_model,
-                max_tokens=budget["max_tokens"],
-                prompt_sink=prompt_sink,
-            )
-        ).strip()
-        section_drafts.append(trim_draft(raw, max_words=budget["section_trim_words"]))
+        draft = ""
+        kept = False
+        for attempt in range(1, 3):
+            attempt_trim = budget["section_trim_words"]
+            attempt_tokens = budget["max_tokens"]
+            if attempt > 1:
+                attempt_trim = max(THIN_SECTION_WORD_FLOOR, budget["section_words"] // 2)
+                attempt_tokens = max(
+                    256, int(round(attempt_trim * SECTION_TOKENS_PER_WORD))
+                )
+            raw = str(
+                generate_fn(
+                    messages,
+                    base_model=base_model,
+                    max_tokens=attempt_tokens,
+                    prompt_sink=prompt_sink,
+                )
+            ).strip()
+            draft = trim_draft(raw, max_words=attempt_trim)
+            guards = _guard_flags(invent_brief, draft, ())
+            if not guards["parrot_reject"] and not guards["invent_reject"]:
+                kept = True
+                break
+        if kept and draft.strip():
+            section_drafts.append(draft)
 
     text = drop_repeated_paragraphs(
         "\n\n".join(part for part in section_drafts if part.strip())
@@ -158,7 +197,7 @@ def run_bare_base_article(
         "model": base_model,
         "k": 0,
         "exemplar_ids": [],
-        "section_count": len(budget["sections"]),
+        "section_count": len(section_drafts),
         "prompt": flatten_chat_messages(messages) if budget["sections"] else "",
     }
 
@@ -326,19 +365,46 @@ def run_eval_write_article(
             base_model=config.base_model,
             prompt_sink=base_prompts,
         )
+        visible = f"{brief['topic']}\n{brief['points']}"
         score = score_rag_vs_base(
             holdout_text,
             article_result["text"],
             base_result["text"],
-            brief["guard_facts"],
+            # Invent against the same visible brief the product arm fact-locks
+            # to — not the full source article the model never saw.
+            visible,
             rag_exemplars=list(article_result.get("exemplar_texts") or []),
             tie_epsilon=tie_epsilon,
-            # Invention is judged against the article; echo against the outline
-            # the model was handed. On a de-voiced brief those are different
-            # texts, and checking echo against the article would miss a draft
-            # that simply lists the bullets back.
-            visible_brief=f"{brief['topic']}\n{brief['points']}",
+            visible_brief=visible,
         )
+        # Sections dropped for invent never reach the stitch; surface that as
+        # invent DQ even when the remaining text is empty or brief-clean.
+        if article_result.get("invent_reject"):
+            score["rag"]["invent_reject"] = True
+            score["rag"]["disqualified"] = True
+            score["rag"]["invented_entities"] = sorted(
+                set(score["rag"].get("invented_entities") or [])
+                | set(article_result.get("invented_entities") or [])
+            )
+            score["rag"]["invented_numbers"] = sorted(
+                set(score["rag"].get("invented_numbers") or [])
+                | set(article_result.get("invented_numbers") or [])
+            )
+            score["rag"]["invented_entities_count"] = len(
+                score["rag"]["invented_entities"]
+            )
+            score["rag"]["invented_numbers_count"] = len(
+                score["rag"]["invented_numbers"]
+            )
+            if score["winner"] == "rag":
+                score["winner"] = "base" if not score["base"]["disqualified"] else "tie"
+        if base_result.get("section_count", 1) == 0:
+            score["base"]["invent_reject"] = True
+            score["base"]["disqualified"] = True
+            if score["winner"] == "base":
+                score["winner"] = (
+                    "rag" if not score["rag"]["disqualified"] else "tie"
+                )
         item = _item_receipt(
             holdout_id=piece.id,
             holdout_text=holdout_text,

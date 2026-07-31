@@ -200,7 +200,7 @@ personality-protect write --topic "…" --points "…" --json
 
 `--topic` and `--points` are the only content the draft may use; retrieved pieces supply rhythm, not facts. Every `write` above runs base weights (`adapter=none`).
 
-On `--channel article`, each `--points` bullet becomes a section (2–8), retrieval is restricted to `linkedin_article` pieces so posts cannot become the rhythm reference, and sections that restate each other are dropped before stitching. The channel refuses to draft unless at least five `linkedin_article` pieces are in the corpus *and* five are in the voice index — a large carve that leaves retrieval empty is an error, not a silently thinner draft.
+On `--channel article`, each `--points` bullet becomes a section (2–8), retrieval is restricted to `linkedin_article` pieces so posts cannot become the rhythm reference, and sections that restate each other are dropped before stitching. Section prompts use an article-specific system rule set: the BRIEF is the only fact source, allowed names/figures from the BRIEF are listed explicitly, thin briefs lower the per-section word aim, and a section that still invents after retry is omitted from the stitch rather than padded in. The channel refuses to draft unless at least five `linkedin_article` pieces are in the corpus *and* five are in the voice index — a large carve that leaves retrieval empty is an error, not a silently thinner draft.
 
 ### Article holdout eval
 
@@ -215,7 +215,7 @@ PP_MLX_ALLOW=1 personality-protect eval-write-article --out receipt.json
 
 The carve is deterministic (`blake2b(piece_id)` order), keeps previously carved ids pinned, and never drops the voice index below the five-article floor. Each holdout is reduced to a lossy brief — a topic plus 3–6 section bullets drawn one per segment of the piece, capped at 60 words and 10% of the source — so neither arm is handed the article back to paraphrase.
 
-Two arms then write the same brief with the same outline, per-section budget, and trim. The product arm gets retrieved exemplars and the measured style card; the control arm gets neither. Drafts are scored on distance to the holdout's own cadence axes, and a draft that parrots its exemplars, echoes the brief, or invents entities or figures is disqualified regardless of distance. Receipts carry ids, distances, and flags — never draft or corpus text.
+Two arms then write the same brief with the same outline, per-section budget, and trim. The product arm gets retrieved exemplars and the measured style card; the control arm gets neither. Invention is judged against the visible brief both arms saw (not the full source article). Drafts are scored on distance to the holdout's own cadence axes, and a draft that parrots its exemplars, echoes the brief, or invents entities or figures is disqualified regardless of distance. Receipts carry ids, distances, and flags — never draft or corpus text.
 
 The verdict needs all three of: the article arm wins the majority, the margin clears `--alpha` (default 0.10) on a one-sided sign test, and it is not disqualified more often than the control. When both arms are disqualified on every holdout, distance never decided anything, and the receipt says so (`distance_ever_decided: false`) rather than reporting it as a cadence loss.
 

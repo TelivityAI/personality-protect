@@ -94,7 +94,8 @@ def test_control_arm_writes_an_article_without_the_voice_machinery(tmp_path: Pat
 
     def fake_generate(messages, **_kwargs: object) -> str:
         seen.append(messages[1]["content"])
-        return f"Contoso Ledger paragraph for section {len(seen)} of the piece."
+        # Stay inside the brief — Contoso is allowed; invented vendors are not.
+        return f"Contoso packaging section {len(seen)} covers the one claim."
 
     result = run_bare_base_article(
         "Contoso packaging",
@@ -105,10 +106,11 @@ def test_control_arm_writes_an_article_without_the_voice_machinery(tmp_path: Pat
     )
     assert result["mode"] == "bare_base_article"
     assert result["section_count"] == 3
-    assert len(seen) == 3
+    assert len(seen) >= 3
     # Same structure as the product arm...
     assert "section 1 of 3" in seen[0]
-    assert f"Write about {budget['section_words']} words" in seen[0]
+    assert f"Aim for about {budget['section_words']} words" in seen[0]
+    assert "ALLOWED names from the BRIEF only" in seen[0]
     # ...and none of the voice machinery.
     assert "EXAMPLES" not in seen[0]
     assert "Sentence length varies" not in seen[0]
@@ -135,7 +137,7 @@ def test_both_arms_see_the_same_outline_and_budget(tmp_path: Path):
     assert "Never use these words" in article_prompts[0]
     assert "Never use these words" not in base_prompts[0]
     assert "EXAMPLES" not in base_prompts[0]
-    for line in ("section 1 of", "Write about", "Write only the section about:"):
+    for line in ("section 1 of", "Aim for about", "Write only the section about:"):
         assert line in article_prompts[0]
         assert line in base_prompts[0]
 
@@ -234,8 +236,10 @@ def test_invented_entities_disqualify_the_article_arm(tmp_path: Path):
         generate_fn_base=lambda _m, **_k: BASE_DRAFT,
     )
     item = receipt["items"][0]
-    assert item["article_invented_entities_count"] > 0
+    # Inventing sections are dropped from the stitch; the arm still DQs.
     assert item["article_disqualified"]
+    assert item["article_invent_reject"] or item["article_invented_entities_count"] > 0
+    assert item["winner"] != "article"
 
 
 def test_both_arms_are_held_to_the_same_length_ceiling(tmp_path: Path):
