@@ -117,6 +117,54 @@ def test_control_arm_writes_an_article_without_the_voice_machinery(tmp_path: Pat
     assert "Never use these words" not in seen[0]
 
 
+def test_control_arm_repairs_and_scrubs_like_the_product_arm(tmp_path: Path):
+    """A fact-lock only one arm has to survive would decide the comparison."""
+    paths, _ = _seed(tmp_path)
+    budget = article_word_budget(paths, "Contoso packaging", "- One\n- Two\n- Three")
+    seen: list[str] = []
+
+    def fake_generate(messages, **_kwargs: object) -> str:
+        prompt = messages[1]["content"]
+        seen.append(prompt)
+        if "REPAIR:" not in prompt:
+            return "The packaging work ran at Fabrikam Northwind for nine weeks."
+        return "Contoso packaging keeps one owner and one published list."
+
+    result = run_bare_base_article(
+        "Contoso packaging",
+        "- One\n- Two\n- Three",
+        budget=budget,
+        generate_fn=fake_generate,
+        base_model="contoso-local",
+    )
+    assert result["section_count"] == 3
+    assert len(result["repaired_sections"]) == 3
+    assert result["dropped_sections"] == []
+    assert "Fabrikam" not in result["text"]
+    repairs = [prompt for prompt in seen if "REPAIR:" in prompt]
+    assert len(repairs) == 3
+    assert "northwind" in repairs[0].lower()
+    # Still no voice machinery, repair or not.
+    assert "EXAMPLES" not in repairs[0]
+
+
+def test_control_arm_that_cannot_be_repaired_still_disqualifies(tmp_path: Path):
+    paths, holdouts = _carve(tmp_path)
+    invented = "The rollout ran at Fabrikam Northwind across two Tailspin Toys sites."
+    receipt = run_eval_write_article(
+        paths,
+        [holdouts[0]],
+        k=1,
+        generate_fn=lambda _m, **_k: ARTICLE_DRAFT,
+        generate_fn_base=lambda _m, **_k: invented,
+    )
+    item = receipt["items"][0]
+    assert item["base_dropped_sections"] == item["section_count"]
+    assert item["base_invent_reject"]
+    assert item["base_disqualified"]
+    assert item["winner"] != "base"
+
+
 def test_both_arms_see_the_same_outline_and_budget(tmp_path: Path):
     paths, holdouts = _carve(tmp_path)
     article_prompts: list[str] = []

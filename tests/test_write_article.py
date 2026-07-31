@@ -202,7 +202,80 @@ def test_article_retrieval_never_mixes_in_posts(tmp_path: Path):
     assert all(piece_id.startswith("contoso-article") for piece_id in result["exemplar_ids"])
 
 
-def test_inventing_section_is_dropped_from_the_stitch(tmp_path: Path):
+def test_inventing_section_is_repaired_instead_of_dropped(tmp_path: Path):
+    """The regenerate is told which names to lose, and the section survives."""
+    _seed_articles(tmp_path, n=MIN_ARTICLE_CORPUS)
+    paths, _, _ = init_profile("contoso", home=tmp_path)
+    seen: list[str] = []
+
+    def fake_generate(messages, **_kwargs: object) -> str:
+        prompt = messages[1]["content"]
+        seen.append(prompt)
+        if "REPAIR:" not in prompt:
+            return "The packaging programme ran at Fabrikam Northwind for nine weeks."
+        return "Contoso names one owner for packaging and writes that decision down."
+
+    result = run_write_article(
+        "Contoso packaging", BRIEF_POINTS, paths, k=1, generate_fn=fake_generate
+    )
+    assert result["section_count"] == 3
+    assert result["dropped_sections"] == []
+    assert len(result["repaired_sections"]) == 3
+    assert result["scrubbed_sections"] == []
+    assert "Fabrikam" not in result["text"]
+    assert not result["invent_reject"]
+
+    repairs = [prompt for prompt in seen if "REPAIR:" in prompt]
+    assert len(repairs) == 3
+    # The offenders are named, or the model is only being asked to guess again.
+    assert "fabrikam" in repairs[0].lower()
+    assert "9 weeks" in repairs[0]
+
+
+def test_scrub_keeps_the_clean_sentences_when_repair_still_invents(tmp_path: Path):
+    """A section the repair could not fix is cut down, not thrown away."""
+    _seed_articles(tmp_path, n=MIN_ARTICLE_CORPUS)
+    paths, _, _ = init_profile("contoso", home=tmp_path)
+
+    def fake_generate(_messages, **_kwargs: object) -> str:
+        return (
+            "One owner signs the packaging decision before a tier opens.\n"
+            "\n"
+            "Fabrikam Northwind published the same list first. Cut the "
+            "exceptions weekly and read the number out loud."
+        )
+
+    result = run_write_article(
+        "Contoso packaging", BRIEF_POINTS, paths, k=1, generate_fn=fake_generate
+    )
+    assert result["section_count"] >= 1
+    assert result["dropped_sections"] == []
+    assert len(result["scrubbed_sections"]) == 3
+    assert "Fabrikam" not in result["text"]
+    assert "One owner signs the packaging decision" in result["text"]
+    assert not result["invent_reject"]
+
+
+def test_section_is_emptied_only_when_repair_and_scrub_both_fail(tmp_path: Path):
+    """Nothing left to keep is the one case that still disqualifies the article."""
+    _seed_articles(tmp_path, n=MIN_ARTICLE_CORPUS)
+    paths, _, _ = init_profile("contoso", home=tmp_path)
+
+    def fake_generate(_messages, **_kwargs: object) -> str:
+        return "Fabrikam Northwind invented a packaging vendor nobody named."
+
+    result = run_write_article(
+        "Contoso packaging", BRIEF_POINTS, paths, k=1, generate_fn=fake_generate
+    )
+    assert result["section_count"] == 0
+    assert len(result["dropped_sections"]) == 3
+    assert result["text"] == ""
+    assert result["invent_reject"]
+    assert result["dropped_invented_entities"]
+
+
+def test_a_dropped_section_does_not_disqualify_a_clean_stitch(tmp_path: Path):
+    """One unrepairable section is a coverage gap, not a fabricated article."""
     _seed_articles(tmp_path, n=MIN_ARTICLE_CORPUS)
     paths, _, _ = init_profile("contoso", home=tmp_path)
     calls = {"n": 0}
@@ -210,18 +283,18 @@ def test_inventing_section_is_dropped_from_the_stitch(tmp_path: Path):
     def fake_generate(_messages, **_kwargs: object) -> str:
         calls["n"] += 1
         if calls["n"] <= 2:
-            return (
-                "Fabrikam Northwind invented a packaging vendor Contoso never named."
-            )
+            return "Fabrikam Northwind invented a packaging vendor nobody named."
         return "Contoso names one owner and cuts exceptions. Keep Ledger boring."
 
     result = run_write_article(
         "Contoso packaging", BRIEF_POINTS, paths, k=1, generate_fn=fake_generate
     )
     assert result["dropped_sections"]
+    assert result["section_count"] == 2
     assert "Fabrikam" not in result["text"]
-    assert result["invent_reject"]
-    assert result["invented_entities"]
+    assert not result["invent_reject"]
+    assert result["invented_entities"] == []
+    assert result["dropped_invented_entities"]
 
 
 def test_run_write_channel_article_delegates(tmp_path: Path):
