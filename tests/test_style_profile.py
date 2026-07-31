@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from contoso_articles import contoso_articles, contoso_post
 from typer.testing import CliRunner
 
 from personality_protect.cli import app
@@ -13,7 +14,15 @@ from personality_protect.models import Piece, save_index
 from personality_protect.select import Selection
 from personality_protect.style_profile import (
     BANNED_AI_FILLER,
+    DEFAULT_ARTICLE_WORD_AIM,
     LINKEDIN_POST_WORD_CEILING,
+    MAX_ARTICLE_SECTION_WORDS,
+    MIN_ARTICLE_SECTION_WORDS,
+    article_length_stats,
+    article_section_count_hint,
+    article_section_words,
+    article_word_aim,
+    article_word_target,
     build_style_profile,
     corpus_style_stats,
     draft_word_target,
@@ -283,3 +292,60 @@ def test_cli_build_style_profile_requires_selection(tmp_path: Path):
     )
     assert r.exit_code == 1
     assert "select" in r.output.lower() or "selection" in r.output.lower()
+
+
+def test_article_length_stats_measure_articles_only():
+    """Post-shaped pieces must not set the article band."""
+    pieces = [*contoso_articles(6), contoso_post()]
+    stats = article_length_stats(pieces)
+    assert stats["article_length_samples"] == 6
+    assert stats["median_article_words"] >= 200
+    assert stats["article_words_p90"] >= stats["median_article_words"]
+
+
+def test_article_stats_are_zero_without_articles():
+    """No articles means no measurement, not the post band under a new name."""
+    stats = article_length_stats([contoso_post()])
+    assert stats == {
+        "median_article_words": 0.0,
+        "article_words_p75": 0.0,
+        "article_words_p90": 0.0,
+        "article_length_samples": 0.0,
+    }
+
+
+def test_article_targets_clear_the_post_ceiling():
+    profile = build_style_profile([*contoso_articles(8), contoso_post()])
+    assert article_word_aim(profile) > LINKEDIN_POST_WORD_CEILING
+    assert article_word_target(profile) >= article_word_aim(profile)
+    assert article_word_target(profile) > draft_word_target(profile)
+
+
+def test_article_targets_fall_back_to_a_stated_default():
+    empty = build_style_profile([contoso_post()])
+    assert article_word_aim(empty) == DEFAULT_ARTICLE_WORD_AIM
+
+
+def test_section_budget_divides_the_article_across_the_outline():
+    profile = build_style_profile([*contoso_articles(8), contoso_post()])
+    aim = article_word_aim(profile)
+    two = article_section_words(profile, sections=2)
+    four = article_section_words(profile, sections=4)
+    assert two > four
+    assert MIN_ARTICLE_SECTION_WORDS <= four <= MAX_ARTICLE_SECTION_WORDS
+    assert abs(four * 4 - aim) <= aim * 0.5
+
+
+def test_section_count_hint_stays_inside_the_band():
+    profile = build_style_profile([*contoso_articles(8), contoso_post()])
+    assert 2 <= article_section_count_hint(profile) <= 8
+
+
+def test_article_directives_drop_the_post_word_ceiling():
+    profile = build_style_profile([*contoso_articles(8), contoso_post()])
+    post = " ".join(style_directives(profile))
+    article = " ".join(style_directives(profile, channel="article"))
+    assert "words total" in post
+    assert "words total" not in article
+    # Cadence still travels: only the length target is channel specific.
+    assert "Never use these words" in article
