@@ -253,3 +253,74 @@ def write_gate_receipt(receipt: dict[str, Any], path: Any) -> Any:
         json.dumps(receipt, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     return path
+
+
+def run_checkpoint_gate_sweep(
+    paths: ProfilePaths,
+    holdout_ids: Sequence[str],
+    *,
+    make_adapter_generate: Any,
+    generate_fn_rag: GenerateFn,
+    k: int = DEFAULT_WRITE_K,
+    max_tokens: int = DEFAULT_WRITE_MAX_TOKENS,
+    alpha: float = SHIP_ALPHA,
+    on_checkpoint: Any = None,
+) -> dict[str, Any]:
+    """Gate every durable step checkpoint, earliest first; keep the first that ships.
+
+    ``make_adapter_generate(adapter_path)`` must build a fresh generator for the
+    installed weights — reusing a prior MLX load would score the wrong adapter.
+    """
+    from personality_protect.mlx_train import list_step_checkpoints
+    from personality_protect.write import install_writer_checkpoint
+
+    latest = paths.adapters_dir / "latest"
+    checkpoints = list_step_checkpoints(latest)
+    if not checkpoints:
+        raise FileNotFoundError(
+            f"No step checkpoints under {latest / 'checkpoints'}. "
+            "Retrain so each chunk persists checkpoints/step_NNNNNN/."
+        )
+
+    results: list[dict[str, Any]] = []
+    kept: str | None = None
+    for ckpt in checkpoints:
+        install_writer_checkpoint(paths, ckpt)
+        generate_adapter = make_adapter_generate(str(ckpt))
+        receipt = run_writer_adapter_gate(
+            paths,
+            holdout_ids,
+            generate_fn_adapter=generate_adapter,
+            generate_fn_rag=generate_fn_rag,
+            k=k,
+            max_tokens=max_tokens,
+            alpha=alpha,
+        )
+        row = {
+            "checkpoint": ckpt.name,
+            "decision": receipt["decision"],
+            "wins": receipt["wins"],
+            "disqualified": receipt["disqualified"],
+            "p_value": receipt["p_value"],
+            "blocking_reasons": receipt["blocking_reasons"],
+            "n_holdouts": receipt["n_holdouts"],
+        }
+        results.append(row)
+        if on_checkpoint is not None:
+            on_checkpoint(row, receipt)
+        if receipt["decision"] == "keep":
+            kept = ckpt.name
+            install_writer_checkpoint(paths, ckpt)
+            break
+
+    sweep: dict[str, Any] = {
+        "kind": "eval_writer_adapter_checkpoint_sweep",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "n_checkpoints": len(checkpoints),
+        "evaluated": len(results),
+        "kept_checkpoint": kept,
+        "decision": "keep" if kept else "archive",
+        "results": results,
+    }
+    assert_receipt_contoso_safe(sweep)
+    return sweep

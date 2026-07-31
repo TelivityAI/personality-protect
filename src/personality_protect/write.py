@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, MutableSequence, Sequence
+from pathlib import Path
 from typing import Any
 
 from personality_protect.chat_prompt import (
@@ -176,7 +177,31 @@ def archive_writer_adapter(paths: ProfilePaths, *, reason: str) -> str | None:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     target = paths.adapters_dir / f"writer-{reason}-{stamp}"
     latest.rename(target)
-    return str(target)
+    # Basename only — absolute paths under ~/.personality-protect embed the
+    # local username and poison Contoso-safe receipts.
+    return target.name
+
+
+def install_writer_checkpoint(paths: ProfilePaths, checkpoint_dir: str | Path) -> str:
+    """Copy a step checkpoint into ``adapters/latest`` for gating or shipping.
+
+    Leaves durable ``checkpoints/`` snapshots in place. Overwrites only the live
+    ``adapters.safetensors`` (and config) that :func:`resolve_writer_adapter` reads.
+    """
+    import shutil
+
+    src = Path(checkpoint_dir)
+    weights = src / "adapters.safetensors"
+    if not weights.is_file():
+        raise FileNotFoundError(f"No adapters.safetensors in checkpoint {src}")
+    latest = paths.adapters_dir / "latest"
+    latest.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(weights, latest / "adapters.safetensors")
+    for name in ("adapter_config.json", "adapter_config.yaml"):
+        cfg = src / name
+        if cfg.is_file():
+            shutil.copy2(cfg, latest / name)
+    return str(latest)
 
 
 _SENTENCE_START_WORD_RE = re.compile(

@@ -941,6 +941,12 @@ def eval_writer_adapter_cmd(
         "--archive-on-fail",
         help="Move the adapter aside when the gate fails (write returns to adapter=none).",
     ),
+    sweep_checkpoints: bool = typer.Option(
+        False,
+        "--sweep-checkpoints",
+        help="Gate every adapters/latest/checkpoints/step_* dir, earliest first; "
+        "install the first that ships.",
+    ),
     out: Optional[Path] = typer.Option(None, "--out", help="Write the receipt JSON here."),
     profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
     home: Optional[Path] = typer.Option(None, "--home"),
@@ -952,6 +958,7 @@ def eval_writer_adapter_cmd(
     device — importing MLX without one aborts the interpreter.
     """
     from personality_protect.eval_writer_adapter import (
+        run_checkpoint_gate_sweep,
         run_writer_adapter_gate,
         write_gate_receipt,
     )
@@ -977,6 +984,63 @@ def eval_writer_adapter_cmd(
             "personality-protect select-writer-holdouts --apply[/red]"
         )
         raise typer.Exit(1)
+
+    if sweep_checkpoints:
+        try:
+            generate_rag = make_mlx_generator(base_model=config.base_model)
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+
+        def _make_adapter(adapter_path: str):
+            return make_mlx_generator(
+                base_model=config.base_model, adapter_path=adapter_path
+            )
+
+        def _on_ckpt(row: dict, _receipt: dict) -> None:
+            if as_json:
+                return
+            wins = row["wins"]
+            console.print(
+                f"[dim]{row['checkpoint']}: adapter {wins['adapter']} — "
+                f"rag {wins['rag']} — tie {wins['tie']} → {row['decision']}[/dim]"
+            )
+
+        try:
+            sweep = run_checkpoint_gate_sweep(
+                paths,
+                holdout_ids,
+                make_adapter_generate=_make_adapter,
+                generate_fn_rag=generate_rag,
+                k=k,
+                max_tokens=max_tokens,
+                alpha=alpha,
+                on_checkpoint=None if as_json else _on_ckpt,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+
+        if sweep["decision"] == "archive" and archive_on_fail:
+            sweep["archived_to"] = archive_writer_adapter(
+                paths, reason="gate-fail-sweep"
+            )
+
+        target = out or (
+            paths.root / "dogfood" / "writer_adapter_checkpoint_sweep_receipt.json"
+        )
+        write_gate_receipt(sweep, target)
+        if as_json:
+            typer.echo(json.dumps(sweep, indent=2, ensure_ascii=False))
+        else:
+            console.print(
+                f"sweep: evaluated {sweep['evaluated']}/{sweep['n_checkpoints']} "
+                f"→ decision [bold]{sweep['decision']}[/bold] "
+                f"(kept={sweep['kept_checkpoint']}) → {target}"
+            )
+        if sweep["decision"] != "keep":
+            raise typer.Exit(1)
+        return
 
     adapter_path = resolve_writer_adapter(paths)
     if adapter_path is None:
