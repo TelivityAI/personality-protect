@@ -276,6 +276,36 @@ def test_verdict_requires_a_margin_a_coin_would_not_produce():
     assert "article_disqualified_more_often" in fabricating["blocking_reasons"]
 
 
+def test_a_run_that_never_compared_cadence_says_so():
+    """Losing on distance and never reaching distance are different failures.
+
+    Both arms disqualified scores a tie, so an all-disqualified run and a run
+    the voice arm genuinely lost both report zero wins. Only one of them is
+    evidence about voice, and the receipt has to name which.
+    """
+    stalled = decide_article_voice(
+        {"article": 0, "base": 0, "tie": 4},
+        article_disqualified=4,
+        base_disqualified=4,
+        both_disqualified=4,
+        n_items=4,
+    )
+    assert stalled["verdict"] == "not_supported"
+    assert stalled["distance_ever_decided"] is False
+    assert "every_item_disqualified_in_both_arms" in stalled["blocking_reasons"]
+
+    measured = decide_article_voice(
+        {"article": 1, "base": 3, "tie": 0},
+        article_disqualified=0,
+        base_disqualified=0,
+        both_disqualified=0,
+        n_items=4,
+    )
+    assert measured["verdict"] == "not_supported"
+    assert measured["distance_ever_decided"] is True
+    assert "every_item_disqualified_in_both_arms" not in measured["blocking_reasons"]
+
+
 def test_raw_artifacts_stay_out_of_the_receipt(tmp_path: Path):
     paths, holdouts = _carve(tmp_path)
     article_fn, base_fn = _arms()

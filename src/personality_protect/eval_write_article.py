@@ -218,17 +218,30 @@ def decide_article_voice(
     article_disqualified: int,
     base_disqualified: int,
     alpha: float = ARTICLE_ALPHA,
+    both_disqualified: int = 0,
+    n_items: int = 0,
 ) -> dict[str, Any]:
     """Whether this run supports the claim that the article channel has voice.
 
     Same three conditions as the writer ship gate: win the majority, do it by a
     margin a fair coin would not produce this often, and do not fabricate more
     than the arm being compared against.
+
+    ``both_disqualified`` exists because those three conditions cannot tell two
+    different failures apart. An item where both arms are disqualified scores as
+    a tie, so a run where *every* item is disqualified reports the same
+    "did not win the majority" as a run where the voice arm was measured and
+    drifted further from the author. The first never got as far as comparing
+    cadence. Saying which one happened is the difference between a result and a
+    number that looks like one.
     """
     article_wins = int(wins.get("article", 0))
     base_wins = int(wins.get("base", 0))
     p_value = sign_test_p_value(article_wins, base_wins)
     reasons: list[str] = []
+    undecided = n_items > 0 and both_disqualified >= n_items
+    if undecided:
+        reasons.append("every_item_disqualified_in_both_arms")
     if article_wins <= base_wins:
         reasons.append("article_did_not_win_majority")
     if p_value > float(alpha):
@@ -238,6 +251,8 @@ def decide_article_voice(
     return {
         "verdict": "voice_supported" if not reasons else "not_supported",
         "article_beats_base": article_wins > base_wins,
+        "distance_ever_decided": not undecided,
+        "items_disqualified_in_both_arms": int(both_disqualified),
         "p_value": p_value,
         "alpha": float(alpha),
         "blocking_reasons": reasons,
@@ -280,6 +295,7 @@ def run_eval_write_article(
     skipped: list[str] = []
     article_dq = 0
     base_dq = 0
+    both_dq = 0
 
     for piece in pieces:
         holdout_text = normalize_corpus_text(piece.text)
@@ -335,6 +351,9 @@ def run_eval_write_article(
         wins[item["winner"]] = wins.get(item["winner"], 0) + 1
         article_dq += int(bool(item["article_disqualified"]))
         base_dq += int(bool(item["base_disqualified"]))
+        both_dq += int(
+            bool(item["article_disqualified"]) and bool(item["base_disqualified"])
+        )
         items.append(item)
         if on_item is not None:
             on_item(item)
@@ -357,6 +376,8 @@ def run_eval_write_article(
         article_disqualified=article_dq,
         base_disqualified=base_dq,
         alpha=alpha,
+        both_disqualified=both_dq,
+        n_items=len(items),
     )
     receipt: dict[str, Any] = {
         "kind": "eval_write_article",

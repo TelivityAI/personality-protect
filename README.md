@@ -217,7 +217,7 @@ The carve is deterministic (`blake2b(piece_id)` order), keeps previously carved 
 
 Two arms then write the same brief with the same outline, per-section budget, and trim. The product arm gets retrieved exemplars and the measured style card; the control arm gets neither. Drafts are scored on distance to the holdout's own cadence axes, and a draft that parrots its exemplars, echoes the brief, or invents entities or figures is disqualified regardless of distance. Receipts carry ids, distances, and flags — never draft or corpus text.
 
-The verdict needs all three of: the article arm wins the majority, the margin clears `--alpha` (default 0.10) on a one-sided sign test, and it is not disqualified more often than the control.
+The verdict needs all three of: the article arm wins the majority, the margin clears `--alpha` (default 0.10) on a one-sided sign test, and it is not disqualified more often than the control. When both arms are disqualified on every holdout, distance never decided anything, and the receipt says so (`distance_ever_decided: false`) rather than reporting it as a cadence loss.
 
 ### Status / API
 
