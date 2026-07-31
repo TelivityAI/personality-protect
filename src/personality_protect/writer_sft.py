@@ -1,4 +1,12 @@
-"""Brief→post SFT rows for the writer LoRA (not the translator path)."""
+"""Brief→post SFT rows for the writer LoRA (not the translator path).
+
+Every row is ``(D(y), y)``: a de-voiced note in, the author's post out. The
+first writer adapter was trained on rows whose brief was a verbatim extract of
+its own target — median 5-gram copy ratio 1.0 — so the cheapest way to fit the
+data was to echo the input, and the adapter did exactly that at generation time.
+Pair construction is therefore gated, not merely built: a row that cannot be
+moved far enough from its target is dropped rather than trained on.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +16,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from personality_protect.config import ProfilePaths
-from personality_protect.eval_write_holdout import mine_brief_from_holdout
+from personality_protect.corpus_text import normalize_corpus_text
+from personality_protect.devoice import (
+    MAX_PAIR_COPY_RATIO,
+    DevoiceRejected,
+    mine_writer_brief,
+)
 from personality_protect.models import Piece, load_index
 from personality_protect.prompt_write import WRITE_SYSTEM_PROMPT, build_write_user_content
 from personality_protect.style_profile import load_style_profile, style_directives
@@ -39,36 +52,68 @@ def piece_to_writer_example(
     piece: Piece,
     *,
     style_directives_list: list[str] | None = None,
-) -> dict[str, Any] | None:
-    """One chat example: lossy brief → author's post as assistant target."""
-    body = (piece.text or "").strip()
-    if len(body.split()) < _MIN_TARGET_WORDS:
-        return None
+    max_copy_ratio: float = MAX_PAIR_COPY_RATIO,
+) -> tuple[dict[str, Any] | None, str]:
+    """One chat example: de-voiced brief → author's post as assistant target.
+
+    Returns ``(row, reason)``. ``reason`` names why a piece was dropped so the
+    receipt can report *which* constraint pair construction is losing rows to,
+    rather than a single opaque skip count.
+    """
+    body = normalize_corpus_text(piece.text or "")
     if piece.source not in _POST_SOURCES:
-        return None
+        return None, "not_a_post"
+    if len(body.split()) < _MIN_TARGET_WORDS:
+        return None, "too_short"
     try:
-        brief = mine_brief_from_holdout(body, holdout_id=piece.id)
+        brief, report = mine_writer_brief(
+            body, holdout_id=piece.id, max_copy_ratio=max_copy_ratio
+        )
+    except DevoiceRejected as exc:
+        return None, exc.reasons[0]
     except ValueError:
-        return None
+        return None, "unbriefable"
+
     user = build_write_user_content(
         topic=brief["topic"],
         points=brief["points"],
         examples=(),
         style_directives=style_directives_list or (),
     )
-    return {
-        "messages": [
-            {"role": "system", "content": WRITE_SYSTEM_PROMPT},
-            {"role": "user", "content": user},
-            {"role": "assistant", "content": body},
-        ],
-        "meta": {
-            "piece_id": piece.id,
-            "source": piece.source,
-            "year": piece.year,
-            "word_count": len(body.split()),
-            "pair_kind": "writer",
+    return (
+        {
+            "messages": [
+                {"role": "system", "content": WRITE_SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+                {"role": "assistant", "content": body},
+            ],
+            "meta": {
+                "piece_id": piece.id,
+                "source": piece.source,
+                "year": piece.year,
+                "word_count": len(body.split()),
+                "pair_kind": "writer",
+                "devoiced": True,
+                # Per-row provenance for the pair audit. Ratios only — never the
+                # brief or the post body.
+                "brief_copy_ratio": report["brief_copy_ratio"],
+                "note_copy_ratio": report["copy_ratio"],
+                "brief_words": report["brief_words"],
+            },
         },
+        "kept",
+    )
+
+
+def _quantiles(values: list[float]) -> dict[str, float | None]:
+    """Median and p90 of a pair metric (empty-safe)."""
+    if not values:
+        return {"median": None, "p90": None, "max": None}
+    ordered = sorted(values)
+    return {
+        "median": round(ordered[len(ordered) // 2], 4),
+        "p90": round(ordered[min(len(ordered) - 1, int(0.9 * len(ordered)))], 4),
+        "max": round(ordered[-1], 4),
     }
 
 
@@ -78,20 +123,23 @@ def build_writer_sft(
     *,
     holdout_ids: Iterable[str] = (),
     style_directives_list: list[str] | None = None,
+    max_copy_ratio: float = MAX_PAIR_COPY_RATIO,
 ) -> dict[str, Any]:
-    """Write writer SFT JSONL; skip holdouts and unbriefable posts."""
+    """Write writer SFT JSONL; skip holdouts and pairs that stayed near ``(y, y)``."""
     excluded = {str(piece_id) for piece_id in holdout_ids}
     rows: list[dict[str, Any]] = []
-    skipped = 0
+    dropped: dict[str, int] = {}
     for piece in pieces:
         if piece.id in excluded:
-            skipped += 1
+            dropped["holdout"] = dropped.get("holdout", 0) + 1
             continue
-        example = piece_to_writer_example(
-            piece, style_directives_list=style_directives_list
+        example, reason = piece_to_writer_example(
+            piece,
+            style_directives_list=style_directives_list,
+            max_copy_ratio=max_copy_ratio,
         )
         if example is None:
-            skipped += 1
+            dropped[reason] = dropped.get(reason, 0) + 1
             continue
         rows.append(example)
 
@@ -103,8 +151,18 @@ def build_writer_sft(
     return {
         "path": str(out_path),
         "examples": len(rows),
-        "skipped": skipped,
+        "skipped": sum(dropped.values()),
+        "dropped_by_reason": dict(sorted(dropped.items())),
         "holdouts_excluded": sorted(excluded),
+        "pair_kind": "devoiced_brief_to_post",
+        "max_copy_ratio": float(max_copy_ratio),
+        # The headline pair-quality numbers. Before de-voicing this sat at 1.0.
+        "brief_copy_ratio": _quantiles(
+            [float(row["meta"]["brief_copy_ratio"]) for row in rows]
+        ),
+        "note_copy_ratio": _quantiles(
+            [float(row["meta"]["note_copy_ratio"]) for row in rows]
+        ),
         "built_at": datetime.now(timezone.utc).isoformat(),
     }
 

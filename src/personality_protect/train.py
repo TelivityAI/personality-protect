@@ -24,8 +24,15 @@ from personality_protect.config import (
 )
 from personality_protect.mlx_train import (
     DEFAULT_CHUNK_STEPS,
+    DEFAULT_LEARNING_RATE,
+    DEFAULT_LORA_RANK,
     DEFAULT_MAX_SEQ_LENGTH,
+    DEFAULT_NUM_LAYERS,
     PROOF_MAX_STEPS,
+    WRITER_EPOCHS,
+    WRITER_LEARNING_RATE,
+    WRITER_LORA_RANK,
+    WRITER_NUM_LAYERS,
     ProgressCallback,
     run_chunked_mlx_train,
 )
@@ -60,7 +67,13 @@ class MockFallbackError(RuntimeError):
     """Raised when a real backend would silently degrade to mock."""
 
 
-def auto_max_steps(n_examples: int, *, smoke: bool = False, max_steps: int | None = None) -> int:
+def auto_max_steps(
+    n_examples: int,
+    *,
+    smoke: bool = False,
+    max_steps: int | None = None,
+    epochs: int = DEFAULT_EPOCHS,
+) -> int:
     """Resolve train steps: explicit override, smoke low-step, or auto from corpus size."""
     if max_steps is not None and max_steps > 0:
         return max_steps
@@ -68,7 +81,23 @@ def auto_max_steps(n_examples: int, *, smoke: bool = False, max_steps: int | Non
         return SMOKE_MAX_STEPS
     # ~epochs passes over the JSONL at batch size 1, clamped for tiny/huge corpora
     n = max(1, int(n_examples))
-    return max(MIN_AUTO_STEPS, min(MAX_AUTO_STEPS, n * DEFAULT_EPOCHS))
+    return max(MIN_AUTO_STEPS, min(MAX_AUTO_STEPS, n * max(1, int(epochs))))
+
+
+def writer_train_settings() -> dict[str, Any]:
+    """LoRA hyperparameters for the writer recipe.
+
+    Separated from the translator defaults because the two tasks are not the
+    same size of change. Translation edits a draft it is already given; writing
+    a post from a note has to produce the whole text, which needs more adapted
+    layers and more rank than the 8/8 the first run inherited.
+    """
+    return {
+        "num_layers": WRITER_NUM_LAYERS,
+        "lora_rank": WRITER_LORA_RANK,
+        "learning_rate": WRITER_LEARNING_RATE,
+        "epochs": WRITER_EPOCHS,
+    }
 
 
 def check_corpus_size(n_selected: int, *, force: bool = False, smoke: bool = False) -> str | None:
@@ -239,10 +268,25 @@ def run_train(
     progress_callback: ProgressCallback | None = None,
     pairs: Path | None = None,
     writer: bool = False,
+    num_layers: int | None = None,
+    lora_rank: int | None = None,
+    learning_rate: float | None = None,
 ) -> TrainResult:
     config = load_config(paths)
     if writer and pairs is not None:
         raise ValueError("Pass only one of --writer or --pairs")
+    recipe = writer_train_settings() if writer else {}
+    resolved_layers = (
+        num_layers if num_layers is not None else recipe.get("num_layers", DEFAULT_NUM_LAYERS)
+    )
+    resolved_rank = (
+        lora_rank if lora_rank is not None else recipe.get("lora_rank", DEFAULT_LORA_RANK)
+    )
+    resolved_lr = (
+        learning_rate
+        if learning_rate is not None
+        else recipe.get("learning_rate", DEFAULT_LEARNING_RATE)
+    )
     voice_pair_mode = pairs is not None
     if voice_pair_mode:
         # Gated flatten→author pairs are the data floor; skip selected-piece gate.
@@ -299,7 +343,12 @@ def run_train(
             done = completed_steps_from_meta(prior)
             if prior_total > done:
                 max_steps = prior_total
-    steps = auto_max_steps(n, smoke=smoke or mock, max_steps=max_steps)
+    steps = auto_max_steps(
+        n,
+        smoke=smoke or mock,
+        max_steps=max_steps,
+        epochs=int(recipe.get("epochs", DEFAULT_EPOCHS)),
+    )
 
     if sft_only:
         mode_note = (
@@ -361,6 +410,9 @@ def run_train(
             chunk_steps=chunk_steps,
             memory_gb=memory_gb,
             max_seq_length=max_seq_length,
+            num_layers=resolved_layers,
+            lora_rank=resolved_rank,
+            learning_rate=resolved_lr,
             progress_callback=progress_callback,
             proof=proof,
             resume=resume,
@@ -493,6 +545,9 @@ def _train_mlx(
     chunk_steps: int = DEFAULT_CHUNK_STEPS,
     memory_gb: float | None = None,
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
+    num_layers: int = DEFAULT_NUM_LAYERS,
+    lora_rank: int = DEFAULT_LORA_RANK,
+    learning_rate: float = DEFAULT_LEARNING_RATE,
     progress_callback: ProgressCallback | None = None,
     proof: bool = False,
     resume: bool = False,
@@ -537,6 +592,9 @@ def _train_mlx(
             adapter_dir=adapter_dir,
             total_steps=max(1, max_steps),
             chunk_steps=chunk_steps,
+            num_layers=num_layers,
+            lora_rank=lora_rank,
+            learning_rate=learning_rate,
             memory_gb=memory_gb,
             max_seq_length=max_seq_length,
             resume=resume,

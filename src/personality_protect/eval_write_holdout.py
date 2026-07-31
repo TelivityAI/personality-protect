@@ -89,9 +89,12 @@ _NUMBER_TAIL_WORDS = frozenset(
     }
 )
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
-_MIN_HOLDOUT_WORDS = math.ceil(
-    (_TOPIC_MIN_WORDS + _MIN_POINTS * _MIN_POINT_WORDS) / _MAX_BRIEF_OVERLAP
-)
+def min_briefable_words(max_overlap: float = _MAX_BRIEF_OVERLAP) -> int:
+    """Shortest source that can yield a topic and two bullets inside ``max_overlap``."""
+    return math.ceil((_TOPIC_MIN_WORDS + _MIN_POINTS * _MIN_POINT_WORDS) / max_overlap)
+
+
+_MIN_HOLDOUT_WORDS = min_briefable_words()
 
 # Raw prompts and drafts contain personal text. They live under the profile
 # directory (already gitignored, and outside the repo) and are never surfaced
@@ -318,7 +321,12 @@ def mine_brief_from_holdout(
         raise ValueError("holdout text must not be empty")
 
     holdout_words = len(_word_tokens(body))
-    if holdout_words < _MIN_HOLDOUT_WORDS:
+    # Derive the floor from the caller's budget instead of the module default.
+    # The two only diverge for a source that is already de-voiced, where a
+    # looser overlap cap is correct and a floor pinned to 25% would reject
+    # sources long enough to brief.
+    min_words = min_briefable_words(max_overlap)
+    if holdout_words < min_words:
         raise ValueError(
             f"holdout is {holdout_words} words — too short to brief without "
             f"handing back more than {max_overlap:.0%} of it; "
@@ -500,6 +508,7 @@ def score_draft_against_holdout(
     draft: str,
     brief: str,
     exemplars: Sequence[str] = (),
+    visible_brief: str | None = None,
 ) -> dict[str, Any]:
     """g4: axis distance + guard flags (counts + keys; no draft body).
 
@@ -507,6 +516,12 @@ def score_draft_against_holdout(
     rhythm, and an exemplar dump has perfect rhythm because it *is* the author's
     text — so distance alone once crowned a draft that was a copy of its own
     prompt. A disqualified draft cannot win, whatever its distance.
+
+    ``brief`` is the allowed-facts set the invention guard checks against, which
+    on a de-voiced pair is the source piece rather than the prompt. Echo has to
+    be measured against what the model actually saw, so ``visible_brief`` may
+    carry the mined topic and bullets separately; it defaults to ``brief``,
+    which is correct wherever the two are the same text.
     """
     ref_axes = text_axes(holdout_text)
     draft_axes = text_axes(draft)
@@ -515,7 +530,8 @@ def score_draft_against_holdout(
     # Handing the mined bullets back is the other way to score a flattering
     # distance without writing anything, and it is what the winning draft did on
     # one holdout.
-    echoed = brief_echo_reject(draft, brief)
+    shown = brief if visible_brief is None else visible_brief
+    echoed = brief_echo_reject(draft, shown)
     return {
         "distance": _axes_distance(ref_axes, draft_axes),
         "axes": draft_axes,
@@ -538,11 +554,16 @@ def score_rag_vs_base(
     *,
     rag_exemplars: Sequence[str] = (),
     tie_epsilon: float = TIE_EPSILON,
+    visible_brief: str | None = None,
 ) -> dict[str, Any]:
     """Three-way score: holdout reference vs RAG draft vs bare-base draft."""
     holdout_axes = text_axes(holdout_text)
-    rag = score_draft_against_holdout(holdout_text, rag_draft, brief, rag_exemplars)
-    base = score_draft_against_holdout(holdout_text, base_draft, brief)
+    rag = score_draft_against_holdout(
+        holdout_text, rag_draft, brief, rag_exemplars, visible_brief=visible_brief
+    )
+    base = score_draft_against_holdout(
+        holdout_text, base_draft, brief, visible_brief=visible_brief
+    )
     delta = float(base["distance"]) - float(rag["distance"])
     if rag["disqualified"] and base["disqualified"]:
         winner = "tie"

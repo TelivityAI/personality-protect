@@ -228,6 +228,11 @@ _COMMON_CAPITALIZED = (
     _NON_ENTITY_CAPS | _COMMON_WORDS | _CALENDAR_WORDS | _COMMON_ACRONYMS | _PROMPT_SCAFFOLD
 )
 
+# Public alias: the de-voicing operator needs the same "capitalized but not a
+# name" vocabulary to decide which shouted words are emphasis it may lowercase
+# and which are acronyms it must leave alone.
+COMMON_CAPITALIZED = _COMMON_CAPITALIZED
+
 
 @dataclass(frozen=True)
 class InventionResult:

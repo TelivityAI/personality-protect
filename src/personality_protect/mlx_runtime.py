@@ -138,7 +138,15 @@ def ensure_mlx_wired_cap(*, memory_gb: float | None = None) -> int:
 
 
 def release_mlx_memory() -> None:
-    """Best-effort Metal cache clear after filter/generate."""
+    """Best-effort Metal cache clear after filter/generate.
+
+    The opt-in check is not decoration: a Metal-less session aborts inside
+    ``metal::load_device`` via C++ ``terminate``, which ``except Exception``
+    cannot catch. Without the guard a cleanup call in a sandboxed process takes
+    the interpreter down with a crash dialog instead of returning quietly.
+    """
+    if not mlx_import_allowed():
+        return
     try:
         import mlx.core as mx
 

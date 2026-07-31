@@ -30,6 +30,19 @@ DEFAULT_CHUNK_STEPS = 50
 # with a higher --memory-gb cap on 48 GB machines.
 DEFAULT_MAX_SEQ_LENGTH = 1024
 DEFAULT_NUM_LAYERS = 8
+# mlx-lm's own defaults, named here so a caller can raise them per recipe
+# instead of silently inheriting whatever the upstream config ships.
+DEFAULT_LEARNING_RATE = 1e-5
+DEFAULT_LORA_RANK = 8
+# Writer recipe. The failed run used the translator recipe unchanged: 8 layers
+# and rank 8 at 1e-5 for 300 steps over 100 rows. With pairs that now demand a
+# real transformation rather than a copy, the adapter needs both more capacity
+# and more passes over a smaller, cleaner set — and a slightly higher rate,
+# because 1e-5 on rank 8 barely moves a 9B model in 300 steps.
+WRITER_NUM_LAYERS = 16
+WRITER_LORA_RANK = 16
+WRITER_LEARNING_RATE = 3e-5
+WRITER_EPOCHS = 10
 # Cap wired Metal memory: leave OS/apps breathing room.
 DEFAULT_WIRED_FRACTION = 0.40
 DEFAULT_WIRED_CAP_BYTES = 16 * 10**9  # 16 GB hard cap (leave Studio headroom)
@@ -260,8 +273,14 @@ def build_mlx_lora_argv(
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     num_layers: int = DEFAULT_NUM_LAYERS,
     batch_size: int = 1,
+    learning_rate: float = DEFAULT_LEARNING_RATE,
 ) -> list[str]:
-    """CLI argv for one mlx-lm LoRA chunk (memory-safe defaults)."""
+    """CLI argv for one mlx-lm LoRA chunk (memory-safe defaults).
+
+    LoRA rank is absent on purpose: mlx-lm exposes it only through the
+    ``lora_parameters`` config, not as a CLI flag, so the chunk worker sets it
+    on the args namespace instead of here.
+    """
     argv = [
         "lora",
         "--model",
@@ -292,7 +311,7 @@ def build_mlx_lora_argv(
         "--save-every",
         str(max(1, iters)),
         "--learning-rate",
-        "1e-5",
+        f"{learning_rate:g}",
         # Loss on assistant tokens only — rewrite SFT, not draft echo.
         "--mask-prompt",
     ]
@@ -341,6 +360,8 @@ def run_mlx_chunk_subprocess(
     resume_adapter: Path | None = None,
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     num_layers: int = DEFAULT_NUM_LAYERS,
+    learning_rate: float = DEFAULT_LEARNING_RATE,
+    lora_rank: int = DEFAULT_LORA_RANK,
     on_line: Callable[[str], None] | None = None,
     timeout: int | None = None,
 ) -> ChunkResult:
@@ -373,6 +394,10 @@ def run_mlx_chunk_subprocess(
         str(max_seq_length),
         "--num-layers",
         str(num_layers),
+        "--learning-rate",
+        f"{learning_rate:g}",
+        "--lora-rank",
+        str(max(1, lora_rank)),
         "--wired-bytes",
         str(int(wired_limit_bytes)),
     ]
@@ -447,6 +472,8 @@ def run_chunked_mlx_train(
     memory_gb: float | None = None,
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     num_layers: int = DEFAULT_NUM_LAYERS,
+    learning_rate: float = DEFAULT_LEARNING_RATE,
+    lora_rank: int = DEFAULT_LORA_RANK,
     resume: bool = False,
     force_retrain: bool = False,
     progress_callback: ProgressCallback | None = None,
@@ -487,6 +514,8 @@ def run_chunked_mlx_train(
             "peak_mem_gb": None,
             "max_seq_length": max_seq_length,
             "num_layers": num_layers,
+            "learning_rate": learning_rate,
+            "lora_rank": lora_rank,
             "adapter_file": str(adapter_dir / "adapters.safetensors"),
             "resume": plan.resume,
             "already_completed": plan.already_completed,
@@ -574,6 +603,8 @@ def run_chunked_mlx_train(
             resume_adapter=resume_adapter,
             max_seq_length=max_seq_length,
             num_layers=num_layers,
+            learning_rate=learning_rate,
+            lora_rank=lora_rank,
             on_line=_on_line,
         )
         if result.peak_mem_gb is not None:
@@ -603,6 +634,8 @@ def run_chunked_mlx_train(
                     "peak_mem_gb": max(peaks) if peaks else None,
                     "max_seq_length": max_seq_length,
                     "num_layers": num_layers,
+                    "learning_rate": learning_rate,
+                    "lora_rank": lora_rank,
                     "adapter_file": str(adapter_file),
                     "resume": plan.resume,
                     "already_completed": plan.already_completed,
@@ -675,6 +708,8 @@ def run_chunked_mlx_train(
             "peak_mem_gb": max(peaks) if peaks else None,
             "max_seq_length": max_seq_length,
             "num_layers": num_layers,
+            "learning_rate": learning_rate,
+            "lora_rank": lora_rank,
             "adapter_file": str(adapter_file),
             "resume": plan.resume,
             "already_completed": plan.already_completed,
@@ -706,6 +741,8 @@ def run_chunked_mlx_train(
             "peak_mem_gb": max(peaks) if peaks else None,
             "max_seq_length": max_seq_length,
             "num_layers": num_layers,
+            "learning_rate": learning_rate,
+            "lora_rank": lora_rank,
             "adapter_file": str(adapter_file),
             "resume": plan.resume,
             "already_completed": plan.already_completed,
