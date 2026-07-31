@@ -44,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--resume-adapter-file", default=None)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--lora-rank", type=int, default=8)
     args = parser.parse_args(argv)
 
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -79,10 +80,16 @@ def main(argv: list[str] | None = None) -> int:
     ns.mask_prompt = True
     ns.report_to = None
     ns.clear_cache_threshold = 2 * 10**9  # clear allocator if cache > 2 GB
+    # lora_parameters arrives from CONFIG_DEFAULTS as a shared dict; copy before
+    # overriding so a caller in the same process does not inherit the change.
+    lora_parameters = dict(getattr(ns, "lora_parameters", None) or {})
+    lora_parameters["rank"] = max(1, args.lora_rank)
+    ns.lora_parameters = lora_parameters
 
     print(
         f"PP MLX chunk: iters={ns.iters} wired_cap_gb={args.wired_bytes / 1e9:.1f} "
-        f"max_seq={ns.max_seq_length} layers={ns.num_layers}",
+        f"max_seq={ns.max_seq_length} layers={ns.num_layers} "
+        f"rank={lora_parameters['rank']} lr={ns.learning_rate:g}",
         flush=True,
     )
     run(ns)

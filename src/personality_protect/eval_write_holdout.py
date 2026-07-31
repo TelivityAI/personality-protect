@@ -89,9 +89,12 @@ _NUMBER_TAIL_WORDS = frozenset(
     }
 )
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
-_MIN_HOLDOUT_WORDS = math.ceil(
-    (_TOPIC_MIN_WORDS + _MIN_POINTS * _MIN_POINT_WORDS) / _MAX_BRIEF_OVERLAP
-)
+def min_briefable_words(max_overlap: float = _MAX_BRIEF_OVERLAP) -> int:
+    """Shortest source that can yield a topic and two bullets inside ``max_overlap``."""
+    return math.ceil((_TOPIC_MIN_WORDS + _MIN_POINTS * _MIN_POINT_WORDS) / max_overlap)
+
+
+_MIN_HOLDOUT_WORDS = min_briefable_words()
 
 # Raw prompts and drafts contain personal text. They live under the profile
 # directory (already gitignored, and outside the repo) and are never surfaced
@@ -318,7 +321,12 @@ def mine_brief_from_holdout(
         raise ValueError("holdout text must not be empty")
 
     holdout_words = len(_word_tokens(body))
-    if holdout_words < _MIN_HOLDOUT_WORDS:
+    # Derive the floor from the caller's budget instead of the module default.
+    # The two only diverge for a source that is already de-voiced, where a
+    # looser overlap cap is correct and a floor pinned to 25% would reject
+    # sources long enough to brief.
+    min_words = min_briefable_words(max_overlap)
+    if holdout_words < min_words:
         raise ValueError(
             f"holdout is {holdout_words} words — too short to brief without "
             f"handing back more than {max_overlap:.0%} of it; "

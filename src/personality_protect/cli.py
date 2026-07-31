@@ -54,6 +54,7 @@ from personality_protect.eval_write_holdout import (
     run_eval_write_holdout,
     write_receipt,
 )
+from personality_protect.eval_writer_adapter import SHIP_ALPHA
 from personality_protect.filter import (
     filter_draft,
     paragraph_windows,
@@ -109,6 +110,11 @@ from personality_protect.write import (
     MAX_WRITE_K,
     MIN_WRITE_K,
     run_write,
+)
+from personality_protect.writer_holdout import (
+    DEFAULT_HOLDOUT_FRACTION,
+    MAX_HOLDOUT_N,
+    MIN_HOLDOUT_N,
 )
 
 app = typer.Typer(
@@ -340,11 +346,18 @@ def index_voice_cmd(
         "--holdout-id",
         help="Piece id to exclude from retrieval (repeatable).",
     ),
+    from_carve: bool = typer.Option(
+        False,
+        "--from-carve",
+        help="Also exclude every id in the profile's writer holdout carve.",
+    ),
     profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
     home: Optional[Path] = typer.Option(None, "--home"),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Rebuild the local voice retrieval index from the current corpus."""
+    from personality_protect.writer_holdout import load_pinned_holdout_ids
+
     _banner_from_ctx(ctx, json_mode=as_json)
     paths = get_paths(profile, home=home)
     try:
@@ -353,7 +366,13 @@ def index_voice_cmd(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
 
-    result = build_voice_index(paths, holdout_ids=holdout_id or ())
+    # Retyping a widened carve as flags is how a holdout quietly re-enters
+    # retrieval; read it from the file the carve already wrote.
+    excluded = list(holdout_id or ())
+    if from_carve:
+        excluded = sorted(set(excluded) | set(load_pinned_holdout_ids(paths)))
+
+    result = build_voice_index(paths, holdout_ids=excluded)
     if as_json:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -616,6 +635,193 @@ def build_writer_sft_cmd(
         f"writer SFT: {receipt['examples']} examples "
         f"(skipped {receipt['skipped']}) → {receipt['path']}"
     )
+    console.print(
+        f"[dim]pair copy ratio (brief→post): median="
+        f"{receipt['brief_copy_ratio']['median']} "
+        f"p90={receipt['brief_copy_ratio']['p90']} "
+        f"max={receipt['brief_copy_ratio']['max']} "
+        f"(cap {receipt['max_copy_ratio']})[/dim]"
+    )
+    console.print(f"[dim]dropped: {receipt['dropped_by_reason']}[/dim]")
+
+
+@app.command("select-writer-holdouts")
+def select_writer_holdouts_cmd(
+    ctx: typer.Context,
+    fraction: float = typer.Option(
+        DEFAULT_HOLDOUT_FRACTION,
+        "--fraction",
+        help="Share of briefable posts to reserve for the ship gate.",
+    ),
+    minimum: int = typer.Option(MIN_HOLDOUT_N, "--min", help="Floor on holdout count."),
+    maximum: int = typer.Option(MAX_HOLDOUT_N, "--max", help="Ceiling on holdout count."),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Write the carve to the profile. Default is report-only.",
+    ),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Pick a widened, deterministic holdout set for the writer ship gate."""
+    from personality_protect.models import load_index
+    from personality_protect.writer_holdout import (
+        load_pinned_holdout_ids,
+        save_holdout_ids,
+        select_writer_holdouts,
+    )
+
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    try:
+        pieces = load_index(paths.index_path)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    receipt = select_writer_holdouts(
+        pieces,
+        pinned_ids=load_pinned_holdout_ids(paths),
+        fraction=fraction,
+        minimum=minimum,
+        maximum=maximum,
+    )
+    if apply:
+        receipt["written_to"] = str(save_holdout_ids(paths, receipt))
+
+    if as_json:
+        typer.echo(json.dumps(receipt, indent=2, ensure_ascii=False))
+        return
+    console.print(
+        f"holdouts: {receipt['n_holdouts']} of {receipt['n_briefable']} briefable "
+        f"posts ({receipt['n_posts']} total); "
+        f"{receipt['train_pairs_remaining']} pairs left to train on"
+    )
+    if not apply:
+        console.print("[dim]report-only — re-run with --apply to write the carve[/dim]")
+    else:
+        console.print(
+            "[yellow]Rebuild retrieval so the new holdouts are never indexed: "
+            "personality-protect index-voice[/yellow]"
+        )
+
+
+@app.command("eval-writer-adapter")
+def eval_writer_adapter_cmd(
+    ctx: typer.Context,
+    k: int = typer.Option(DEFAULT_WRITE_K, "--k", help="Exemplars per draft."),
+    max_tokens: int = typer.Option(DEFAULT_WRITE_MAX_TOKENS, "--max-tokens"),
+    alpha: float = typer.Option(
+        SHIP_ALPHA, "--alpha", help="One-sided significance required to keep."
+    ),
+    archive_on_fail: bool = typer.Option(
+        False,
+        "--archive-on-fail",
+        help="Move the adapter aside when the gate fails (write returns to adapter=none).",
+    ),
+    out: Optional[Path] = typer.Option(None, "--out", help="Write the receipt JSON here."),
+    profile: str = typer.Option(DEFAULT_PROFILE, "--profile"),
+    home: Optional[Path] = typer.Option(None, "--home"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Ship gate: RAG+writer LoRA vs RAG-alone on the carved holdouts.
+
+    Loads MLX weights once per arm. Needs PP_MLX_ALLOW=1 and a real Metal
+    device — importing MLX without one aborts the interpreter.
+    """
+    from personality_protect.eval_writer_adapter import (
+        run_writer_adapter_gate,
+        write_gate_receipt,
+    )
+    from personality_protect.write import (
+        archive_writer_adapter,
+        make_mlx_generator,
+        resolve_writer_adapter,
+    )
+    from personality_protect.writer_holdout import load_pinned_holdout_ids
+
+    _banner_from_ctx(ctx, json_mode=as_json)
+    paths = get_paths(profile, home=home)
+    try:
+        config = load_config(paths)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    holdout_ids = load_pinned_holdout_ids(paths)
+    if not holdout_ids:
+        console.print(
+            "[red]No holdout carve found. Run: "
+            "personality-protect select-writer-holdouts --apply[/red]"
+        )
+        raise typer.Exit(1)
+
+    adapter_path = resolve_writer_adapter(paths)
+    if adapter_path is None:
+        console.print(
+            "[red]No writer adapter to gate. Train one with: "
+            "personality-protect train --writer[/red]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        generate_adapter = make_mlx_generator(
+            base_model=config.base_model, adapter_path=adapter_path
+        )
+        generate_rag = make_mlx_generator(base_model=config.base_model)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    done = {"n": 0}
+
+    def _progress(item: dict) -> None:
+        done["n"] += 1
+        console.print(
+            f"[dim]{done['n']}/{len(holdout_ids)} {item['holdout_id']}: "
+            f"{item['winner']}[/dim]"
+        )
+
+    try:
+        receipt = run_writer_adapter_gate(
+            paths,
+            holdout_ids,
+            generate_fn_adapter=generate_adapter,
+            generate_fn_rag=generate_rag,
+            k=k,
+            max_tokens=max_tokens,
+            alpha=alpha,
+            on_item=None if as_json else _progress,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    if receipt["decision"] == "archive" and archive_on_fail:
+        receipt["archived_to"] = archive_writer_adapter(paths, reason="gate-fail")
+
+    target = out or (paths.root / "dogfood" / "writer_adapter_gate_receipt.json")
+    write_gate_receipt(receipt, target)
+
+    if as_json:
+        typer.echo(json.dumps(receipt, indent=2, ensure_ascii=False))
+    else:
+        wins = receipt["wins"]
+        console.print(
+            f"gate n={receipt['n_holdouts']}: adapter {wins['adapter']} — "
+            f"rag {wins['rag']} — tie {wins['tie']} "
+            f"(p={receipt['p_value']}, alpha={receipt['alpha']})"
+        )
+        console.print(
+            f"disqualified: adapter {receipt['disqualified']['adapter']}, "
+            f"rag {receipt['disqualified']['rag']}"
+        )
+        console.print(f"decision: [bold]{receipt['decision']}[/bold] → {target}")
+        if receipt["blocking_reasons"]:
+            console.print(f"[yellow]{', '.join(receipt['blocking_reasons'])}[/yellow]")
+    if receipt["decision"] != "keep":
+        raise typer.Exit(1)
 
 
 @app.command("write")
@@ -876,6 +1082,29 @@ def train_cmd(
             "use 2048 with a higher --memory-gb cap for article sections."
         ),
     ),
+    num_layers: Optional[int] = typer.Option(
+        None,
+        "--num-layers",
+        help="MLX: layers to adapt (default 8; the --writer recipe uses 16).",
+    ),
+    lora_rank: Optional[int] = typer.Option(
+        None,
+        "--lora-rank",
+        help="MLX: LoRA rank (default 8; the --writer recipe uses 16).",
+    ),
+    learning_rate: Optional[float] = typer.Option(
+        None,
+        "--learning-rate",
+        help="MLX: LoRA learning rate (default 1e-5; the --writer recipe uses 3e-5).",
+    ),
+    detach: bool = typer.Option(
+        False,
+        "--detach",
+        help=(
+            "Run the train in its own session and return immediately "
+            "(survives closing the shell). Prints pid and log path."
+        ),
+    ),
     proof: bool = typer.Option(
         False,
         "--proof",
@@ -950,6 +1179,21 @@ def train_cmd(
     if pairs is not None and not pairs.is_file():
         console.print(f"[red]pairs file not found: {pairs}[/red]")
         raise typer.Exit(2)
+
+    if detach:
+        from personality_protect.detach import relaunch_self_detached, timestamped_log_path
+
+        log_path = timestamped_log_path(paths.root / "dogfood", "train")
+        spawned = relaunch_self_detached(
+            [arg for arg in sys.argv[1:] if arg != "--detach"],
+            log_path=log_path,
+        )
+        if as_json:
+            typer.echo(json.dumps(spawned, indent=2))
+            return
+        console.print(f"train detached: pid {spawned['pid']}")
+        console.print(f"log: {spawned['log_path']}")
+        return
 
     try:
         detected = detect_backend(
@@ -1174,6 +1418,9 @@ def train_cmd(
             progress_callback=callback,
             pairs=pairs,
             writer=writer,
+            num_layers=num_layers,
+            lora_rank=lora_rank,
+            learning_rate=learning_rate,
         )
     except (FileNotFoundError, RuntimeError, MockFallbackError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")

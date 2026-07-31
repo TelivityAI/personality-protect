@@ -111,6 +111,74 @@ def mlx_generate_no_adapter(
         release_mlx_memory()
 
 
+def make_mlx_generator(
+    *,
+    base_model: str,
+    adapter_path: str | None = None,
+) -> GenerateFn:
+    """Load one arm's weights once and reuse them across every generation.
+
+    :func:`mlx_generate_no_adapter` reloads the model on each call, which is
+    fine for a single draft and untenable for a gate: a widened holdout would
+    pay dozens of 9B loads, and the repeated allocate/free cycle is what invites
+    the wired-memory spikes the runtime cap exists to prevent. The returned
+    callable keeps the same signature so it drops into ``generate_fn``.
+    """
+    from personality_protect.mlx_runtime import (
+        assert_mlx_import_allowed,
+        ensure_mlx_wired_cap,
+    )
+
+    assert_mlx_import_allowed()
+    ensure_mlx_wired_cap(memory_gb=16.0)
+    from mlx_lm import generate, load
+
+    model, tokenizer = load(base_model, adapter_path=adapter_path)
+
+    def _generate(
+        messages: Sequence[Message],
+        *,
+        base_model: str = base_model,
+        max_tokens: int = DEFAULT_WRITE_MAX_TOKENS,
+        adapter_path: str | None = None,
+        prompt_sink: PromptSink | None = None,
+    ) -> str:
+        prompt = render_chat_prompt(
+            tokenizer, messages, fallback=flatten_chat_messages(messages)
+        )
+        if prompt_sink is not None:
+            prompt_sink.append(prompt)
+        return str(
+            generate(
+                model,
+                tokenizer,
+                prompt=prompt,
+                max_tokens=max(64, int(max_tokens)),
+                verbose=False,
+            )
+        ).strip()
+
+    return _generate
+
+
+def archive_writer_adapter(paths: ProfilePaths, *, reason: str) -> str | None:
+    """Move a rejected adapter aside so the write path resolves to none.
+
+    Deleting would make a failed gate unauditable. The weights move to a
+    timestamped sibling directory that :func:`resolve_writer_adapter` does not
+    look in, which is what returns the product to ``adapter=none``.
+    """
+    from datetime import datetime, timezone
+
+    latest = paths.adapters_dir / "latest"
+    if not (latest / "adapters.safetensors").is_file():
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = paths.adapters_dir / f"writer-{reason}-{stamp}"
+    latest.rename(target)
+    return str(target)
+
+
 _SENTENCE_START_WORD_RE = re.compile(
     r"(?:(?<=\A)|(?<=[.!?:;]\s)|(?<=[.!?:;]\n)|(?<=\n))([A-Z][a-z][a-zA-Z'’-]*)"
 )
