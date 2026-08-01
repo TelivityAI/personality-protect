@@ -17,6 +17,7 @@ Both directions are covered by tests in ``tests/test_writer_guards.py``.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -42,6 +43,7 @@ BRIEF_ECHO_LIMIT = 0.6
 BRIEF_ECHO_MIN_TOKENS = 12
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 _ENTITY_RE = re.compile(
     r"\b(?:[A-Z]{2,}|[A-Z](?:&[A-Z])+|"
     r"[A-Z][a-z][a-zA-Z0-9'-]*(?:\s+[A-Z][a-z][a-zA-Z0-9'-]*)*)\b"
@@ -504,6 +506,61 @@ def check_invention(brief: str, draft: str) -> InventionResult:
         invented_entities=frozenset(invented_entities),
         invented_numbers=frozenset(invented_numbers),
     )
+
+
+def scrub_invented_sentences(
+    draft: str,
+    brief: str,
+    *,
+    normalize: Callable[[str], str] | None = None,
+    max_passes: int = 3,
+) -> str:
+    """Cut the sentences carrying names or figures the brief never granted.
+
+    Last resort after a repair regenerate has already failed. The sentence, not
+    the span, is the unit of removal: cutting only the fabricated name out of
+    "Fabrikam shipped the migration in nine weeks" leaves the fabricated claim
+    standing with its subject missing, which still reads as prose and is still
+    false. Dropping the sentence removes the claim.
+
+    Lineation survives — sentences are dropped inside their own line — so a
+    scrubbed section keeps the paragraph rhythm the rest of the pipeline
+    measures. Returns ``""`` when nothing survives, which is the caller's
+    signal to drop the section.
+
+    ``normalize`` is the draft-side case normalizer the caller's invention
+    guard applies before checking (sentence-initial verbs are capitalized by
+    syntax, not because they are names). It is injected rather than imported
+    because it lives above this module in the import order.
+    """
+
+    text = draft or ""
+    prepare = normalize or (lambda value: value)
+    for _ in range(max(1, int(max_passes))):
+        if not text.strip() or check_invention(brief, prepare(text)).passed:
+            break
+        lines: list[str] = []
+        dropped = 0
+        for line in text.splitlines():
+            if not line.strip():
+                lines.append("")
+                continue
+            sentences = [part for part in _SENTENCE_END_RE.split(line) if part.strip()]
+            kept = [
+                part
+                for part in sentences
+                if check_invention(brief, prepare(part)).passed
+            ]
+            dropped += len(sentences) - len(kept)
+            lines.append(" ".join(kept).strip())
+        if not dropped:
+            # The whole draft invents something no single sentence owns; more
+            # passes would only repeat this one.
+            break
+        text = "\n".join(lines)
+    for pattern, replacement in _TIDY_RULES:
+        text = pattern.sub(replacement, text)
+    return text.strip()
 
 
 def brief_allowed_facts(brief: str) -> dict[str, list[str]]:

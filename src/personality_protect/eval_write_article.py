@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,7 @@ from personality_protect.article_brief import (
 from personality_protect.chat_prompt import flatten_chat_messages
 from personality_protect.config import ProfilePaths, load_config
 from personality_protect.corpus_text import normalize_corpus_text
-from personality_protect.draft_trim import drop_repeated_paragraphs, trim_draft, word_count
+from personality_protect.draft_trim import drop_repeated_paragraphs, word_count
 from personality_protect.eval_write_holdout import (
     TIE_EPSILON,
     assert_receipt_contoso_safe,
@@ -50,7 +51,6 @@ from personality_protect.eval_write_holdout import (
     write_raw_artifacts,
 )
 from personality_protect.eval_writer_adapter import sign_test_p_value
-from personality_protect.prompt_write import build_write_messages
 from personality_protect.style_profile import (
     article_section_words,
     load_style_profile,
@@ -65,10 +65,10 @@ from personality_protect.write_article import (
     DEFAULT_ARTICLE_SECTION_MAX_TOKENS,
     SECTION_TOKENS_PER_WORD,
     SECTION_TRIM_HEADROOM,
-    THIN_SECTION_WORD_FLOOR,
-    _guard_flags,
     _section_brief,
+    build_section_messages,
     count_indexed_article_pieces,
+    draft_section_with_repair,
     outline_from_brief,
     run_write_article,
     scale_section_words_for_brief,
@@ -136,56 +136,57 @@ def run_bare_base_article(
     inventing entities because it had barely written any.
 
     The control therefore gets the same outline, the same per-section budget,
-    and the same trim. What it does not get is the voice machinery — retrieved
-    exemplars and the measured style profile — which is the only thing the
-    comparison is meant to be about.
+    and the same trim — and, since the product arm gained one, the same invent
+    repair and mechanical scrub. A fact-lock that only the product arm has to
+    survive would separate the arms by editing policy rather than by writing.
+    What the control does not get is the voice machinery — retrieved exemplars
+    and the measured style profile — which is the only thing the comparison is
+    meant to be about.
     """
     invent_brief = str(budget.get("visible_brief") or build_brief(topic, points))
     section_drafts: list[str] = []
+    dropped_sections: list[str] = []
+    repaired_sections: list[str] = []
+    scrubbed_sections: list[str] = []
     messages: list[dict[str, str]] = []
+    attempts_total = 0
     for index, section in enumerate(budget["sections"], start=1):
         section_topic, section_points = _section_brief(topic, section, points)
-        messages = build_write_messages(
-            topic=section_topic,
-            points=section_points,
-            examples=(),
-            channel="article",
-            style_directives=section_structure_directives(
-                section=section,
-                index=index,
-                total=budget["section_count"],
-                word_aim=budget["word_aim"],
-                section_words=budget["section_words"],
-                section_trim_words=budget["section_trim_words"],
-                allowed_entities=budget.get("allowed_entities") or (),
-                allowed_numbers=budget.get("allowed_numbers") or (),
+        outcome = draft_section_with_repair(
+            build_messages=partial(
+                build_section_messages,
+                topic=section_topic,
+                points=section_points,
+                examples=(),
+                directives=section_structure_directives(
+                    section=section,
+                    index=index,
+                    total=budget["section_count"],
+                    word_aim=budget["word_aim"],
+                    section_words=budget["section_words"],
+                    section_trim_words=budget["section_trim_words"],
+                    allowed_entities=budget.get("allowed_entities") or (),
+                    allowed_numbers=budget.get("allowed_numbers") or (),
+                ),
             ),
+            generate_fn=generate_fn,
+            base_model=base_model,
+            invent_brief=invent_brief,
+            section_words=budget["section_words"],
+            section_trim_words=budget["section_trim_words"],
+            max_tokens=budget["max_tokens"],
+            prompt_sink=prompt_sink,
         )
-        draft = ""
-        kept = False
-        for attempt in range(1, 3):
-            attempt_trim = budget["section_trim_words"]
-            attempt_tokens = budget["max_tokens"]
-            if attempt > 1:
-                attempt_trim = max(THIN_SECTION_WORD_FLOOR, budget["section_words"] // 2)
-                attempt_tokens = max(
-                    256, int(round(attempt_trim * SECTION_TOKENS_PER_WORD))
-                )
-            raw = str(
-                generate_fn(
-                    messages,
-                    base_model=base_model,
-                    max_tokens=attempt_tokens,
-                    prompt_sink=prompt_sink,
-                )
-            ).strip()
-            draft = trim_draft(raw, max_words=attempt_trim)
-            guards = _guard_flags(invent_brief, draft, ())
-            if not guards["parrot_reject"] and not guards["invent_reject"]:
-                kept = True
-                break
-        if kept and draft.strip():
-            section_drafts.append(draft)
+        messages = outcome["messages"]
+        attempts_total += int(outcome["attempts"])
+        if outcome["status"] == "dropped":
+            dropped_sections.append(section)
+            continue
+        section_drafts.append(str(outcome["draft"]))
+        if outcome["status"] == "repaired":
+            repaired_sections.append(section)
+        elif outcome["status"] == "scrubbed":
+            scrubbed_sections.append(section)
 
     text = drop_repeated_paragraphs(
         "\n\n".join(part for part in section_drafts if part.strip())
@@ -198,6 +199,10 @@ def run_bare_base_article(
         "k": 0,
         "exemplar_ids": [],
         "section_count": len(section_drafts),
+        "attempts": attempts_total,
+        "dropped_sections": dropped_sections,
+        "repaired_sections": repaired_sections,
+        "scrubbed_sections": scrubbed_sections,
         "prompt": flatten_chat_messages(messages) if budget["sections"] else "",
     }
 
@@ -246,6 +251,14 @@ def _item_receipt(
         "article_draft_words": len(str(article_result.get("text") or "").split()),
         "base_draft_words": len(str(base_result.get("text") or "").split()),
         "article_attempts": int(article_result.get("attempts") or 1),
+        "base_attempts": int(base_result.get("attempts") or 1),
+        # Counts, never titles: the outline is mined from the holdout body.
+        "article_repaired_sections": len(article_result.get("repaired_sections") or []),
+        "article_scrubbed_sections": len(article_result.get("scrubbed_sections") or []),
+        "article_dropped_sections": len(article_result.get("dropped_sections") or []),
+        "base_repaired_sections": len(base_result.get("repaired_sections") or []),
+        "base_scrubbed_sections": len(base_result.get("scrubbed_sections") or []),
+        "base_dropped_sections": len(base_result.get("dropped_sections") or []),
         "exemplar_ids": list(article_result.get("exemplar_ids") or []),
         "article_k": int(article_result.get("k") or 0),
     }
@@ -377,8 +390,9 @@ def run_eval_write_article(
             tie_epsilon=tie_epsilon,
             visible_brief=visible,
         )
-        # Sections dropped for invent never reach the stitch; surface that as
-        # invent DQ even when the remaining text is empty or brief-clean.
+        # The product arm sets this when the stitch is empty or the stitched
+        # text still invents — the two cases the scorer cannot see for itself,
+        # since an empty draft invents nothing.
         if article_result.get("invent_reject"):
             score["rag"]["invent_reject"] = True
             score["rag"]["disqualified"] = True

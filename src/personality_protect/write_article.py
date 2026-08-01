@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from functools import partial
 from typing import Any
 
 from personality_protect.chat_prompt import flatten_chat_messages
@@ -41,6 +42,7 @@ from personality_protect.writer_guards import (
     check_invention,
     mask_exemplar_entities,
     parrot_reject,
+    scrub_invented_sentences,
 )
 
 ARTICLE_SOURCES: tuple[str, ...] = ("linkedin_article",)
@@ -69,6 +71,9 @@ ARTICLE_EXEMPLAR_WORDS = MAX_EXEMPLAR_WORDS
 THIN_BRIEF_WORDS = 80
 THIN_SECTION_WORD_FLOOR = 80
 THIN_WORDS_PER_BRIEF_WORD = 2.5
+# Floor for the repair pass: the budget is already halved, and a section that
+# runs out of tokens mid-sentence is a new failure, not a repaired one.
+MIN_REPAIR_TOKENS = 256
 
 _BULLET_RE = re.compile(r"^\s*[-*•]\s+")
 
@@ -242,6 +247,71 @@ def section_structure_directives(
     return lines
 
 
+def section_repair_directives(
+    *,
+    invented_entities: Sequence[str] = (),
+    invented_numbers: Sequence[str] = (),
+    section_words: int,
+) -> list[str]:
+    """Name the facts a failed section has to lose before it is written again.
+
+    The regenerate used to differ from the first attempt only by a shorter
+    budget, which asks for less invention without saying what was invented; the
+    holdout answered with the same fabricated names inside a shorter section.
+
+    Listing the offenders is a calculated risk. A token put in front of this
+    model tends to come back out of it — the reason exemplar masking redacts
+    names instead of labelling them — so the directive is phrased as removal
+    and :func:`~personality_protect.writer_guards.scrub_invented_sentences`
+    stands behind it for the case where the model repeats what it was told to
+    drop.
+    """
+    entities = [str(item).strip() for item in invented_entities if str(item).strip()]
+    numbers = [str(item).strip() for item in invented_numbers if str(item).strip()]
+    lines = [
+        "REPAIR: your previous draft of this section stated facts the BRIEF "
+        "never gave. Write the section again, from the BRIEF only.",
+    ]
+    if entities:
+        lines.append(
+            "Remove these names completely — do not mention them, rename them, "
+            "or replace them with other names: " + ", ".join(entities) + "."
+        )
+    if numbers:
+        lines.append(
+            "Remove these figures completely and put no figures in their "
+            "place: " + ", ".join(numbers) + "."
+        )
+    lines.append(
+        "Add no companies, people, products, places, or figures of your own. "
+        "Make the claim smaller instead of sourcing it."
+    )
+    lines.append(f"Write a shorter section this time: about {section_words} words.")
+    return lines
+
+
+def build_section_messages(
+    extra_directives: Sequence[str] = (),
+    *,
+    topic: str,
+    points: str,
+    examples: Sequence[str],
+    directives: Sequence[str],
+) -> list[dict[str, str]]:
+    """Article-section prompt with room for an extra directive block.
+
+    Both arms build their sections through here, so a repair directive reaches
+    the control arm in the same position it reaches the product arm.
+    """
+    return build_write_messages(
+        topic=topic,
+        points=points,
+        examples=examples,
+        channel="article",
+        style_directives=[*directives, *extra_directives],
+    )
+
+
 def _guard_flags(brief: str, draft: str, exemplars: Sequence[str]) -> dict[str, Any]:
     invention = check_invention(brief, normalize_sentence_case(draft))
     return {
@@ -249,6 +319,110 @@ def _guard_flags(brief: str, draft: str, exemplars: Sequence[str]) -> dict[str, 
         "invent_reject": not invention.passed,
         "invented_entities": sorted(invention.invented_entities),
         "invented_numbers": sorted(invention.invented_numbers),
+    }
+
+
+def draft_section_with_repair(
+    *,
+    build_messages: Callable[[Sequence[str]], list[dict[str, str]]],
+    generate_fn: GenerateFn,
+    base_model: str,
+    invent_brief: str,
+    section_words: int,
+    section_trim_words: int,
+    max_tokens: int,
+    exemplars: Sequence[str] = (),
+    prompt_sink: PromptSink | None = None,
+) -> dict[str, Any]:
+    """Draft one section, then repair it, then scrub it, and only then drop it.
+
+    ``status`` says which of those the section survived: ``clean`` (the first
+    draft passed the guards), ``repaired`` (the regenerate with the offenders
+    named passed), ``scrubbed`` (it passed only after the inventing sentences
+    were cut out), or ``dropped`` (nothing usable survived).
+
+    Dropping is last rather than second because it is the expensive outcome. An
+    inventing section used to be dropped outright, so a thin brief could take
+    every section out and leave an empty article that still counted as a draft
+    — the holdout produced exactly that, a zero-word arm scored against a base
+    arm that had written 135 words.
+    """
+    repair_words = max(THIN_SECTION_WORD_FLOOR, int(section_words) // 2)
+    draft = ""
+    guards: dict[str, Any] = {
+        "parrot_reject": False,
+        "invent_reject": False,
+        "invented_entities": [],
+        "invented_numbers": [],
+    }
+    attempts = 0
+    first_messages: list[dict[str, str]] = []
+    for attempt in (1, 2):
+        if attempt == 1:
+            extra: Sequence[str] = ()
+            trim_words = int(section_trim_words)
+            attempt_tokens = int(max_tokens)
+        else:
+            # Second pass: half the budget, plus the offender list when there
+            # is one. A parrot failure has nothing to list, so it keeps the
+            # shorter-budget retry on its own.
+            trim_words = repair_words
+            attempt_tokens = max(
+                MIN_REPAIR_TOKENS, int(round(trim_words * SECTION_TOKENS_PER_WORD))
+            )
+            extra = (
+                section_repair_directives(
+                    invented_entities=guards["invented_entities"],
+                    invented_numbers=guards["invented_numbers"],
+                    section_words=trim_words,
+                )
+                if guards["invent_reject"]
+                else ()
+            )
+        messages = build_messages(extra)
+        if attempt == 1:
+            first_messages = messages
+        attempts += 1
+        raw = str(
+            generate_fn(
+                messages,
+                base_model=base_model,
+                max_tokens=attempt_tokens,
+                prompt_sink=prompt_sink,
+            )
+        ).strip()
+        draft = trim_draft(raw, max_words=trim_words)
+        guards = _guard_flags(invent_brief, draft, exemplars)
+        clean = not guards["parrot_reject"] and not guards["invent_reject"]
+        if clean and draft.strip():
+            return {
+                "draft": draft,
+                "status": "clean" if attempt == 1 else "repaired",
+                "attempts": attempts,
+                "guards": guards,
+                "messages": first_messages,
+            }
+
+    if guards["invent_reject"]:
+        scrubbed = scrub_invented_sentences(
+            draft, invent_brief, normalize=normalize_sentence_case
+        )
+        if scrubbed.strip():
+            scrub_guards = _guard_flags(invent_brief, scrubbed, exemplars)
+            if not scrub_guards["parrot_reject"] and not scrub_guards["invent_reject"]:
+                return {
+                    "draft": scrubbed,
+                    "status": "scrubbed",
+                    "attempts": attempts,
+                    "guards": scrub_guards,
+                    "messages": first_messages,
+                }
+    return {
+        "draft": "",
+        "status": "dropped",
+        "attempts": attempts,
+        "guards": guards,
+        "messages": first_messages,
     }
 
 
@@ -263,7 +437,7 @@ def run_write_article(
     prompt_sink: PromptSink | None = None,
     min_articles: int = MIN_ARTICLE_CORPUS,
 ) -> dict[str, Any]:
-    """Outline → per-section RAG draft → stitch into one article."""
+    """Outline → per-section RAG draft → repair/scrub → stitch into one article."""
     topic = topic.strip()
     points = points.strip()
     if not topic:
@@ -322,71 +496,57 @@ def run_write_article(
 
     section_drafts: list[str] = []
     dropped_sections: list[str] = []
+    repaired_sections: list[str] = []
+    scrubbed_sections: list[str] = []
     all_messages: list[list[dict[str, str]]] = []
     attempts_total = 0
     dropped_invented_entities: set[str] = set()
     dropped_invented_numbers: set[str] = set()
-    last_guards: dict[str, Any] = {
-        "parrot_reject": False,
-        "invent_reject": False,
-        "invented_entities": [],
-        "invented_numbers": [],
-    }
 
-    for section in sections:
+    for index, section in enumerate(sections, start=1):
         section_topic, section_points = _section_brief(topic, section, points)
-        invent_brief = full_brief
-        messages = build_write_messages(
-            topic=section_topic,
-            points=section_points,
-            examples=masked,
-            channel="article",
-            style_directives=[
-                *directives,
-                *section_structure_directives(
-                    section=section,
-                    index=len(section_drafts) + len(dropped_sections) + 1,
-                    total=len(sections),
-                    word_aim=word_aim,
-                    section_words=section_words,
-                    section_trim_words=section_trim_words,
-                    allowed_entities=allowed["entities"],
-                    allowed_numbers=allowed["numbers"],
-                ),
-            ],
+        outcome = draft_section_with_repair(
+            build_messages=partial(
+                build_section_messages,
+                topic=section_topic,
+                points=section_points,
+                examples=masked,
+                directives=[
+                    *directives,
+                    *section_structure_directives(
+                        section=section,
+                        index=index,
+                        total=len(sections),
+                        word_aim=word_aim,
+                        section_words=section_words,
+                        section_trim_words=section_trim_words,
+                        allowed_entities=allowed["entities"],
+                        allowed_numbers=allowed["numbers"],
+                    ),
+                ],
+            ),
+            generate_fn=generator,
+            base_model=model_id,
+            invent_brief=full_brief,
+            section_words=section_words,
+            section_trim_words=section_trim_words,
+            max_tokens=section_max_tokens,
+            exemplars=exemplars,
+            prompt_sink=prompt_sink,
         )
-        all_messages.append(messages)
-        draft = ""
-        kept = False
-        for attempt in range(1, 3):
-            attempts_total += 1
-            # Second attempt: stricter short budget if the first invents.
-            attempt_trim = section_trim_words
-            attempt_tokens = section_max_tokens
-            if attempt > 1:
-                attempt_trim = max(THIN_SECTION_WORD_FLOOR, section_words // 2)
-                attempt_tokens = max(
-                    256, int(round(attempt_trim * SECTION_TOKENS_PER_WORD))
-                )
-            raw = str(
-                generator(
-                    messages,
-                    base_model=model_id,
-                    max_tokens=attempt_tokens,
-                    prompt_sink=prompt_sink,
-                )
-            ).strip()
-            draft = trim_draft(raw, max_words=attempt_trim)
-            last_guards = _guard_flags(invent_brief, draft, exemplars)
-            if not last_guards["parrot_reject"] and not last_guards["invent_reject"]:
-                kept = True
-                break
-        if kept and draft.strip():
-            section_drafts.append(draft)
-        else:
+        all_messages.append(outcome["messages"])
+        attempts_total += int(outcome["attempts"])
+        if outcome["status"] == "dropped":
+            guards = outcome["guards"]
             dropped_sections.append(section)
-            dropped_invented_entities.update(last_guards.get("invented_entities") or [])
-            dropped_invented_numbers.update(last_guards.get("invented_numbers") or [])
+            dropped_invented_entities.update(guards.get("invented_entities") or [])
+            dropped_invented_numbers.update(guards.get("invented_numbers") or [])
+            continue
+        section_drafts.append(str(outcome["draft"]))
+        if outcome["status"] == "repaired":
+            repaired_sections.append(section)
+        elif outcome["status"] == "scrubbed":
+            scrubbed_sections.append(section)
 
     # Sections are generated independently from the same brief, so two of them
     # can arrive as the same paragraph. Stitching them unfiltered is what turns
@@ -394,17 +554,14 @@ def run_write_article(
     text = drop_repeated_paragraphs(
         "\n\n".join(part for part in section_drafts if part.strip())
     ).strip()
-    # Final invent check against the full brief the author supplied.
+    # Final invent check against the full brief the author supplied. The flag
+    # describes the text that ships: a section dropped for inventing is a gap
+    # in coverage, not a fabrication in the draft. Forcing invent_reject on any
+    # drop disqualified whole articles whose remaining text was clean — and on
+    # the holdout that was three of four items. What still fails the article is
+    # an empty stitch, or a stitch that invents against the visible brief.
     final_guards = _guard_flags(full_brief, text, exemplars)
-    if dropped_sections:
-        final_guards["invent_reject"] = True
-        final_guards["invented_entities"] = sorted(
-            set(final_guards["invented_entities"]) | dropped_invented_entities
-        )
-        final_guards["invented_numbers"] = sorted(
-            set(final_guards["invented_numbers"]) | dropped_invented_numbers
-        )
-    if not section_drafts:
+    if not text:
         final_guards["invent_reject"] = True
 
     return {
@@ -426,6 +583,10 @@ def run_write_article(
         "sections": sections,
         "section_count": len(section_drafts),
         "dropped_sections": dropped_sections,
+        "repaired_sections": repaired_sections,
+        "scrubbed_sections": scrubbed_sections,
+        "dropped_invented_entities": sorted(dropped_invented_entities),
+        "dropped_invented_numbers": sorted(dropped_invented_numbers),
         "draft_words": word_count(text),
         "allowed_entities": allowed["entities"],
         "allowed_numbers": allowed["numbers"],

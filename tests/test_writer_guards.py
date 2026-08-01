@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from personality_protect.write import normalize_sentence_case
 from personality_protect.writer_guards import (
     brief_echo_reject,
     check_invention,
@@ -10,7 +11,10 @@ from personality_protect.writer_guards import (
     find_scaffold_markers,
     mask_exemplar_entities,
     parrot_reject,
+    scrub_invented_sentences,
 )
+
+SCRUB_BRIEF = "Topic: Contoso packaging\nPoints:\n- Name one owner\n- Cut exceptions"
 
 
 def test_mask_exemplar_entities_absent_from_brief():
@@ -289,3 +293,51 @@ def test_brief_echo_rejects_the_bullets_handed_back():
     )
 
     assert brief_echo_reject(echo, brief) is True
+
+
+def test_scrub_cuts_the_inventing_sentence_and_keeps_the_rest():
+    draft = (
+        "One owner signs off on packaging before a tier opens.\n"
+        "\n"
+        "Fabrikam Northwind ran the same programme first. The exception list "
+        "gets read out loud every week."
+    )
+
+    scrubbed = scrub_invented_sentences(
+        draft, SCRUB_BRIEF, normalize=normalize_sentence_case
+    )
+
+    assert "Fabrikam" not in scrubbed
+    assert "One owner signs off on packaging" in scrubbed
+    assert "read out loud every week" in scrubbed
+    # Paragraph break survives, so the section keeps its lineation.
+    assert "\n\n" in scrubbed
+    assert check_invention(SCRUB_BRIEF, normalize_sentence_case(scrubbed)).passed
+
+
+def test_scrub_cuts_the_sentence_carrying_an_invented_figure():
+    draft = (
+        "The owner is named in writing.\n"
+        "We cleared nine exceptions in three weeks and stopped counting."
+    )
+
+    scrubbed = scrub_invented_sentences(
+        draft, SCRUB_BRIEF, normalize=normalize_sentence_case
+    )
+
+    assert "nine exceptions" not in scrubbed
+    assert scrubbed == "The owner is named in writing."
+
+
+def test_scrub_returns_nothing_when_every_sentence_invents():
+    draft = (
+        "Fabrikam Northwind shipped the tier. Tailspin Toys confirmed the "
+        "rollout afterwards."
+    )
+
+    assert (
+        scrub_invented_sentences(
+            draft, SCRUB_BRIEF, normalize=normalize_sentence_case
+        )
+        == ""
+    )
