@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from personality_protect.draft_trim import (
     drop_repeated_paragraphs,
+    drop_restated_sections,
     trim_draft,
     trim_to_word_target,
     word_count,
@@ -40,6 +41,23 @@ def test_drop_repeated_paragraphs_catches_near_duplicates():
 def test_drop_repeated_paragraphs_keeps_distinct_short_lines():
     text = "Ship the ledger.\n\nOwn the outage.\n\nName one owner.\n"
     assert len(drop_repeated_paragraphs(text).split("\n\n")) == 3
+
+
+def test_drop_restated_sections_drops_paraphrase_of_earlier_section():
+    first = (
+        "Contoso Ledger names one owner before a packaging tier opens and "
+        "keeps the renewal test boring so the signal stays readable."
+    )
+    paraphrase = (
+        "Before a packaging tier opens Contoso Ledger names one owner and "
+        "keeps the renewal test boring so its signal stays readable."
+    )
+    third = (
+        "Exceptions are where a published price list quietly stops describing "
+        "anyone who still renews Contoso."
+    )
+    kept = drop_restated_sections([first, paraphrase, third])
+    assert kept == [first, third]
 
 
 def test_trim_to_word_target_cuts_on_paragraph_boundaries():

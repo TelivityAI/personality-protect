@@ -349,3 +349,29 @@ def test_article_directives_drop_the_post_word_ceiling():
     assert "words total" not in article
     # Cadence still travels: only the length target is channel specific.
     assert "Never use these words" in article
+
+
+def test_article_directives_use_article_cadence_not_comment_slop():
+    """Short comments must not tell the article channel to write 3-word lines."""
+    from personality_protect.models import Piece
+
+    short_comments = [
+        Piece(
+            id=f"c{i}",
+            source="linkedin_comment",
+            text="Yes. Do this. Ship it now.",
+            year=2026,
+        )
+        for i in range(20)
+    ]
+    profile = build_style_profile([*contoso_articles(8), *short_comments])
+    stats = profile["stats"]
+    assert stats["article_cadence_samples"] >= 3
+    assert stats["article_sentence_words_p75"] > stats["sentence_words_p75"]
+    article = " ".join(style_directives(profile, channel="article"))
+    post = " ".join(style_directives(profile, channel="post"))
+    assert f"{stats['article_sentence_words_p25']:.0f}–{stats['article_sentence_words_p75']:.0f}" in article
+    assert f"{stats['sentence_words_p25']:.0f}–{stats['sentence_words_p75']:.0f}" in post
+    assert f"{stats['sentence_words_p25']:.0f}–{stats['sentence_words_p75']:.0f}" not in article
+    assert "first person for experience" in article
+    assert "more often than 'I'" in post

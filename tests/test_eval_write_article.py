@@ -111,6 +111,8 @@ def test_control_arm_writes_an_article_without_the_voice_machinery(tmp_path: Pat
     assert "section 1 of 3" in seen[0]
     assert f"Aim for about {budget['section_words']} words" in seen[0]
     assert "ALLOWED names from the BRIEF only" in seen[0]
+    assert "Other sections (do not cover them here):" in seen[0]
+    assert "Brief points:" not in seen[0]
     # ...and none of the voice machinery.
     assert "EXAMPLES" not in seen[0]
     assert "Sentence length varies" not in seen[0]

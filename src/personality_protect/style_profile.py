@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from personality_protect.config import ProfilePaths
+from personality_protect.corpus_text import normalize_corpus_text
 from personality_protect.eval_compare import _sentence_word_counts, _word_tokens
 from personality_protect.models import Piece
 from personality_protect.select import selected_pieces
@@ -325,6 +326,51 @@ def article_section_words(profile: dict[str, Any], *, sections: int) -> int:
     )
 
 
+# Below this, article cadence is noise — fall back to the corpus-wide card.
+MIN_ARTICLE_CADENCE_SAMPLES = 3
+
+
+def article_cadence_stats(pieces: Iterable[Piece]) -> dict[str, Any]:
+    """Cadence measured on linkedin_article pieces only.
+
+    The corpus-wide card is dominated by short posts and comments. Feeding that
+    into the article channel produces punchy LinkedIn-slop sentences instead of
+    the author's longform rhythm — which is exactly the complaint a real article
+    draft gets when the style card says most sentences run 3–14 words.
+    """
+    articles = [
+        p
+        for p in pieces
+        if p.source in _ARTICLE_LENGTH_SOURCES and (p.text or "").strip()
+    ]
+    if len(articles) < MIN_ARTICLE_CADENCE_SAMPLES:
+        return {"article_cadence_samples": float(len(articles))}
+    # Article exports often carry Medium/Ghost CSS ahead of the body. Measuring
+    # that raw paste reports 2–8 word "sentences" and 80%+ short lines — which
+    # then tells the article channel to write LinkedIn-comment slop.
+    texts: list[str] = []
+    for piece in articles:
+        cleaned = normalize_corpus_text(piece.text)
+        if cleaned.strip():
+            texts.append(cleaned)
+    if len(texts) < MIN_ARTICLE_CADENCE_SAMPLES:
+        return {"article_cadence_samples": float(len(texts))}
+    axes = corpus_style_stats(texts)
+    spread = sentence_length_spread(texts)
+    return {
+        "article_cadence_samples": float(len(texts)),
+        "article_sentence_words_p25": spread["sentence_words_p25"],
+        "article_sentence_words_p75": spread["sentence_words_p75"],
+        "article_median_sentence_words": float(axes.get("median_sentence_words") or 0),
+        "article_short_line_ratio": float(axes.get("short_line_ratio") or 0),
+        "article_multi_sentence_paragraph_ratio": multi_sentence_paragraph_ratio(texts),
+        "article_you_count": int(axes.get("you_count") or 0),
+        "article_i_count": int(axes.get("i_count") or 0),
+        "article_you_gt_i": bool(axes.get("you_gt_i")),
+        "article_contraction_rate": float(axes.get("contraction_rate") or 0),
+    }
+
+
 def build_style_profile(
     pieces: Iterable[Piece],
     *,
@@ -337,6 +383,7 @@ def build_style_profile(
     texts = [p.text for p in piece_list if (p.text or "").strip()]
     stats.update(post_length_stats(piece_list))
     stats.update(article_length_stats(piece_list))
+    stats.update(article_cadence_stats(piece_list))
     stats.update(sentence_length_spread(texts))
     stats["multi_sentence_paragraph_ratio"] = multi_sentence_paragraph_ratio(texts)
     return {
@@ -382,18 +429,40 @@ def style_directives(profile: dict[str, Any], *, channel: str = "post") -> list[
     model copyable text and it copies; cadence targets carry the same voice
     signal with nothing to paste.
 
-    ``channel='article'`` drops the post length directive. Cadence transfers
-    across channels; a word budget does not, and telling an article section to
-    stay under the LinkedIn post ceiling is how a longform draft came out post
-    length. The article path states its own budget per section.
+    ``channel='article'`` drops the post length directive and, when enough
+    articles were measured, uses article-only cadence instead of the
+    comment-dominated corpus card. A word budget never transfers; cadence only
+    transfers when there is no article sample to speak for itself.
     """
     stats = profile.get("stats") or {}
     is_article = (channel or "post").strip().lower() == "article"
+    use_article_cadence = (
+        is_article
+        and float(stats.get("article_cadence_samples") or 0) >= MIN_ARTICLE_CADENCE_SAMPLES
+    )
     directives: list[str] = []
 
-    low = float(stats.get("sentence_words_p25") or 0)
-    high = float(stats.get("sentence_words_p75") or 0)
-    median_sentence = float(stats.get("median_sentence_words") or 0)
+    if use_article_cadence:
+        low = float(stats.get("article_sentence_words_p25") or 0)
+        high = float(stats.get("article_sentence_words_p75") or 0)
+        median_sentence = float(stats.get("article_median_sentence_words") or 0)
+        short_ratio = float(stats.get("article_short_line_ratio") or 0)
+        multi_ratio = float(stats.get("article_multi_sentence_paragraph_ratio") or 0)
+        you_n = int(stats.get("article_you_count") or 0)
+        i_n = int(stats.get("article_i_count") or 0)
+        you_gt_i = bool(stats.get("article_you_gt_i"))
+        contraction_rate = float(stats.get("article_contraction_rate") or 0)
+    else:
+        low = float(stats.get("sentence_words_p25") or 0)
+        high = float(stats.get("sentence_words_p75") or 0)
+        median_sentence = float(stats.get("median_sentence_words") or 0)
+        short_ratio = float(stats.get("short_line_ratio") or 0)
+        multi_ratio = float(stats.get("multi_sentence_paragraph_ratio") or 0)
+        you_n = int(stats.get("you_count") or 0)
+        i_n = int(stats.get("i_count") or 0)
+        you_gt_i = bool(stats.get("you_gt_i"))
+        contraction_rate = float(stats.get("contraction_rate") or 0)
+
     if low and high and high > low:
         directives.append(
             f"Sentence length varies: most run {low:.0f}–{high:.0f} words. "
@@ -405,19 +474,30 @@ def style_directives(profile: dict[str, Any], *, channel: str = "post") -> list[
             "but do not write long academic sentences."
         )
 
-    short_ratio = float(stats.get("short_line_ratio") or 0)
-    if short_ratio:
-        directives.append(
-            f"About {short_ratio * 100:.0f}% of lines are 8 words or fewer. "
-            "Use short standalone lines and frequent paragraph breaks."
-        )
-
-    multi_ratio = float(stats.get("multi_sentence_paragraph_ratio") or 0)
-    if multi_ratio:
+    # Article exports mix short headings with long prose. Prefer the
+    # multi-sentence paragraph signal when it is present, or the short-line
+    # directive turns every section into comment-length punch lines.
+    if use_article_cadence and multi_ratio >= 0.15:
         directives.append(
             f"About {multi_ratio * 100:.0f}% of paragraphs carry two or more "
-            "sentences. Do not write the whole post as single short lines."
+            "sentences. Write in prose paragraphs, not a stack of one-liners."
         )
+        if short_ratio >= 0.55:
+            directives.append(
+                f"About {short_ratio * 100:.0f}% of lines are 8 words or fewer. "
+                "Short lines are fine for emphasis, not for the whole article."
+            )
+    else:
+        if short_ratio:
+            directives.append(
+                f"About {short_ratio * 100:.0f}% of lines are 8 words or fewer. "
+                "Use short standalone lines and frequent paragraph breaks."
+            )
+        if multi_ratio:
+            directives.append(
+                f"About {multi_ratio * 100:.0f}% of paragraphs carry two or more "
+                "sentences. Do not write the whole post as single short lines."
+            )
 
     median_post = float(stats.get("median_post_words") or 0)
     if median_post and not is_article:
@@ -427,14 +507,20 @@ def style_directives(profile: dict[str, Any], *, channel: str = "post") -> list[
         )
 
     # Absent counts must stay silent: an empty profile asserting a pronoun lean
-    # would put a made-up voice rule in the prompt.
-    if int(stats.get("you_count") or 0) or int(stats.get("i_count") or 0):
-        if stats.get("you_gt_i"):
+    # would put a made-up voice rule in the prompt. On articles, a pure you>i
+    # rule erases first-person experience voice when both pronouns are real.
+    if you_n or i_n:
+        if use_article_cadence and you_n and i_n:
+            directives.append(
+                "Use first person for experience and judgment; use 'you' when "
+                "giving the reader a direct instruction."
+            )
+        elif you_gt_i:
             directives.append("Address the reader as 'you' more often than 'I'.")
         else:
             directives.append("Speak in first person more often than addressing 'you'.")
 
-    if float(stats.get("contraction_rate") or 0) > 0.01:
+    if contraction_rate > 0.01:
         directives.append("Use contractions; write the way people speak.")
 
     banned = [str(phrase) for phrase in (profile.get("banned_ai_filler") or [])][:12]
