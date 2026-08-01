@@ -24,6 +24,7 @@ from personality_protect.write_article import (
     assert_article_corpus,
     count_indexed_article_pieces,
     outline_from_brief,
+    prepare_article_exemplar,
     run_write_article,
     scale_section_words_for_brief,
 )
@@ -38,6 +39,23 @@ def _seed_articles(tmp_path: Path, n: int = MIN_ARTICLE_CORPUS) -> Path:
     build_voice_index(paths)
     save_style_profile(paths, build_style_profile(pieces))
     return tmp_path
+
+
+def test_prepare_article_exemplar_spends_the_clip_on_prose_not_chrome():
+    raw = (
+        "Contoso Ledger keeps packaging boring\n\n"
+        "Contoso Ledger keeps packaging boring\n"
+        "Created on 2026-04-05 01:41\n"
+        "Published on 2026-04-05 19:17\n"
+        "Every Contoso renewal has an owner. Most packaging changes fail the "
+        "moment the first exception lands without a name on it.\n"
+    )
+    clipped = prepare_article_exemplar(raw, max_words=40)
+    assert "Created on" not in clipped
+    assert "Published on" not in clipped
+    assert clipped.count("Contoso Ledger keeps packaging boring") == 1
+    assert "Every Contoso renewal has an owner" in clipped
+    assert len(clipped.split()) <= 40
 
 
 def test_outline_from_brief_uses_bullets():
@@ -158,6 +176,62 @@ def test_section_prompt_states_its_place_in_the_article(tmp_path: Path):
     )
     assert "section 1 of 3" in seen[0]
     assert "section 3 of 3" in seen[2]
+
+
+def test_section_prompt_scopes_to_current_bullet_not_full_brief(tmp_path: Path):
+    """Every section used to receive every bullet, so section 1 dumped the article."""
+    _seed_articles(tmp_path, n=6)
+    paths, _, _ = init_profile("contoso", home=tmp_path)
+    seen: list[str] = []
+
+    def fake_generate(messages, **_kwargs: object) -> str:
+        seen.append(messages[1]["content"])
+        return "Contoso Ledger names one owner before the packaging change lands."
+
+    run_write_article(
+        "Contoso packaging", BRIEF_POINTS, paths, k=1, generate_fn=fake_generate
+    )
+    first = seen[0]
+    assert "Brief points:" not in first
+    assert "Stay on this section only." not in first
+    assert "Name one owner" in first
+    assert "Cut exceptions" in first  # listed as another section, not as points
+    assert "Other sections (do not cover them here):" in first
+    # The points field for section 1 is only that section's bullet.
+    assert "- Name one owner" in first
+    assert "- Cut exceptions\n- Keep Ledger boring" not in first
+
+
+def test_stitch_drops_paraphrased_section_restatement(tmp_path: Path):
+    """Near-copy section drafts must not survive as a longer looping article."""
+    _seed_articles(tmp_path, n=MIN_ARTICLE_CORPUS)
+    paths, _, _ = init_profile("contoso", home=tmp_path)
+    bodies = [
+        (
+            "Contoso Ledger names one owner before a packaging tier opens and "
+            "keeps the renewal test boring so the signal stays readable."
+        ),
+        (
+            "Before a packaging tier opens Contoso Ledger names one owner and "
+            "keeps the renewal test boring so its signal stays readable."
+        ),
+        (
+            "Exceptions are where a published price list quietly stops "
+            "describing anyone who still renews Contoso."
+        ),
+    ]
+    calls = {"n": 0}
+
+    def fake_generate(_messages, **_kwargs: object) -> str:
+        text = bodies[min(calls["n"], len(bodies) - 1)]
+        calls["n"] += 1
+        return text
+
+    result = run_write_article(
+        "Contoso packaging", BRIEF_POINTS, paths, k=1, generate_fn=fake_generate
+    )
+    assert "Exceptions are where a published price list" in result["text"]
+    assert result["text"].count("names one owner") == 1
 
 
 def test_section_trim_keeps_a_long_section_from_running_away(tmp_path: Path):

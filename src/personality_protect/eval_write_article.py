@@ -41,7 +41,11 @@ from personality_protect.article_brief import (
 from personality_protect.chat_prompt import flatten_chat_messages
 from personality_protect.config import ProfilePaths, load_config
 from personality_protect.corpus_text import normalize_corpus_text
-from personality_protect.draft_trim import drop_repeated_paragraphs, word_count
+from personality_protect.draft_trim import (
+    drop_repeated_paragraphs,
+    drop_restated_sections,
+    word_count,
+)
 from personality_protect.eval_write_holdout import (
     TIE_EPSILON,
     assert_receipt_contoso_safe,
@@ -150,8 +154,10 @@ def run_bare_base_article(
     scrubbed_sections: list[str] = []
     messages: list[dict[str, str]] = []
     attempts_total = 0
-    for index, section in enumerate(budget["sections"], start=1):
+    outline = list(budget["sections"])
+    for index, section in enumerate(outline, start=1):
         section_topic, section_points = _section_brief(topic, section, points)
+        others = [title for title in outline if title != section]
         outcome = draft_section_with_repair(
             build_messages=partial(
                 build_section_messages,
@@ -167,6 +173,7 @@ def run_bare_base_article(
                     section_trim_words=budget["section_trim_words"],
                     allowed_entities=budget.get("allowed_entities") or (),
                     allowed_numbers=budget.get("allowed_numbers") or (),
+                    other_sections=others,
                 ),
             ),
             generate_fn=generate_fn,
@@ -189,7 +196,7 @@ def run_bare_base_article(
             scrubbed_sections.append(section)
 
     text = drop_repeated_paragraphs(
-        "\n\n".join(part for part in section_drafts if part.strip())
+        "\n\n".join(drop_restated_sections(section_drafts))
     ).strip()
     return {
         "text": text,

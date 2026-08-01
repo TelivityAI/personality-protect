@@ -15,7 +15,13 @@ from typing import Any
 
 from personality_protect.chat_prompt import flatten_chat_messages
 from personality_protect.config import DEFAULT_MLX_MODEL, ProfilePaths, load_config
-from personality_protect.draft_trim import drop_repeated_paragraphs, trim_draft, word_count
+from personality_protect.corpus_text import normalize_corpus_text
+from personality_protect.draft_trim import (
+    drop_repeated_paragraphs,
+    drop_restated_sections,
+    trim_draft,
+    word_count,
+)
 from personality_protect.models import load_index
 from personality_protect.prompt_write import build_write_messages
 from personality_protect.style_profile import (
@@ -58,14 +64,41 @@ SECTION_TRIM_HEADROOM = 1.35
 # Tokens per target word. Roughly 1.35 tokens/word for English plus room to
 # finish the closing sentence before the budget runs out.
 SECTION_TOKENS_PER_WORD = 2.0
-# Same clip as the post channel, and the article eval is why. A 60-word clip of
-# a 1,000-word article shows little of its section rhythm, so this was widened
-# to 120 on the theory that longform needs a longer look. The holdout run
-# answered: at 120 the stitched draft shared 150+ exact 8-token windows with its
-# own exemplars and was disqualified for parroting on three holdouts of four.
-# Longform gives the model more room to copy, not less, so the clip stays short
-# and voice travels as measured cadence instead.
+# Same clip budget as the post channel for parrot reasons: at 120 words the
+# holdout shared 150+ exact 8-token windows with its exemplars. The article
+# path still has to spend that budget on prose, not on LinkedIn title /
+# "Created on" / "Published on" chrome — otherwise the model never sees the
+# author's longform rhythm inside the 60-word window.
 ARTICLE_EXEMPLAR_WORDS = MAX_EXEMPLAR_WORDS
+_ARTICLE_META_LINE_RE = re.compile(
+    r"^(created on|published on|edited on)\b",
+    re.IGNORECASE,
+)
+_ARTICLE_DATE_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def prepare_article_exemplar(text: str, *, max_words: int = ARTICLE_EXEMPLAR_WORDS) -> str:
+    """Normalize, drop export chrome, then clip — so the budget is real prose."""
+    cleaned = normalize_corpus_text(text)
+    lines: list[str] = []
+    seen_title = ""
+    for raw in cleaned.splitlines():
+        line = raw.strip()
+        if not line:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        if _ARTICLE_META_LINE_RE.match(line) or _ARTICLE_DATE_LINE_RE.match(line):
+            continue
+        if not seen_title:
+            seen_title = line.casefold()
+            lines.append(line)
+            continue
+        if line.casefold() == seen_title:
+            continue
+        lines.append(line)
+    body = "\n".join(lines).strip()
+    return clip_exemplar(body, max_words=max_words)
 # When the visible brief is thin, demanding a full article-length section is
 # what forces invention. Cap the per-section aim from brief richness instead.
 THIN_BRIEF_WORDS = 80
@@ -168,11 +201,18 @@ def outline_from_brief(topic: str, points: str) -> list[str]:
     return sections
 
 
-def _section_brief(topic: str, section: str, points: str) -> tuple[str, str]:
-    """Topic/points pair for one section generation call."""
+def _section_brief(topic: str, section: str, points: str = "") -> tuple[str, str]:
+    """Topic/points pair for one section generation call.
+
+    Only this section's claim goes in the points field. Handing every section
+    the full brief is what made section 1 dump the article and sections 2–N
+    rewrite it; invent checking still uses the full brief separately.
+    ``points`` is accepted for call-site compatibility and ignored.
+    """
+    del points
     return (
         f"{topic} — {section}" if topic and topic != section else section,
-        f"- {section}\n- Stay on this section only.\n- Brief points:\n{points}",
+        f"- {section}",
     )
 
 
@@ -212,6 +252,7 @@ def section_structure_directives(
     section_trim_words: int,
     allowed_entities: Sequence[str] = (),
     allowed_numbers: Sequence[str] = (),
+    other_sections: Sequence[str] = (),
 ) -> list[str]:
     """Where this section sits, how long it may run, and which facts are allowed.
 
@@ -224,10 +265,16 @@ def section_structure_directives(
         f"This is section {index} of {total} in a longform article of about "
         f"{word_aim} words; the other sections cover the rest of the brief.",
         f"Write only the section about: {section}",
+        "Do not restate or rewrite other sections. Advance only this section.",
         f"Aim for about {section_words} words in this section, and no more "
         f"than {section_trim_words}. Prefer stopping early over inventing "
         "facts to fill the count.",
     ]
+    others = [str(item).strip() for item in other_sections if str(item).strip()]
+    if others:
+        lines.append(
+            "Other sections (do not cover them here): " + " | ".join(others) + "."
+        )
     entities = [str(item).strip() for item in allowed_entities if str(item).strip()]
     numbers = [str(item).strip() for item in allowed_numbers if str(item).strip()]
     if entities:
@@ -489,7 +536,8 @@ def run_write_article(
     exemplars = [str(match["text"]) for match in matches]
     masked = [
         mask_exemplar_entities(
-            clip_exemplar(exemplar, max_words=ARTICLE_EXEMPLAR_WORDS), full_brief
+            prepare_article_exemplar(exemplar, max_words=ARTICLE_EXEMPLAR_WORDS),
+            full_brief,
         )
         for exemplar in exemplars
     ]
@@ -505,6 +553,7 @@ def run_write_article(
 
     for index, section in enumerate(sections, start=1):
         section_topic, section_points = _section_brief(topic, section, points)
+        others = [title for title in sections if title != section]
         outcome = draft_section_with_repair(
             build_messages=partial(
                 build_section_messages,
@@ -522,6 +571,7 @@ def run_write_article(
                         section_trim_words=section_trim_words,
                         allowed_entities=allowed["entities"],
                         allowed_numbers=allowed["numbers"],
+                        other_sections=others,
                     ),
                 ],
             ),
@@ -548,11 +598,11 @@ def run_write_article(
         elif outcome["status"] == "scrubbed":
             scrubbed_sections.append(section)
 
-    # Sections are generated independently from the same brief, so two of them
-    # can arrive as the same paragraph. Stitching them unfiltered is what turns
-    # a five-section article into the same point made five times.
+    # Sections are generated independently, so two of them can arrive as the
+    # same argument in different words. Drop restated section drafts first,
+    # then collapse near-duplicate paragraphs inside what remains.
     text = drop_repeated_paragraphs(
-        "\n\n".join(part for part in section_drafts if part.strip())
+        "\n\n".join(drop_restated_sections(section_drafts))
     ).strip()
     # Final invent check against the full brief the author supplied. The flag
     # describes the text that ships: a section dropped for inventing is a gap

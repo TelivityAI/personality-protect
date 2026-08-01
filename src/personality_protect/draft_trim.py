@@ -51,6 +51,40 @@ def drop_repeated_paragraphs(text: str) -> str:
     return "\n\n".join(kept)
 
 
+# Section drafts are generated independently. A later section can rephrase an
+# earlier one without any single paragraph hitting NEAR_DUPLICATE_RATIO, which
+# is how a five-section stitch becomes the same argument five times. Coverage
+# against the kept article catches that paraphrase; pairwise similarity catches
+# near-copies of one prior section.
+SECTION_RESTATE_SIMILARITY = 0.55
+SECTION_RESTATE_COVERAGE = 0.62
+
+
+def drop_restated_sections(sections: list[str] | tuple[str, ...]) -> list[str]:
+    """Keep section drafts that still add substance after earlier ones."""
+    kept: list[str] = []
+    kept_token_sets: list[set[str]] = []
+    for section in sections:
+        text = (section or "").strip()
+        if not text:
+            continue
+        tokens = set(_tokens(text))
+        if not tokens:
+            continue
+        if any(
+            _similarity(tokens, earlier) >= SECTION_RESTATE_SIMILARITY
+            for earlier in kept_token_sets
+        ):
+            continue
+        if kept_token_sets:
+            prior = set().union(*kept_token_sets)
+            if len(tokens & prior) / len(tokens) >= SECTION_RESTATE_COVERAGE:
+                continue
+        kept.append(text)
+        kept_token_sets.append(tokens)
+    return kept
+
+
 def trim_to_word_target(text: str, max_words: int) -> str:
     """Keep whole paragraphs up to ``max_words``, never cutting mid-sentence.
 
